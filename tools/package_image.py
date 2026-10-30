@@ -34,7 +34,7 @@ PUBLIC_SOURCE_DIRS = {
 PUBLIC_SOURCE_FILES = (
     "Dockerfile", "docker-compose.yml", "docker-compose.legacy.yml", "docker-compose.vaapi.yml",
     ".dockerignore", ".gitignore", ".gitattributes", ".env.example", "requirements.txt", "requirements-dev.txt",
-    "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
+    "README.md", "AGENTS.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
     ".github/workflows/ci.yml", ".github/workflows/publish-image.yml", "docs/architecture.md", "docs/migration.md",
     "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
     "docs/superpowers/plans/2026-10-30-history-comments-integration.md",
