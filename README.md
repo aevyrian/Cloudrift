@@ -38,15 +38,17 @@ docker compose up -d --build
 
 ### 使用发行镜像
 
-公开镜像位于 [GitHub Container Registry](https://github.com/users/aevyrian/packages/container/package/cloudrift)，支持 Linux amd64，提供 `1.3.6` 和 `latest` 标签，可免登录拉取。新安装先按上文下载项目并准备 `.env`，再在项目目录运行：
+公开镜像位于 [Docker Hub](https://hub.docker.com/r/aevyrian/cloudrift)，支持 Linux amd64，提供 `1.3.6` 和 `latest` 标签，可免登录拉取。新安装先按上文下载项目并准备 `.env`，再在项目目录运行：
 
 ```bash
-docker pull ghcr.io/aevyrian/cloudrift:1.3.6
-docker tag ghcr.io/aevyrian/cloudrift:1.3.6 cloudrift:1.3.6
+docker pull aevyrian/cloudrift:1.3.6
+docker tag aevyrian/cloudrift:1.3.6 cloudrift:1.3.6
 docker compose up -d --no-build
 ```
 
 第二步将仓库镜像对应到现有 Compose 使用的本地标签。镜像仓库中的 1.3.6 与 v1.3.6 Release 的已验证镜像相同；现有部署先按 [迁移说明](docs/migration.md) 核对挂载。
+
+也提供相同内容的 [GHCR 镜像](https://github.com/users/aevyrian/packages/container/package/cloudrift)：拉取 `ghcr.io/aevyrian/cloudrift:1.3.6` 后，同样将其标记为 `cloudrift:1.3.6` 即可沿用 Compose。
 
 也可从 [Releases](https://github.com/aevyrian/Cloudrift/releases) 下载同一版本的源码 ZIP、Linux amd64 镜像归档及 `SHA256SUMS.txt`。在 Linux 主机校验已下载文件后解压源码，将镜像归档导入 Docker；镜像标签与包内 Compose 保持一致：
 
