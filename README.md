@@ -36,6 +36,20 @@ docker compose up -d --build
 
 密钥和 Cookie 仅在自己的部署中配置，不要写入 Git、脚本源码或公开问题反馈。网站用于可信局域网；不要把带有个人媒体与登录信息的实例直接暴露到公网。
 
+### 使用发行镜像
+
+从 [Releases](https://github.com/aevyrian/Cloudrift/releases) 下载同一版本的源码 ZIP、Linux amd64 镜像归档及 `SHA256SUMS.txt`。在 Linux 主机校验已下载文件后解压源码，将镜像归档导入 Docker；镜像标签与包内 Compose 保持一致：
+
+```bash
+sha256sum --ignore-missing -c SHA256SUMS.txt
+docker load -i cloudrift-v1.3.6-linux-amd64.tar.gz
+# 在解压后的源码目录中：
+cp .env.example .env
+docker compose up -d --no-build
+```
+
+镜像附带运行依赖；使用该路径不需要现场构建。下载作品仍需网络及有效 Cookie。已有部署先阅读 [迁移说明](docs/migration.md)，不要覆盖原 `.env` 或改变挂载。
+
 ## 数据和升级
 
 | 主机目录 | 容器位置 | 内容 |
