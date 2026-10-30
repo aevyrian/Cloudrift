@@ -2,6 +2,7 @@ import hmac
 import hashlib
 import math
 import json
+import re
 import secrets
 import sqlite3
 import time
@@ -87,6 +88,30 @@ class Store:
                 CREATE INDEX IF NOT EXISTS work_identity ON works(author_id,created_at,type);
                 CREATE TABLE IF NOT EXISTS work_aliases (id TEXT PRIMARY KEY, work_id TEXT NOT NULL);
                 CREATE TABLE IF NOT EXISTS favorites (work_id TEXT PRIMARY KEY, created_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS browse_history (
+                    event_id TEXT PRIMARY KEY, work_id TEXT NOT NULL, url TEXT NOT NULL,
+                    title TEXT NOT NULL, author_name TEXT NOT NULL, author_url TEXT NOT NULL,
+                    viewed_at TEXT NOT NULL, metadata_revision INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS browse_history_time ON browse_history(viewed_at DESC,event_id DESC);
+                CREATE TABLE IF NOT EXISTS comment_jobs (
+                    work_id TEXT PRIMARY KEY, operation TEXT NOT NULL, integrity TEXT NOT NULL,
+                    reason TEXT NOT NULL, token TEXT NOT NULL, checkpoint TEXT NOT NULL,
+                    requests INTEGER NOT NULL DEFAULT 0, new_comments INTEGER NOT NULL DEFAULT 0,
+                    active_seconds REAL NOT NULL DEFAULT 0, asset_bytes INTEGER NOT NULL DEFAULT 0,
+                    platform_total INTEGER, saved_at TEXT, updated_at TEXT NOT NULL);
+                CREATE TABLE IF NOT EXISTS comments (
+                    work_id TEXT NOT NULL, id TEXT NOT NULL, root_id TEXT NOT NULL,
+                    reply_to_id TEXT NOT NULL, reply_to_user TEXT NOT NULL, nickname TEXT NOT NULL,
+                    text TEXT NOT NULL, created_at INTEGER NOT NULL, likes INTEGER NOT NULL,
+                    platform_reply_count INTEGER NOT NULL, first_saved_at TEXT NOT NULL, last_saved_at TEXT NOT NULL,
+                    PRIMARY KEY(work_id,id));
+                CREATE INDEX IF NOT EXISTS comment_order ON comments(work_id,root_id);
+                CREATE TABLE IF NOT EXISTS comment_assets (
+                    id TEXT PRIMARY KEY, work_id TEXT NOT NULL, comment_id TEXT NOT NULL,
+                    kind TEXT NOT NULL, source_url TEXT NOT NULL, relative_path TEXT NOT NULL DEFAULT '',
+                    status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL DEFAULT '',
+                    bytes INTEGER NOT NULL DEFAULT 0);
+                CREATE INDEX IF NOT EXISTS comment_assets_work ON comment_assets(work_id,comment_id,status);
                 CREATE TABLE IF NOT EXISTS authors (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
                     enabled INTEGER NOT NULL DEFAULT 0, interval_minutes INTEGER NOT NULL DEFAULT 60,
@@ -96,6 +121,8 @@ class Store:
             for name, kind in (("starred", "INTEGER NOT NULL DEFAULT 0"), ("favorite", "INTEGER NOT NULL DEFAULT 0"), ("schedule_until", "REAL NOT NULL DEFAULT 0")):
                 if name not in columns:
                     db.execute(f'ALTER TABLE authors ADD COLUMN {name} {kind}')
+            if 'metadata_revision' not in {row[1] for row in db.execute('PRAGMA table_info(browse_history)')}:
+                db.execute('ALTER TABLE browse_history ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0')
 
     @contextmanager
     def connect(self):
@@ -113,9 +140,12 @@ class Store:
         return json.loads(row[0]) if row else default
 
     def set_setting(self, key, value):
+        self.set_settings({key: value})
+
+    def set_settings(self, values):
         with self.connect() as db:
-            db.execute("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
-                       (key, json.dumps(value, ensure_ascii=False)))
+            db.executemany("INSERT INTO settings VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                           [(key, json.dumps(value, ensure_ascii=False)) for key, value in values.items()])
 
     def set_admin_key(self, key, expected_key, first=False):
         with self.connect() as db:
@@ -287,6 +317,229 @@ class Store:
                 db.execute('INSERT OR IGNORE INTO favorites VALUES (?,?)',(work['id'],stamp()))
             else:
                 db.execute('DELETE FROM favorites WHERE work_id=?',(work['id'],))
+
+    def comment_work_id(self, local_id):
+        if re.fullmatch(r'[0-9]{19}', local_id or ''):
+            return local_id
+        with self.connect() as db:
+            rows = db.execute('SELECT id FROM work_aliases WHERE work_id=?', (local_id,)).fetchall()
+        return rows[0][0] if len(rows) == 1 and re.fullmatch(r'[0-9]{19}', rows[0][0]) else None
+
+    @staticmethod
+    def _comment_state(db, work_id):
+        job = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+        counts = db.execute("SELECT COUNT(*),COALESCE(SUM(root_id!=''),0) FROM comments WHERE work_id=?", (work_id,)).fetchone()
+        paused = db.execute("SELECT value FROM settings WHERE key='comment_queue_paused'").fetchone()
+        return {'operation': job['operation'] if job else 'unsaved', 'integrity': job['integrity'] if job else 'unsaved',
+                'reason': job['reason'] if job else '', 'total': counts[0], 'replies': counts[1],
+                'saved_at': job['saved_at'] if job else None, 'platform_total': job['platform_total'] if job else None,
+                'queue_paused': bool(json.loads(paused[0])) if paused else False}
+
+    def comment_state(self, work_id):
+        with self.connect() as db:
+            return self._comment_state(db, work_id)
+
+    @staticmethod
+    def _comment_items(db, work_id, root_id=None, offset=0, limit=None, internal=False):
+        query = '''SELECT c.*, (SELECT COUNT(*) FROM comments r WHERE r.work_id=c.work_id AND r.root_id=c.id) AS reply_count,
+                   (c.reply_to_id!='' AND NOT EXISTS(SELECT 1 FROM comments p WHERE p.work_id=c.work_id AND p.id=c.reply_to_id)) AS reply_target_missing
+                   FROM comments c WHERE c.work_id=?'''
+        args = [work_id]
+        if root_id is not None:
+            query += ' AND c.root_id=?'
+            args.append(root_id)
+        query += ' ORDER BY c.rowid'
+        if limit is not None:
+            query += ' LIMIT ? OFFSET ?'
+            args.extend((limit, offset))
+        items = []
+        for row in db.execute(query, args).fetchall():
+            value = dict(row)
+            value.pop('platform_reply_count')
+            value['reply_target_missing'] = bool(value['reply_target_missing'])
+            fields = '*' if internal else 'id,kind,status,error'
+            value['attachments'] = [dict(a) for a in db.execute(
+                'SELECT ' + fields + ' FROM comment_assets WHERE work_id=? AND comment_id=? ORDER BY rowid', (work_id, row['id']))]
+            items.append(value)
+        return items
+
+    def comment_page(self, work_id, root_id='', offset=0, limit=50):
+        with self.connect() as db:
+            items = self._comment_items(db, work_id, root_id, offset, limit + 1)
+        return {'items': items[:limit], 'next_offset': offset + limit if len(items) > limit else None}
+
+    def comment_snapshot(self, work_id):
+        with self.connect() as db:
+            db.execute('BEGIN')
+            result = {'work_id': work_id, 'status': self._comment_state(db, work_id),
+                      'items': self._comment_items(db, work_id, internal=True)}
+        return result
+
+    def comment_asset(self, asset_id):
+        with self.connect() as db:
+            row = db.execute('SELECT * FROM comment_assets WHERE id=?', (asset_id,)).fetchone()
+        return dict(row) if row else None
+
+    @staticmethod
+    def _comment_job(row):
+        if not row:
+            return None
+        value = dict(row)
+        value['checkpoint'] = json.loads(value['checkpoint'])
+        return value
+
+    def comment_job(self, work_id):
+        with self.connect() as db:
+            return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
+
+    def comment_queue(self, work_id, action):
+        if not re.fullmatch(r'[0-9]{19}', work_id or '') or action not in {'save', 'update', 'continue'}:
+            raise ValueError('作品或评论操作无效')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            db.execute("INSERT INTO settings VALUES ('comment_queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
+            row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            if row and row['operation'] in ('queued', 'running'):
+                return self._comment_job(row)
+            checkpoint = json.loads(row['checkpoint']) if row else {'cursor': 0, 'root_done': False, 'replies': []}
+            if action in ('save', 'update') or (checkpoint['root_done'] and not checkpoint['replies']):
+                checkpoint = {'cursor': 0, 'root_done': False, 'replies': []}
+            token = secrets.token_hex(16)
+            db.execute('''INSERT INTO comment_jobs(work_id,operation,integrity,reason,token,checkpoint,updated_at)
+                          VALUES (?,'queued','unsaved','',?,?,?) ON CONFLICT(work_id) DO UPDATE SET
+                          operation='queued',reason='',token=excluded.token,checkpoint=excluded.checkpoint,
+                          requests=0,new_comments=0,active_seconds=0,asset_bytes=0,platform_total=NULL,updated_at=excluded.updated_at''',
+                       (work_id, token, json.dumps(checkpoint), stamp()))
+            return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
+
+    def comment_cancel(self, work_id):
+        with self.connect() as db:
+            db.execute("UPDATE comment_jobs SET operation='stopped',reason='已停止，已保存内容保留',updated_at=? WHERE work_id=? AND operation IN ('queued','running')", (stamp(), work_id))
+
+    def comment_recover(self):
+        with self.connect() as db:
+            db.execute("UPDATE comment_jobs SET operation='interrupted',reason='服务中断，已保存内容保留',updated_at=? WHERE operation='running'", (stamp(),))
+
+    def comment_claim(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute("SELECT * FROM comment_jobs WHERE operation IN ('queued','running') ORDER BY CASE operation WHEN 'running' THEN 0 ELSE 1 END,rowid LIMIT 1").fetchone()
+            if row:
+                db.execute("UPDATE comment_jobs SET operation='running',updated_at=? WHERE work_id=? AND operation='queued'", (stamp(), row['work_id']))
+                row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (row['work_id'],)).fetchone()
+            return self._comment_job(row)
+
+    def comment_media_busy(self):
+        with self.connect() as db:
+            return bool(db.execute("SELECT 1 FROM tasks WHERE status IN ('queued','parsing','downloading') LIMIT 1").fetchone())
+
+    def comment_request_begin(self, work_id, token, now, reserve=True):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT operation,token FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            values = {r['key']: json.loads(r['value']) for r in db.execute("SELECT key,value FROM settings WHERE key IN ('queue_resume_at','comment_next_request_at','comment_queue_paused')")}
+            if (not job or job['operation'] != 'running' or job['token'] != token or values.get('comment_queue_paused')
+                    or now < values.get('queue_resume_at', 0) or (reserve and now < values.get('comment_next_request_at', 0))
+                    or db.execute("SELECT 1 FROM tasks WHERE status IN ('queued','parsing','downloading') LIMIT 1").fetchone()):
+                return False
+            if reserve:
+                db.execute("INSERT INTO settings VALUES ('comment_next_request_at',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (json.dumps(now + 3),))
+            return True
+
+    def comment_block(self, work_id, token):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            result = db.execute("UPDATE comment_jobs SET operation='failed',integrity='partial',reason='评论访问需要登录、验证或暂时受限，请处理后重试',updated_at=? WHERE work_id=? AND token=? AND operation='running'", (stamp(), work_id, token))
+            if result.rowcount:
+                db.execute("INSERT INTO settings VALUES ('comment_queue_paused','true') ON CONFLICT(key) DO UPDATE SET value='true'")
+
+    def comment_commit_page(self, work_id, token, items, checkpoint, platform_total, elapsed):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            if not job or job['token'] != token or job['operation'] not in ('running', 'stopped', 'queued'):
+                return False
+            new_count, now = 0, stamp()
+            for item in items:
+                values = (work_id, item['id'], item['root_id'], item['reply_to_id'], item['reply_to_user'], item['nickname'],
+                          item['text'], item['created_at'], item['likes'], item['reply_count'], now, now)
+                inserted = db.execute('INSERT OR IGNORE INTO comments VALUES (?,?,?,?,?,?,?,?,?,?,?,?)', values).rowcount
+                new_count += inserted
+                if not inserted:
+                    db.execute('''UPDATE comments SET root_id=?,reply_to_id=?,reply_to_user=?,nickname=?,text=?,created_at=?,likes=?,
+                                  platform_reply_count=?,last_saved_at=? WHERE work_id=? AND id=?''',
+                               (*values[2:10], now, work_id, item['id']))
+                for index, asset in enumerate(item['attachments']):
+                    asset_id = hashlib.sha256(f"{work_id}\0{item['id']}\0{index}".encode()).hexdigest()[:32]
+                    db.execute('''INSERT INTO comment_assets(id,work_id,comment_id,kind,source_url,status,error) VALUES (?,?,?,?,?,?,?)
+                                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,source_url=excluded.source_url,
+                                  status=CASE WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.status
+                                              WHEN comment_assets.status='missing' AND excluded.status='pending' THEN 'pending' ELSE comment_assets.status END,
+                                  error=CASE WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.error
+                                             WHEN comment_assets.status='missing' AND excluded.status='pending' THEN '' ELSE comment_assets.error END''',
+                               (asset_id, work_id, item['id'], asset['kind'], asset['source_url'], asset['status'], asset['error']))
+            db.execute("UPDATE comment_jobs SET checkpoint=?,requests=requests+1,new_comments=new_comments+?,active_seconds=active_seconds+?,integrity='partial',saved_at=?,platform_total=COALESCE(?,platform_total),updated_at=? WHERE work_id=? AND token=?",
+                       (json.dumps(checkpoint), new_count, elapsed, now, platform_total, now, work_id, token))
+            return True
+
+    def comment_next_asset(self, work_id):
+        with self.connect() as db:
+            row = db.execute("SELECT * FROM comment_assets WHERE work_id=? AND status='pending' ORDER BY rowid LIMIT 1", (work_id,)).fetchone()
+        return dict(row) if row else None
+
+    def comment_commit_asset(self, work_id, token, asset_id, result, elapsed, error=''):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT token,operation FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            if not job or job['token'] != token or job['operation'] not in ('running', 'stopped'):
+                return False
+            db.execute('''UPDATE comment_assets SET status=?,relative_path=?,sha256=?,bytes=?,error=? WHERE id=? AND work_id=? AND status='pending' ''',
+                       ('missing' if error else 'saved', result.get('relative_path', ''), result.get('sha256', ''), result.get('bytes', 0), error, asset_id, work_id))
+            db.execute('UPDATE comment_jobs SET active_seconds=active_seconds+?,asset_bytes=asset_bytes+?,saved_at=?,updated_at=? WHERE work_id=? AND token=?',
+                       (elapsed, result.get('bytes', 0), stamp(), stamp(), work_id, token))
+            return True
+
+    def comment_end(self, work_id, token, operation, reason, finished=False):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT token,operation FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            if not job or job['token'] != token or job['operation'] != 'running':
+                return
+            missing = db.execute("SELECT 1 FROM comment_assets WHERE work_id=? AND status!='saved' LIMIT 1", (work_id,)).fetchone()
+            integrity = 'finished-visible' if finished and not missing else 'partial'
+            if finished and missing:
+                reason = '评论已保存，部分附件未保存或不受支持'
+            db.execute('UPDATE comment_jobs SET operation=?,integrity=?,reason=?,updated_at=? WHERE work_id=? AND token=?',
+                       (operation, integrity, reason, stamp(), work_id, token))
+
+    def record_browse_history(self, items):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            for item in items:
+                existing = db.execute('SELECT work_id,url,viewed_at FROM browse_history WHERE event_id=?', (item['event_id'],)).fetchone()
+                if existing and tuple(existing) != (item['work_id'], item['url'], item['viewed_at']):
+                    raise ValueError('浏览记录标识冲突，请稍后重试')
+                db.execute('''INSERT INTO browse_history(event_id,work_id,url,title,author_name,author_url,viewed_at,metadata_revision)
+                              VALUES (?,?,?,?,?,?,?,?) ON CONFLICT(event_id) DO UPDATE SET
+                              title=COALESCE(NULLIF(excluded.title,''),browse_history.title),
+                              author_name=COALESCE(NULLIF(excluded.author_name,''),browse_history.author_name),
+                              author_url=COALESCE(NULLIF(excluded.author_url,''),browse_history.author_url),
+                              metadata_revision=excluded.metadata_revision
+                              WHERE excluded.metadata_revision > browse_history.metadata_revision''',
+                           (item['event_id'], item['work_id'], item['url'], item['title'], item['author_name'],
+                            item['author_url'], item['viewed_at'], item['metadata_revision']))
+        return len(items)
+
+    def browse_history(self, limit, before=None):
+        with self.connect() as db:
+            total = db.execute('SELECT COUNT(*) FROM browse_history').fetchone()[0]
+            where = 'WHERE (viewed_at,event_id) < (?,?)' if before else ''
+            args = (*before.split('|'), limit + 1) if before else (limit + 1,)
+            rows = db.execute('SELECT * FROM browse_history ' + where +
+                              ' ORDER BY viewed_at DESC,event_id DESC LIMIT ?', args).fetchall()
+        items = [dict(row) for row in rows[:limit]]
+        next_cursor = items[-1]['viewed_at'] + '|' + items[-1]['event_id'] if len(rows) > limit else None
+        return {'items': items, 'total': total, 'next_cursor': next_cursor}
 
     def library(self, q="", author="", offset=0, limit=30, seed=None, ceiling=None, favorite=False):
         where, args = ["1=1"], []

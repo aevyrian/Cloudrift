@@ -2,6 +2,7 @@
 import asyncio
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -16,6 +17,14 @@ def needs_compatibility(path, info):
     audio=[s.get('codec_name') for s in info['streams'] if s.get('codec_type')=='audio']
     return (path.suffix.lower() not in {'.mp4','.m4v','.mov'} or video.get('codec_name')!='h264'
             or video.get('pix_fmt') not in {'yuv420p','yuvj420p'} or any(c not in {'aac','mp3'} for c in audio))
+
+
+def duration(info):
+    value=info.get('format') or {}
+    value=value.get('duration') if isinstance(value,dict) else None
+    try:value=float(value) if not isinstance(value,bool) else 0
+    except (TypeError,ValueError,OverflowError):return 0
+    return value if math.isfinite(value) and value>=0 else 0
 
 
 class PlaybackCache:
@@ -89,7 +98,7 @@ class PlaybackCache:
                 return {'status':'ready','mode':'compatible'}
             if key not in self.records:
                 info=await self.probe(path)
-                self.records[key]={'compatible':needs_compatibility(path,info),'duration':float(info.get('format',{}).get('duration') or 0),'progress':0}
+                self.records[key]={'compatible':needs_compatibility(path,info),'duration':duration(info),'progress':0}
                 # shortcut: Keep only recent probes; scan the library only on explicit user request.
                 if len(self.records)>512:
                     for old in list(self.records):
@@ -157,10 +166,10 @@ class PlaybackCache:
                         value=line.strip().split(b'=',1)[1]
                         if value.isdigit():record['progress']=min(99,int(value)/(record['duration']*10000))
                 await proc.wait()
-            await asyncio.wait_for(progress(),max(60,min(1800,record['duration']*5)))
+            await asyncio.wait_for(progress(),max(60,min(1800,record['duration']*5)) if record['duration'] else 1800)
             if proc.returncode:raise RuntimeError('这个视频暂时无法转换，请重试播放；原文件已保留')
-            info=await self.probe(temporary);duration=float(info.get('format',{}).get('duration') or 0)
-            if needs_compatibility(temporary,info) or duration<=0 or (record['duration'] and abs(duration-record['duration'])>max(.25,record['duration']*.01)):
+            info=await self.probe(temporary);output_duration=duration(info)
+            if needs_compatibility(temporary,info) or output_duration<=0 or (record['duration'] and abs(output_duration-record['duration'])>max(.25,record['duration']*.01)):
                 raise RuntimeError('播放副本完整性检查未通过，未替换原文件，请重试')
         except FileNotFoundError as exc:
             raise RuntimeError('播放兼容组件尚未就绪，请更新本项目镜像后重试') from exc

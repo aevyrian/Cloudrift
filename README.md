@@ -13,6 +13,9 @@
 - 在作品库随机浏览、搜索、收藏、刷视频和翻图集。普通视频进入时自动播放，播完接着播放下一条；每次打开网站默认开启声音，可手动关闭。浏览器限制有声自动播放时需点击画面播放。收藏支持作品和博主，订阅可星标置前。
 - 任务支持单个及当前筛选结果的批量重试、取消、删除；无需二次确认，删除仅移除记录，已下载媒体和断点文件保留。
 - 通过脚本猫等油猴管理器安装抖音收藏库助手，从抖音网页发送当前作品或博主；下载按钮仅下载一次，爱心用于订阅。同次打开面板时切换作者复用订阅查询，重新打开会刷新其他设备的改动。
+- 助手在面板关闭时也记录实际浏览的作品链接，网站“历史”按时间展示；断网时先暂存在助手中，连接恢复后重试。仅记录启用后的浏览，后台标签预加载不算观看。
+- 作品数优先复用当前页面资料；额外查询采用未登录的独立会话，不使用已配置的抖音 Cookie，平台限制可能使数量暂不可用。
+- 对选择的作品手动保存评论和回复，在本地阅读支持的评论图片，并可导出 JSON、CSV 或含附件的 ZIP；不自动采集全部作品，旧作品须有可信原作编号。
 - 点击“添加下载”下的“一键同步抖音 Cookie”，由已安装的助手读取当前浏览器登录状态；服务端验证成功后保存，正在下载时等待任务结束再应用。首次需允许助手读取抖音 Cookie，失败不会覆盖原配置。
 - 旧媒体目录可只读接入。不搬迁、改名或重下旧文件；发现匹配歧义、索引未完成或文件不完整时停止任务并提示处理。
 
@@ -36,37 +39,17 @@ docker compose up -d --build
 
 密钥和 Cookie 仅在自己的部署中配置，不要写入 Git、脚本源码或公开问题反馈。网站用于可信局域网；不要把带有个人媒体与登录信息的实例直接暴露到公网。
 
-### 使用发行镜像
+### 已发行的旧版镜像
 
-公开镜像位于 [Docker Hub](https://hub.docker.com/r/aevyrian/cloudrift)，支持 Linux amd64，提供 `1.3.6` 和 `latest` 标签，可免登录拉取。新安装先按上文下载项目并准备 `.env`，再在项目目录运行：
+当前源码为 1.4.0 试用版，请按上面的步骤自行构建。现有 [Docker Hub](https://hub.docker.com/r/aevyrian/cloudrift)、[GHCR](https://github.com/users/aevyrian/packages/container/package/cloudrift) 和 [v1.3.6 Release](https://github.com/aevyrian/Cloudrift/releases/tag/v1.3.6) 仍是 1.3.6，不包含此版本的历史和评论功能。
 
-```bash
-docker pull aevyrian/cloudrift:1.3.6
-docker tag aevyrian/cloudrift:1.3.6 cloudrift:1.3.6
-docker compose up -d --no-build
-```
-
-第二步将仓库镜像对应到现有 Compose 使用的本地标签。镜像仓库中的 1.3.6 与 v1.3.6 Release 的已验证镜像相同；现有部署先按 [迁移说明](docs/migration.md) 核对挂载。
-
-也提供相同内容的 [GHCR 镜像](https://github.com/users/aevyrian/packages/container/package/cloudrift)：拉取 `ghcr.io/aevyrian/cloudrift:1.3.6` 后，同样将其标记为 `cloudrift:1.3.6` 即可沿用 Compose。
-
-也可从 [Releases](https://github.com/aevyrian/Cloudrift/releases) 下载同一版本的源码 ZIP、Linux amd64 镜像归档及 `SHA256SUMS.txt`。在 Linux 主机校验已下载文件后解压源码，将镜像归档导入 Docker；镜像标签与包内 Compose 保持一致：
-
-```bash
-sha256sum --ignore-missing -c SHA256SUMS.txt
-docker load -i cloudrift-v1.3.6-linux-amd64.tar.gz
-# 在解压后的源码目录中：
-cp .env.example .env
-docker compose up -d --no-build
-```
-
-镜像附带运行依赖；使用该路径不需要现场构建。下载作品仍需网络及有效 Cookie。已有部署先阅读 [迁移说明](docs/migration.md)，不要覆盖原 `.env` 或改变挂载。
+如需使用 1.3.6 镜像，请使用 v1.3.6 Release 自带的源码包与 Compose 文件，按该版本包内 README 操作；不要将旧镜像重新标记为 1.4.0。已有部署先阅读 [迁移说明](docs/migration.md)，保留原 `.env` 和挂载。
 
 ## 数据和升级
 
 | 主机目录 | 容器位置 | 内容 |
 | --- | --- | --- |
-| `APP_DATA_DIR`，默认 `./data` | `/data` | 配置、SQLite、任务记录、索引和播放缓存 |
+| `APP_DATA_DIR`，默认 `./data` | `/data` | 配置、SQLite、任务记录、浏览历史、离线评论附件、索引和播放缓存 |
 | `APP_MEDIA_DIR`，默认 `./media` | `/media` | 新下载的媒体 |
 | 可选 `APP_LEGACY_DIR` | `/legacy`，只读 | 需要接入的旧媒体目录 |
 
@@ -114,6 +97,8 @@ node tests/test_userscript.mjs
 node tests/test_task_view.mjs
 python tools/package_image.py --source-only
 ```
+
+评论、回复及图片的实际可保存范围受平台权限、验证码与接口变化影响；本地保存内容是累计快照，不保证与线上完全一致。1.4.0 尚未进行真实平台及 NAS 运行验证。
 
 测试使用临时目录与合成数据。任务页已做桌面、手机、筛选、详情及不写下载队列的检查；这些结果不代表真实新下载、所有旧媒体编码或所有 NAS 硬件均已验证。下载能力仍受 Cookie、作品权限和平台接口变化影响，不保证最高画质或无水印。
 

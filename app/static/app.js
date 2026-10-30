@@ -7,7 +7,7 @@
   }
   function switchView(view, videos) {
     for (const video of videos) {video.playbackWarm=false;video.cancelPreparation?.();if(video.getAttribute)releasePlayback(video);else playVisible(video,false);}
-    return ['library', 'favorites', 'tasks', 'authors', 'settings'].includes(view) ? view : 'library';
+    return ['library', 'favorites', 'tasks', 'authors', 'history', 'settings'].includes(view) ? view : 'library';
   }
   function moveGallery(index, change, count) { return Math.max(0, Math.min(Math.max(0, count - 1), index + change)); }
   function isVideoFile(file) { return /\.(mp4|webm|mov|m4v|mkv)(?:$|\?)/i.test(file.name || file.url || ''); }
@@ -21,14 +21,136 @@
     if (key.length < 8 || key.length > 128 || /[^\x21-\x7e]/.test(key)) return '请用 8–128 位英文字母、数字或符号，不含空格。';
     return key === repeat ? '' : '两次输入的密钥不一致，请再检查一下。';
   }
-  if (typeof module !== 'undefined' && module.exports) { module.exports = { mediaURL, switchView, moveGallery, isVideoFile, authorInitial, keyError, taskTitle, playVisible, applySound, releasePlayback, preloadVideos }; return; }
+  function createCommentsPanel({ document, element, api, binary, objectURL, formatDate }) {
+    let active = null, generation = 0, timer = 0, urls = [];
+    const path = id => `/api/works/${encodeURIComponent(id)}/comments`;
+    const button = (text, fn) => { const node = element('button', 'secondary', text); node.type = 'button'; node.addEventListener('click', fn); return node; };
+    function close(focus = false) {
+      generation++; clearTimeout(timer); timer = 0;
+      for (const url of urls) objectURL.revokeObjectURL(url); urls = [];
+      if (active) { const previous = active; active = null; previous.panel.remove(); previous.trigger.setAttribute('aria-expanded', 'false'); if (focus) previous.trigger.focus(); }
+    }
+    function isOpenFor(card) { return Boolean(active && active.card === card); }
+    function open(work, card, trigger) {
+      close(); const serial = generation, current = () => active && active.serial === serial;
+      const panel = element('section', 'comments-panel'); panel.setAttribute('role', 'region'); panel.setAttribute('aria-label', '离线评论'); panel.tabIndex = -1;
+      const header = element('div', 'comments-header'), title = element('h2', '', '离线评论');
+      const dismiss = button('×', () => close(true)); dismiss.setAttribute('aria-label', '关闭评论'); header.append(title, dismiss);
+      const summary = element('p', 'comments-summary'), explanation = element('p', 'hint', '评论为本地累计保存，可能需要分次保存；打开面板不会自动采集。');
+      const statusMessage = element('p', 'hint'); statusMessage.setAttribute('role', 'status'); statusMessage.setAttribute('aria-live', 'polite');
+      const controls = element('div', 'comments-actions'), exports = element('div', 'comments-actions'), list = element('div', 'comments-list');
+      const more = button('加载更多评论', () => loadPage(active.retryReset)); more.hidden = true;
+      panel.append(header, summary, explanation, statusMessage, controls, exports, list, more);
+      panel.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(true); } event.stopPropagation(); });
+      active = { serial, card, trigger, panel, offset: 0, canSave: false, busy: false, state: null, pageSerial: 0, pageLoading: false, retryReset: false, revision: 0 };
+      card.append(panel); trigger.setAttribute('aria-expanded', 'true'); panel.focus();
+      const localPath = path(work.id);
+      function report(error) { if (current()) statusMessage.textContent = error?.message || '操作失败，请重试。'; }
+      async function operation(action) {
+        if (!current() || active.busy || !active.canSave) return;
+        active.busy = true; active.revision++; active.pageSerial++; active.pageLoading = false;
+        try { await api(localPath, 'POST', { action }); if (current()) await loadPage(true); }
+        catch (error) { if (current() && active.state) paintStatus(active.state, active.canSave); report(error); }
+        finally { if (current()) { active.busy = false; if (!active.pageLoading) more.disabled = false; } }
+      }
+      async function cancel() {
+        if (!current() || active.busy) return;
+        active.busy = true; active.revision++; active.pageSerial++; active.pageLoading = false;
+        try { await api(`${localPath}/cancel`, 'POST'); if (current()) await loadPage(true); }
+        catch (error) { if (current() && active.state) paintStatus(active.state, active.canSave); report(error); }
+        finally { if (current()) { active.busy = false; if (!active.pageLoading) more.disabled = false; } }
+      }
+      async function exportData(format) {
+        try {
+          const data = await binary(`${localPath}/export?format=${format}`); if (!current()) return;
+          const url = objectURL.createObjectURL(data); urls.push(url);
+          const link = element('a'); link.href = url; link.download = `comments-${work.id}.${format}`; document.body.append(link); link.click(); link.remove();
+        } catch (error) { report(error); }
+      }
+      function paintStatus(status, canSave) {
+        if (!current()) return;
+        active.canSave = Boolean(canSave); active.state = status;
+        const total = Number(status.total) || 0, replies = Number(status.replies) || 0;
+        const integrity = status.integrity === 'finished-visible' ? '本次可见内容已遍历' : status.integrity === 'partial' ? '部分保存' : '尚未保存';
+        summary.textContent = `已保存 ${total} 条评论 · 其中回复 ${replies} 条 · ${integrity}${status.saved_at ? ` · 保存于 ${formatDate(status.saved_at)}` : ''}${status.platform_total != null ? ` · 平台报告数量 ${status.platform_total}` : ''}`;
+        const operations = { queued: '等待保存', running: '正在保存', stopped: '已停止', failed: '保存失败', interrupted: '保存中断', finished: '本次保存结束', unsaved: '尚未保存评论' };
+        statusMessage.textContent = `${operations[status.operation] || '状态未知'}${status.reason ? ` · ${status.reason}` : ''}${status.queue_paused ? ' · 评论队列已暂停' : ''}${!canSave ? ' · 暂时无法识别原作品，不能保存评论' : ''}`;
+        controls.replaceChildren(); exports.replaceChildren();
+        if (['queued', 'running'].includes(status.operation)) controls.append(button('停止保存', cancel));
+        else if (canSave) {
+          const action = status.integrity === 'partial' || ['failed','interrupted','stopped'].includes(status.operation) ? 'continue' : status.integrity === 'unsaved' ? 'save' : 'update';
+          const label = status.operation === 'failed' ? '重试' : action === 'save' ? '保存评论' : action === 'continue' ? '继续保存' : '更新评论';
+          controls.append(button(label, () => operation(action)));
+        }
+        if (status.integrity !== 'unsaved' || total) for (const format of ['json', 'csv', 'zip']) exports.append(button(format === 'zip' ? '导出含图片 ZIP' : `导出 ${format.toUpperCase()}`, () => exportData(format)));
+        clearTimeout(timer);
+        if (['queued', 'running'].includes(status.operation)) timer = setTimeout(poll, 5000);
+      }
+      async function poll() {
+        const revision = active.revision;
+        try {
+          const result = await api(`${localPath}?offset=0&limit=50&root_id=`); if (!current() || revision !== active.revision) return;
+          const wasActive = ['queued', 'running'].includes(active.state?.operation);
+          paintStatus(result.status, result.can_save);
+          if (wasActive && !['queued', 'running'].includes(result.status.operation)) await loadPage(true);
+        } catch (error) { report(error); if (current()) timer = setTimeout(poll, 10000); }
+      }
+      function renderComment(item, parent, isReply = false) {
+        const row = element('article', 'comment-row'), text = element('p', 'comment-text', item.text || ''), meta = element('p', 'hint', `${item.nickname || '未知用户'}${item.reply_to_user ? ` 回复 ${item.reply_to_user}` : ''} · ${formatDate(item.created_at)} · ${Number(item.likes) || 0} 赞`);
+        row.append(meta, text);
+        if (item.reply_target_missing) row.append(element('p', 'hint', '上级评论未保存'));
+        for (const attachment of item.attachments || []) {
+          if (attachment.status !== 'saved') { row.append(element('p', 'hint', `图片未保存${attachment.error ? `：${attachment.error}` : ''}`)); continue; }
+          const placeholder = element('span', 'hint', '正在读取本地图片…'); row.append(placeholder);
+          binary(`/api/comment-assets/${encodeURIComponent(attachment.id)}`).then(blob => {
+            if (!current()) return; const url = objectURL.createObjectURL(blob); urls.push(url);
+            const image = element('img', 'comment-image'); image.alt = attachment.kind === 'sticker' ? '评论图片表情' : '评论图片'; image.src = url; image.loading = 'lazy'; placeholder.replaceChildren(image);
+          }).catch(() => { if (current()) placeholder.textContent = '本地图片无法读取'; });
+        }
+        if (!isReply && item.reply_count > 0) {
+          const replies = element('div', 'comment-replies'); let offset = 0, loading = false;
+          const show = button(`查看 ${item.reply_count} 条回复`, async () => {
+            if (loading || !current()) return; loading = true; show.disabled = true;
+            try {
+              const result = await api(`${localPath}?offset=${offset}&limit=50&root_id=${encodeURIComponent(item.id)}`); if (!current()) return;
+              for (const reply of result.items) renderComment(reply, replies, true);
+              offset = result.next_offset; if (offset == null) show.remove(); else show.textContent = '加载更多回复';
+            } catch (error) { report(error); } finally { loading = false; show.disabled = false; }
+          }); row.append(show, replies);
+        }
+        parent.append(row);
+      }
+      async function loadPage(reset) {
+        if (!current() || (!reset && active.pageLoading)) return;
+        const pageSerial = reset ? ++active.pageSerial : active.pageSerial, revision = active.revision;
+        active.pageLoading = true;
+        const offset = reset ? 0 : active.offset;
+        more.disabled = true;
+        try {
+          const result = await api(`${localPath}?offset=${offset}&limit=50&root_id=`); if (!current() || pageSerial !== active.pageSerial || revision !== active.revision) return;
+          if (reset) list.replaceChildren();
+          paintStatus(result.status, result.can_save);
+          for (const item of result.items) renderComment(item, list);
+          active.offset = result.next_offset; active.retryReset = false; more.textContent = '加载更多评论'; more.hidden = result.next_offset == null;
+          if (reset && !result.items.length) {
+            const text = result.status.integrity === 'finished-visible' && result.status.operation === 'finished' ? '本次没有可见评论。' : '还没有本地评论内容。';
+            list.append(element('p', 'hint', text));
+          }
+        } catch (error) { if (current() && pageSerial === active.pageSerial && revision === active.revision) { report(error); active.retryReset = reset; more.textContent = '重试读取评论'; more.hidden = false; } }
+        finally { if (current() && pageSerial === active.pageSerial && revision === active.revision) { active.pageLoading = false; more.disabled = false; } }
+      }
+      loadPage(true);
+    }
+    return { open, close, isOpenFor };
+  }
+  if (typeof module !== 'undefined' && module.exports) { module.exports = { mediaURL, switchView, moveGallery, isVideoFile, authorInitial, keyError, taskTitle, playVisible, applySound, releasePlayback, preloadVideos, createCommentsPanel }; return; }
   const $ = id => document.getElementById(id);
   if (location.protocol === 'file:') { $('connect-form').hidden = true; $('local-preview').hidden = false; return; }
   const state = { token: localStorage.getItem('library_access_key') || '', muted:false, favoriteKind:'works', auth: null, view: 'library', items: [], total: 0, generation: 0, authorsGeneration: 0, navigation: 0, busy: false, cookieSyncGeneration:0 };
   const frequencies={once:'不订阅',three_days:'每3天更新',weekly:'每7天更新',monthly:'每月更新',quarterly:'每季度更新',yearly:'每年更新'};
   const frequencyValues={1440:'three_days',4320:'three_days',10080:'weekly',43200:'monthly',129600:'quarterly',525600:'yearly'};
   const statusNames = { queued: '已排队', paused:'已暂停', parsing: '正在解析', awaiting_confirmation: '等待画质确认', downloading: '正在下载', completed: '完整保存', failed: '失败', interrupted: '已中断', cancelled: '已取消' };
-  const titles = { library: ['作品库', 'FOR YOU'], favorites:['收藏','SAVED WORKS'], tasks: ['下载', 'DOWNLOADS'], authors: ['订阅', 'CREATORS'], settings: ['设置', 'LIBRARY SETTINGS'] };
+  const titles = { library: ['作品库', 'FOR YOU'], favorites:['收藏','SAVED WORKS'], tasks: ['下载', 'DOWNLOADS'], authors: ['订阅', 'CREATORS'], history: ['历史', 'HISTORY'], settings: ['设置', 'LIBRARY SETTINGS'] };
   function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = String(text); return node; }
   function notice(message, error = false) { $('notice').textContent = message; $('notice').className = `notice${error ? ' error' : ''}`; $('notice').hidden = !message; }
   function formatDate(value) {
@@ -56,12 +178,14 @@
     button.addEventListener('click', async () => { button.disabled = true; try { await operation(); } catch (error) { notice(error.message, true); } finally { button.disabled = false; } }); return button;
   }
   function disconnect() {
+    state.comments?.close();
     state.cookieSyncGeneration=(state.cookieSyncGeneration||0)+1;
     const syncButton=$('cookie-sync-button'),syncLink=$('cookie-sync-link'),syncStatus=$('cookie-sync-status');if(syncButton)syncButton.disabled=false;if(syncLink)syncLink.hidden=true;if(syncStatus)syncStatus.hidden=true;
     switchView('library', document.querySelectorAll('video'));
-    state.token = ''; localStorage.removeItem('library_access_key'); state.generation++; state.navigation++;
+    if (localStorage.getItem('library_access_key') === state.token) localStorage.removeItem('library_access_key');
+    state.token = ''; state.generation++; state.navigation++;
     $('application').hidden = true; $('connection').hidden = false;
-    $('access-key').value = ''; $('script-token').value = ''; $('cookie').value = ''; $('feed').replaceChildren();
+    $('access-key').value = ''; $('script-token').value = ''; $('cookie').value = ''; $('feed').replaceChildren(); $('history-list')?.replaceChildren();
     $('confirm-key').value = ''; $('legacy-key').value = ''; $('admin-key-form').reset();
     taskView.update([]);
     for (const id of ['task-detail', 'task-dialog-body']) $(id).replaceChildren();
@@ -122,6 +246,7 @@
     for (const [name, value] of values) $('system-status').append(element('dt', '', name), element('dd', '', value ?? '暂无'));
   }
   async function navigate(view) {
+    state.comments?.close();
     const navigation = ++state.navigation;
     if(view==='favorites'&&state.view!==view){$('search-query').value='';$('search-author').value='';}
     state.view = switchView(view, document.querySelectorAll('video'));
@@ -138,17 +263,26 @@
       if (['library','favorites'].includes(state.view)) { $('library-label').textContent=state.view==='favorites'?'我的收藏':'随机推荐';$('shuffle-library').hidden=state.view==='favorites';await Promise.all([loadLibrary(true), loadLegacy()]); }
       else if (state.view === 'tasks') await loadTasks();
       else if (state.view === 'authors') await loadAuthors();
+      else if (state.view === 'history') await loadBrowseHistory(true);
       else await loadSettings();
     } catch (error) { if (navigation === state.navigation) notice(error.message, true); }
   }
   let playbackFrame=0,warmTimer=0,activeCard=null,fullscreenCard=null,restoringFullscreen=false;
+  async function fetchCommentBlob(path) {
+    const token = state.token; let response;
+    try { response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal: AbortSignal.timeout(60000) }); }
+    catch { throw new Error('无法连接网站，请检查 NAS 和网络连接。'); }
+    if (!response.ok) { if ((response.status === 401 || response.status === 403) && token === state.token) disconnect(); throw new Error('无法读取本地评论文件，请重试。'); }
+    return response.blob();
+  }
+  state.comments = createCommentsPanel({ document, element, api, binary: fetchCommentBlob, objectURL: globalThis.URL, formatDate });
   function syncPlayback(){
     playbackFrame=0;if(restoringFullscreen)return;const feed=$('feed'),cards=[...feed.querySelectorAll('.work')];
     const index=Math.max(0,Math.min(cards.length-1,Math.round(feed.scrollTop/feed.clientHeight)));
     const enabled=!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view);
     const card=enabled?(document.fullscreenElement?.closest('.work')||cards[index]):null;
     const selected=card?cards.indexOf(card):-1;
-    if(card!==activeCard){clearTimeout(warmTimer);activeCard=card;}
+    if(card!==activeCard){if(activeCard)state.comments?.close();clearTimeout(warmTimer);activeCard=card;}
     cards.forEach((item,i)=>{const v=item.querySelector('video');if(!v)return;
       if(i!==selected)v.autoAdvancePending=false;
       if(!enabled){v.playbackWarm=false;v.cancelPreparation?.();playVisible(v,false);}
@@ -180,7 +314,7 @@
     function currentVideo(video){
       const feed=$('feed'),cards=[...feed.querySelectorAll('.work')];
       const visible=document.fullscreenElement?.closest('.work')||cards[Math.round(feed.scrollTop/feed.clientHeight)];
-      return card.isConnected&&media===video&&activeCard===card&&visible===card&&!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view)&&video.playbackActive&&!video.userPaused&&video.ended;
+      return card.isConnected&&media===video&&activeCard===card&&visible===card&&!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view)&&video.playbackActive&&!video.userPaused&&video.ended&&!state.comments?.isOpenFor(card);
     }
     async function nextWork(video=null){
       if(video&&(advancing||!currentVideo(video))){if(!advancing)video.autoAdvancePending=false;return;}
@@ -250,7 +384,7 @@
         current.addEventListener('loadeddata',()=>{if(!current.videoWidth)fallback();});
         current.addEventListener('playing',()=>{message.remove();schedulePlayback();});
         current.advancePlayback=()=>{if(current.autoAdvancePending)nextWork(current).catch(error=>notice(error.message,true));};
-        current.addEventListener('ended',()=>{if(!current.loop){current.autoAdvancePending=true;current.advancePlayback();}});
+        current.addEventListener('ended',()=>{if(!current.loop&&!state.comments?.isOpenFor(card)){current.autoAdvancePending=true;current.advancePlayback();}});
       } else { media.alt = work.description || '作品图集'; media.loading = position === 0 || index > 0 ? 'eager' : 'lazy'; }
       if(media.tagName!=='VIDEO'){
         media.addEventListener('error', () => { notice('图片无法打开，请检查原文件是否仍存在。', true); });
@@ -283,9 +417,10 @@
     original.hidden = work.source === 'legacy';
     const up = action('⌃', () => card.previousElementSibling?.scrollIntoView({ behavior: 'smooth', block: 'start' })); up.className = 'work-tool'; up.setAttribute('aria-label', '上一条作品');
     const down = action('⌄', () => nextWork()); down.className = 'work-tool'; down.setAttribute('aria-label', '下一条作品');
-    const favorite=action('',async()=>{const value=!work.favorite;await api(`/api/favorites/${encodeURIComponent(work.id)}`,'PUT',{favorite:value});work.favorite=value;paintFavorite();if(state.view==='favorites'&&!value){card.querySelector('video')?.pause();feedObserver.unobserve(card);card.remove();state.items=state.items.filter(w=>w.id!==work.id);state.total--;if(!state.items.length)await loadLibrary(true);}});favorite.className='work-tool favorite-tool';
+    const comment = action('☰', () => state.comments.open(work, card, comment)); comment.className = 'work-tool'; comment.setAttribute('aria-label', '查看离线评论'); comment.setAttribute('aria-expanded', 'false'); comment.title = '评论';
+    const favorite=action('',async()=>{const value=!work.favorite, generation=state.generation, loading=state.loadingLibrary;await api(`/api/favorites/${encodeURIComponent(work.id)}`,'PUT',{favorite:value});work.favorite=value;paintFavorite();if(state.view==='favorites'&&!value){if(state.comments?.isOpenFor(card))state.comments.close();card.querySelector('video')?.pause();feedObserver.unobserve(card);card.remove();state.items=state.items.filter(w=>w.id!==work.id);state.total--;state.nextOffset=Math.max(0,state.nextOffset-1);if(loading||state.loadingLibrary||generation!==state.generation||!state.items.length)await loadLibrary(true);}});favorite.className='work-tool favorite-tool';
     function paintFavorite(){favorite.textContent=work.favorite?'♥':'♡';favorite.setAttribute('aria-label',work.favorite?'取消收藏作品':'收藏作品');favorite.setAttribute('aria-pressed',String(Boolean(work.favorite)));}paintFavorite();
-    tools.append(avatar, favorite, original, up, down); card.append(tools);
+    tools.append(avatar, favorite, comment, original, up, down); card.append(tools);
     feedObserver.observe(card); return card;
   }
   async function loadLibrary(reset = false) {
@@ -300,7 +435,7 @@
     else {query.set('seed',state.seed);if(state.ceiling!==null)query.set('ceiling',state.ceiling);}
     try {
       const data = await api(`/api/library?${query}`); if (generation !== state.generation || !['library','favorites'].includes(state.view)) return;
-      if (reset) { for(const v of $('feed').querySelectorAll('video'))releasePlayback(v);activeCard=null;feedObserver.disconnect(); $('feed').replaceChildren(); $('feed').scrollTop = 0; state.items = []; }
+      if (reset) { state.comments?.close();for(const v of $('feed').querySelectorAll('video'))releasePlayback(v);activeCard=null;feedObserver.disconnect(); $('feed').replaceChildren(); $('feed').scrollTop = 0; state.items = []; }
       state.items.push(...data.items); state.total = data.total;state.nextOffset=data.next_offset;state.ceiling=data.ceiling;state.hasMore=data.has_more;
       for (const [index, work] of data.items.entries()) {
         $('feed').append(renderWork(work, offset + index));
@@ -344,6 +479,39 @@
   const taskView = window.CloudriftTaskView.create({ application: $('application'), makeTaskCard: taskCard, title: taskTitle, onBatch:async(action,ids)=>{
     try{let changed=0,skipped=0;for(let i=0;i<ids.length;i+=1000){const result=await api('/api/tasks/batch','POST',{action,ids:ids.slice(i,i+1000)});changed+=result.changed.length;skipped+=result.skipped.length;}await loadTasks();notice(`已处理 ${changed} 个任务${skipped?`，${skipped} 个因状态变化或同链接正在处理而跳过`:''}。媒体文件保留。`);}catch(error){notice(error.message,true);}
   } });
+  async function loadBrowseHistory(reset = false) {
+    if (!reset && state.historyBusy) return;
+    if (reset) {
+      state.historySerial = (state.historySerial || 0) + 1;
+      state.historyCursor = null; state.historyDay = ''; state.historyBusy = false;
+      $('history-list').replaceChildren(); $('history-count').textContent = '';
+    }
+    const serial = state.historySerial, navigation = state.navigation;
+    const current = () => serial === state.historySerial && navigation === state.navigation && state.view === 'history';
+    state.historyBusy = true; $('history-more').hidden = true; $('history-retry').hidden = true;
+    $('history-status').textContent = '正在读取浏览历史…';
+    try {
+      const path = '/api/browse-history?limit=50' + (state.historyCursor ? `&before=${encodeURIComponent(state.historyCursor)}` : '');
+      const result = await api(path);
+      if (!current()) return;
+      $('history-count').textContent = `共 ${Number(result.total).toLocaleString('zh-CN')} 条浏览记录`;
+      for (const item of result.items) {
+        const date = new Date(item.viewed_at), day = date.toLocaleDateString('zh-CN', { year: 'numeric', month: 'long', day: 'numeric' });
+        if (day !== state.historyDay) { $('history-list').append(element('h2', 'history-day', day)); state.historyDay = day; }
+        const card = element('article', 'record history-record'), content = element('div', 'record-content'), actions = element('div', 'record-actions');
+        content.append(element('h2', '', item.title || '抖音作品'), element('p', 'muted', `${date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })} · ${item.author_name || '未知作者'}`));
+        if (/^https:\/\/www\.douyin\.com\/(video|note)\/\d{19}$/.test(item.url)) {
+          const link = element('a', 'secondary', '查看原作品 ↗'); link.href = item.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; actions.append(link);
+        }
+        card.append(content, actions); $('history-list').append(card);
+      }
+      state.historyCursor = result.next_cursor;
+      if (reset && !result.items.length) empty($('history-list'), '还没有浏览历史', '安装并连接抖音收藏库助手后，浏览的作品会自动记录；旧抖音历史不会自动补齐。');
+      $('history-status').textContent = ''; $('history-more').hidden = !state.historyCursor;
+    } catch (error) {
+      if (current()) { $('history-status').textContent = error.message || '读取失败，请重试。'; $('history-retry').hidden = false; }
+    } finally { if (serial === state.historySerial) state.historyBusy = false; }
+  }
   async function loadTasks() {
     const navigation = state.navigation, tasks = await api('/api/tasks');
     if (navigation === state.navigation && state.view === 'tasks') taskView.update(tasks);
@@ -452,6 +620,8 @@
   paintSound();
   $('sound-toggle').addEventListener('click',()=>{state.muted=!state.muted;applySound($('feed').querySelectorAll('video'),state.muted);paintSound();const v=activeCard?.querySelector('video');if(v){v.playbackActive=false;playVisible(v,true);}});
   $('refresh-tasks').addEventListener('click', () => loadTasks().catch(error => notice(error.message, true)));
+  $('history-more').addEventListener('click', () => loadBrowseHistory());
+  $('history-retry').addEventListener('click', () => loadBrowseHistory(!state.historyCursor));
   $('author-sort').addEventListener('change',()=>loadAuthors().catch(error=>notice(error.message,true)));
   for(const button of document.querySelectorAll('[data-favorite-kind]'))button.addEventListener('click',async()=>{
     state.generation++;

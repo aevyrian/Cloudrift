@@ -14,9 +14,9 @@ python tools/package_image.py --source-only
 
 `source_files(root)` 是 Git 发布快照与 ZIP 共用的文件清单，定义于 `tools/package_image.py`：
 
-- 包含应用、Sender、合成测试、部署文件、CI 配置、架构与迁移说明、必要构建脚本、第三方核心源码、修改说明和许可证。
+- 包含应用、Sender、合成测试、部署文件、CI 配置、架构与迁移说明、评论设计及历史与评论整合计划、必要构建脚本、第三方核心源码、修改说明和许可证。
 - 保留 `tools/ffmpeg/`、`tools/vaapi/`、`tools/wheels/` 的 `.gitkeep`，以满足 Docker 构建目录要求。
-- 排除 `.comet`、本地 Git 历史、AGENTS、本机工作记录、设计稿、备份、运行配置、数据、媒体及离线二进制缓存。
+- 排除 `.comet`、本地 Git 历史、AGENTS、本机工作记录、其他设计稿、备份、运行配置、数据、媒体及离线二进制缓存。
 - `.env.example` 是唯一允许进入包的环境配置示例，所有凭据默认留空。
 
 ZIP 可通过 `python -m unittest discover -s tests -p test_package.py -v` 检查打包选择及边界；该命令不会下载媒体或构建镜像。
@@ -33,5 +33,7 @@ python tools/package_image.py --crane /自己的路径/crane
 第二步还需要事先准备并校验 `tools/vaapi/runtime.tar` 与 `SHA256SUMS`。`build_vaapi.sh` 仅在一次性 Debian 构建容器中运行，不能在 Windows 或 NAS 宿主直接执行。普通用户无需使用这条高级路径；Dockerfile 会在隔离构建阶段自行准备所需内容。
 
 Python 依赖及中间层保存在 `.comet/package/`，交付产物位于 `dist/`。镜像归档工具校验 Linux 原生库与运行时摘要，生成的 `build-info.json` 明确记录 `container_run_verified: false`。归档可读、摘要匹配均不表示它已在 NAS 中运行。
+
+`.github/workflows/publish-image.yml` 是固定校验 v1.3.6 发行镜像的历史发布流程，会推送 1.3.6 和 `latest`；它不适用于发布 1.4.0，不应以此流程发布当前源码。
 
 FFmpeg 与驱动的来源和许可见 [THIRD_PARTY_NOTICES.md](../THIRD_PARTY_NOTICES.md)。公开源码包不包含这些缓存二进制，不声明可以离线构建。打包工具不会自动上传镜像、发布 Release 或修改 NAS。

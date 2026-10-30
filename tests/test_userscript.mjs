@@ -1,4 +1,5 @@
 import assert from 'node:assert/strict';
+import {webcrypto} from 'node:crypto';
 import { createRequire } from 'node:module';
 import { existsSync, readFileSync } from 'node:fs';
 import { runInNewContext } from 'node:vm';
@@ -144,8 +145,9 @@ function browser(url = subscribedURL, {feed = null, preview = null, pageDocument
     querySelector(selector){return selector==='h1'?{textContent:page.pathname.includes('someone_else')?'乙博主':'甲博主'}:null},
     querySelectorAll(selector){if(selector==='[data-e2e="feed-active-video"]')return feed?[feed]:[];if(selector==='[data-e2e="video-detail"], [data-e2e="note-detail"]')return preview?[preview]:[];return []},addEventListener(name,fn){callbacks['document:'+name]=fn}};
   const observer=class {constructor(fn){callbacks.mutation=fn}observe(){}disconnect(){}};
-  runInNewContext(readFileSync(script,'utf8'),{URL,document:doc,unsafeWindow:pageDocument?{document:pageDocument,fetch:fetchProfile}:undefined,fetch:fetchProfile,AbortSignal,location:page,innerWidth:1200,innerHeight:800,
+  runInNewContext(readFileSync(script,'utf8'),{URL,document:doc,unsafeWindow:pageDocument?{document:pageDocument,fetch:fetchProfile}:undefined,fetch:fetchProfile,AbortSignal,location:page,innerWidth:1200,innerHeight:800,crypto:webcrypto,TextEncoder,
     GM_getValue(key,fallback){return storage[key]??fallback}, GM_setValue(key,value){storage[key]=value},
+    GM_listValues(){return Object.keys(storage)}, GM_deleteValue(key){delete storage[key]},
     GM_registerMenuCommand(){},GM_xmlhttpRequest(request){requests.push(request)},
     DOMParser:class{parseFromString(text){return {title:text.startsWith('<title>验证码中间页</title>')?'验证码中间页':'',scripts:[{textContent:text}]}}},ResizeObserver:class{observe(){}disconnect(){}},MutationObserver:observer,
     addEventListener(name,fn){callbacks[name]=fn},
@@ -484,13 +486,13 @@ const countBrowser=options=>{const authorNode={...feedAuthor,href:subscribedURL}
 const countRequest=b=>request(b,'GET','/api/author-count');
 const countReply=(b,r,count,author=subscribedURL)=>b.respond(r,{sec_uid:author.split('/').pop(),count});
 const counts=countBrowser();
-assert.equal(countRequest(counts),undefined,'面板关闭时不查询作品数量');activate(counts);countReply(counts,countRequest(counts),1234);await tick();
+assert.equal(countRequest(counts),undefined,'面板关闭时先等作者稳定');counts.frame.shift()();assert.ok(countRequest(counts),'面板关闭时后台预读作品数量');activate(counts);countReply(counts,countRequest(counts),1234);await tick();
 assert.equal(counts.byClass('work-count').textContent,'· 共 1,234 个作品');
 assert.equal(counts.profileRequests.length,0,'推荐页不能抓博主页或要求跳转主页');
 assert.equal(new URL(countRequest(counts).url).origin,'http://nas.example:8090');
 assert.equal(new URL(countRequest(counts).url).searchParams.get('sec_uid'),subscribedURL.split('/').pop());
 assert.equal(countRequest(counts).headers.Authorization,'Bearer test-token','计数请求只向已配置收藏库发送认证');
-assert.equal(countRequest(counts).timeout,50000,'容纳内核正常请求后的等待时间');
+assert.equal(countRequest(counts).timeout,10000,'超时后及时显示不可用');
 counts.callbacks.detect();counts.callbacks.detect();await tick();assert.equal(counts.requests.filter(r=>new URL(r.url).pathname==='/api/author-count').length,1,'重复检测复用当前博主数量');
 let feedVisible=true;
 const transitionFeed={...feed,getBoundingClientRect:()=>feedVisible?{width:1000,height:700,top:0,bottom:700,left:0}:{width:0,height:0,top:0,bottom:0,left:0}};

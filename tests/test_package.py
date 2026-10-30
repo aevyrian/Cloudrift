@@ -22,12 +22,15 @@ class PackageTests(unittest.TestCase):
             included = {"app/main.py", "app/static/task-view.js", "userscripts/send.user.js", "tests/test_example.py",
                         "vendor/TikTokDownloader/src/core.py", "vendor/TikTokDownloader/license",
                         "tools/package_image.py", "tools/ffmpeg/.gitkeep", "tools/vaapi/.gitkeep",
-                        "tools/wheels/.gitkeep", ".env.example", "Dockerfile", "LICENSE", "THIRD_PARTY_NOTICES.md"}
+                        "tools/wheels/.gitkeep", ".env.example", "Dockerfile", "LICENSE", "THIRD_PARTY_NOTICES.md",
+                        "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
+                        "docs/superpowers/plans/2026-10-30-history-comments-integration.md"}
             excluded = {"app/.env", "app/credentials.json", "app/main.py.bak", "app/main.before.py",
                         "app/__pycache__/main.py", "tests/.private/test_example.py", "tools/wheels/cache.whl",
                         "tools/ffmpeg/ffmpeg.tar.xz", "tools/vaapi/runtime.tar", "tools/private.py",
                         "vendor/TikTokDownloader/Volume/settings.json", "vendor/TikTokDownloader/docs/private.md",
-                        ".comet/config.yaml", ".env", ".env.production", "data/library.sqlite3", "docs/进度.md"}
+                        ".comet/config.yaml", ".env", ".env.production", "data/library.sqlite3", "docs/进度.md",
+                        "docs/superpowers/specs/private.md", "docs/superpowers/plans/private.md"}
             for name in included | excluded:
                 path = root / name
                 path.parent.mkdir(parents=True, exist_ok=True)
@@ -52,6 +55,8 @@ class PackageTests(unittest.TestCase):
                 ".github/workflows/ci.yml": "name: synthetic\n",
                 "docs/architecture.md": "architecture\n",
                 "docs/migration.md": "migration\n",
+                "docs/superpowers/specs/2026-10-30-offline-comments-design.md": "design\n",
+                "docs/superpowers/plans/2026-10-30-history-comments-integration.md": "plan\n",
                 "vendor/TikTokDownloader/PATCHES.md": "patches\n",
                 ".env": "must not be included\n",
             }

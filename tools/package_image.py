@@ -19,7 +19,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "python:3.12-slim-bookworm@sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0"
-TAG = "cloudrift:1.3.6"
+TAG = "cloudrift:1.4.0"
 HEALTH = ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
 ENV = {"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": "/opt/python", "APP_DATA": "/data", "APP_MEDIA": "/media", "APP_CORE": "/app/vendor/TikTokDownloader"}
 EXCLUDED = {".git", ".venv", ".comet", "__pycache__", "Volume", "data", "media", "node_modules"}
@@ -36,6 +36,8 @@ PUBLIC_SOURCE_FILES = (
     ".dockerignore", ".gitignore", ".gitattributes", ".env.example", "requirements.txt", "requirements-dev.txt",
     "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
     ".github/workflows/ci.yml", ".github/workflows/publish-image.yml", "docs/architecture.md", "docs/migration.md",
+    "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
+    "docs/superpowers/plans/2026-10-30-history-comments-integration.md",
     "vendor/TikTokDownloader/PATCHES.md",
     "tools/package_image.py", "tools/prepare_ffmpeg.py", "tools/build_vaapi.sh",
     "tools/ffmpeg/.gitkeep", "tools/vaapi/.gitkeep", "tools/wheels/.gitkeep",
@@ -161,7 +163,9 @@ def package_source():
                     and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets)), None)
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
         raise ValueError("Expected a numeric application VERSION")
-    required = (".github/workflows/ci.yml", "docs/architecture.md", "docs/migration.md", "vendor/TikTokDownloader/PATCHES.md")
+    required = (".github/workflows/ci.yml", "docs/architecture.md", "docs/migration.md", "vendor/TikTokDownloader/PATCHES.md",
+                "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
+                "docs/superpowers/plans/2026-10-30-history-comments-integration.md")
     missing = [name for name in required if not (ROOT / name).is_file()]
     if missing:
         raise FileNotFoundError("Missing release files: " + ", ".join(missing))
@@ -221,7 +225,7 @@ def main():
                "--exposed-ports", "8090/tcp", "--label", "org.opencontainers.image.title=Cloudrift",
                "--label", "org.opencontainers.image.source=https://github.com/aevyrian/Cloudrift",
                "--label", "org.opencontainers.image.licenses=GPL-3.0",
-               "--label", "org.opencontainers.image.version=1.3.6",
+               "--label", "org.opencontainers.image.version=1.4.0",
                "--label", "org.opencontainers.image.vendor-core=473c90ff70c663cfb69310fff2b8d5192f200661",
                "--tag", TAG, "--output", raw]
     for key, value in ENV.items():

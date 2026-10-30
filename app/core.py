@@ -2,12 +2,80 @@ import asyncio
 import re
 import sys
 from pathlib import Path
+from http.cookies import SimpleCookie
 from types import SimpleNamespace
 from urllib.parse import urlsplit
 
 
 CORE_COMMIT = "473c90ff70c663cfb69310fff2b8d5192f200661"
 HOSTS = {"www.douyin.com", "douyin.com", "v.douyin.com", "www.iesdouyin.com", "iesdouyin.com"}
+
+
+class CommentBlocked(RuntimeError):
+    pass
+
+
+def _comment_id(value, empty=False):
+    if empty and (value is None or value == '' or value == '0' or type(value) is int and value == 0):
+        return ''
+    if type(value) is int:
+        value = str(value)
+    if not isinstance(value, str) or not re.fullmatch(r'\d{1,32}', value) or int(value) == 0:
+        raise ValueError('评论编号无效')
+    return value
+
+
+def _comment_number(value):
+    if type(value) is not int or not 0 <= value <= 2**63 - 1:
+        raise ValueError('评论数值无效')
+    return value
+
+
+def _comment_item(item, root_id):
+    if not isinstance(item, dict):
+        raise ValueError('评论结构无效')
+    user = item.get('user')
+    target = item.get('reply_to_user')
+    user = {} if user is None else user
+    target = {} if target is None else target
+    if not isinstance(user, dict) or not isinstance(target, (dict, str)):
+        raise ValueError('评论用户信息无效')
+    nickname = user.get('nickname', '')
+    reply_to_user = target if isinstance(target, str) else target.get('nickname', '')
+    nickname = '' if nickname is None else nickname
+    reply_to_user = '' if reply_to_user is None else reply_to_user
+    text = item.get('text', '')
+    if not all(isinstance(value, str) for value in (nickname, reply_to_user, text)):
+        raise ValueError('评论文字无效')
+    if isinstance(target, dict) and target.get('uid'):
+        uid = _comment_id(target['uid'])
+        reply_to_user = f'{reply_to_user}（{uid}）' if reply_to_user else uid
+    attachments = []
+
+    def add_asset(kind, data):
+        urls = data.get('url_list') if isinstance(data, dict) else None
+        url = next((value for value in urls if isinstance(value, str) and 0 < len(value) <= 8192
+                    and value.startswith('https://')), '') if isinstance(urls, list) else ''
+        attachments.append({'kind': kind if url else 'unsupported', 'source_url': url,
+                            'status': 'pending' if url else 'unsupported', 'error': '' if url else '附件地址不可用'})
+
+    images = item.get('image_list')
+    if images is not None:
+        if not isinstance(images, list):
+            raise ValueError('评论图片结构无效')
+        for image in images:
+            add_asset('image', image.get('origin_url') if isinstance(image, dict) else None)
+    sticker = item.get('sticker')
+    if sticker is not None:
+        add_asset('sticker', sticker.get('static_url') if isinstance(sticker, dict) else None)
+    if item.get('voice') or item.get('audio_comment') or item.get('voice_url'):
+        attachments.append({'kind': 'unsupported', 'source_url': '', 'status': 'unsupported', 'error': '音频评论暂不支持'})
+    return {'id': _comment_id(item.get('cid')), 'root_id': root_id or '',
+            'reply_to_id': _comment_id(item.get('reply_to_reply_id'), empty=True), 'reply_to_user': reply_to_user,
+            'nickname': nickname, 'text': text, 'created_at': _comment_number(item.get('create_time')),
+            'likes': _comment_number(item.get('digg_count')),
+            'reply_count': _comment_number(item.get('reply_comment_total', 0 if root_id else None)),
+            'attachments': attachments}
 
 
 def download_directory(value, media_root):
@@ -103,29 +171,114 @@ class Core:
                 await asyncio.to_thread(app.params_task.join, 5)
         self.parser = None
 
-    async def author_count(self, sec_uid, cookie):
+    async def author_count(self, sec_uid):
         try:
             if str(self.source) not in sys.path:
                 sys.path.insert(0, str(self.source))
             from curl_cffi.requests import AsyncSession
-            from src.custom import DATA_HEADERS, IMPERSONATE, USERAGENT
-            from src.encrypt import DouYinParams
+            from src.custom import DATA_HEADERS, PARAMS_HEADERS, IMPERSONATE, USERAGENT
+            from src.encrypt import DouYinParams, TtWid
             from src.interface.user import User
 
             class Silent:
                 def __getattr__(self, name):
                     return lambda *args, **kwargs: None
 
-            async with AsyncSession(timeout=8, impersonate=IMPERSONATE, verify=True, allow_redirects=False) as client:
-                params = SimpleNamespace(headers=DATA_HEADERS, logger=Silent(), console=Silent(), douyin_params=DouYinParams(),
-                                         max_retry=0, timeout=8, client=client, impersonate=IMPERSONATE, user_agent=USERAGENT)
-                user = await User(params, cookie=cookie, sec_user_id=sec_uid).run()
+            allowed = {'accept', 'accept-encoding', 'content-type', 'referer'}
+            headers = {key: value for key, value in DATA_HEADERS.items() if key.lower() in allowed}
+            registration_headers = {key: value for key, value in PARAMS_HEADERS.items() if key.lower() in allowed}
+            async with AsyncSession(timeout=5, impersonate=IMPERSONATE, verify=True, allow_redirects=False) as client:
+                registration = await client.post(TtWid.API, data=TtWid.DATA, headers=registration_headers)
+                if registration.status_code != 200 or not registration.content or any(text in registration.text for text in ('请完成验证', '访问过于频繁')):
+                    raise ValueError
+                cookies = SimpleCookie()
+                cookies.load(registration.headers.get('Set-Cookie', ''))
+                visitor = cookies.get('ttwid')
+                if not visitor or not visitor.value or len(visitor.value) > 2048:
+                    raise ValueError
+                client.cookies.set('ttwid', visitor.value, domain='.douyin.com')
+                home = await client.get('https://www.douyin.com/', headers=headers)
+                if home.status_code != 200 or not home.content or any(text in home.text for text in ('请完成验证', '访问过于频繁')):
+                    raise ValueError
+                params = SimpleNamespace(headers=headers, logger=Silent(), console=Silent(), douyin_params=DouYinParams(),
+                                         max_retry=0, timeout=5, client=client, impersonate=IMPERSONATE, user_agent=USERAGENT)
+                query = User(params, sec_user_id=sec_uid)
+                query.params = {key: value for key, value in query.params.items() if key.lower() not in {'mstoken', 'uifid', 'webid'}} | {'msToken': '', 'uifid': ''}
+                query.set_referer(None)
+                values = query.generate_params()
+                tokens = [cookie.value for cookie in client.cookies.jar if cookie.name == 'msToken']
+                values['msToken'] = tokens[-1] if tokens else ''
+                values['msToken'] = values.pop('msToken')
+                # 数量已有缓存和并发限流，不走下载分页的随机等待。
+                signed = query.deal_url_params(query.api, values)
+                response = await client.get(f'{query.api}?{signed}', headers=query.headers)
+                if response.status_code != 200 or not response.content or any(text in response.text for text in ('请完成验证', '访问过于频繁')):
+                    raise ValueError
+                payload = response.json()
+                user = payload.get('user') if isinstance(payload, dict) else None
             count = user.get('aweme_count') if isinstance(user, dict) else None
             if not isinstance(user, dict) or user.get('sec_uid') != sec_uid or type(count) is not int or not 0 <= count <= 2**53 - 1:
                 raise ValueError
             return count
         except Exception:
             raise RuntimeError('无法获取博主作品数量') from None
+
+    async def comment_page(self, work_id, cursor=0, root_id=None):
+        if not isinstance(work_id, str) or not re.fullmatch(r'\d{19}', work_id):
+            raise ValueError('无法识别原作品编号')
+        cursor = _comment_number(cursor)
+        root_id = _comment_id(root_id, empty=True)
+        if not self.ready or not self.app or not self.app.parameter:
+            raise RuntimeError('下载核心尚未就绪')
+        if not any(key.lower() == 'cookie' and value for key, value in self.app.parameter.headers.items()):
+            raise CommentBlocked('请先配置抖音 Cookie，再保存评论')
+        try:
+            from src.interface.comment import Comment, Reply
+            params = self.app.parameter
+            if root_id:
+                query = Reply(params, detail_id=work_id, comment_id=root_id, pages=1, cursor=cursor, count=20)
+            else:
+                query = Comment(params, detail_id=work_id, pages=1, cursor=cursor, count=20)
+            query.set_referer(None)
+            values = query.generate_params()
+            if 'msToken' in values:
+                values['msToken'] = values.pop('msToken')
+            signed = query.deal_url_params(query.api, values)
+            async with asyncio.timeout(12):
+                response = await params.client.get(f'{query.api}?{signed}', headers=query.headers, timeout=12, allow_redirects=False)
+            if response.status_code in (301, 302, 303, 307, 308, 401, 403, 429):
+                raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试')
+            if response.status_code != 200 or not response.content:
+                raise ValueError('评论接口响应无效')
+            try:
+                payload = response.json()
+            except Exception:
+                if any(word in response.text.lower() for word in ('验证码', '验证', '登录', '频繁', 'captcha', 'verify', 'login', 'rate limit')):
+                    raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试') from None
+                raise ValueError('评论接口响应无效') from None
+            if not isinstance(payload, dict):
+                raise ValueError('评论结构无效')
+            status = payload.get('status_code')
+            if type(status) is not int or status != 0:
+                message = payload.get('status_msg', '')
+                if isinstance(message, str) and any(word in message.lower() for word in ('验证', '登录', '频繁', 'captcha', 'verify', 'login', 'rate limit')):
+                    raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试')
+                raise ValueError('评论接口返回失败')
+            comments, more = payload.get('comments'), payload.get('has_more')
+            next_cursor = _comment_number(payload.get('cursor'))
+            if not isinstance(comments, list) or type(more) not in (int, bool) or more not in (0, 1):
+                raise ValueError('评论分页结构无效')
+            if more and (not comments or next_cursor <= cursor):
+                raise ValueError('评论分页未正常推进')
+            total = payload.get('total')
+            if total is not None:
+                total = _comment_number(total)
+            return {'items': [_comment_item(item, root_id) for item in comments],
+                    'next_cursor': next_cursor, 'has_more': bool(more), 'total': total}
+        except CommentBlocked:
+            raise
+        except Exception:
+            raise RuntimeError('读取评论失败，请检查网络或稍后重试') from None
 
     async def parse(self, link, kind, earliest=None):
         if not self.ready:

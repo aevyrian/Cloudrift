@@ -67,6 +67,50 @@ class PlaybackTests(unittest.IsolatedAsyncioTestCase):
         self.source.write_bytes(b'changed-original')
         self.assertIsNone(self.cache.ready(self.source))
 
+    async def test_unknown_duration_allows_native_and_conversion_preparation(self):
+        for codec in ('h264', 'hevc'):
+            for index, duration in enumerate(('N/A', 'NaN', 'Infinity', '-Infinity', '-1', None)):
+                with self.subTest(codec=codec, duration=duration):
+                    path=self.root/f'{codec}-{index}.mp4';path.write_bytes(b'original')
+                    info=streams(codec);info['format']['duration']=duration
+                    async def encode(source,temporary,record):
+                        self.assertEqual(record['duration'],0)
+                        temporary.write_bytes(b'converted')
+                    with patch.object(self.cache,'probe',AsyncMock(return_value=info)),patch.object(self.cache,'encode',side_effect=encode) as run:
+                        result=await self.cache.prepare(path)
+                        if codec=='h264':
+                            self.assertEqual(result,{'status':'ready','mode':'original'})
+                            run.assert_not_called()
+                        else:
+                            self.assertEqual(result['status'],'preparing')
+                            await asyncio.gather(*list(self.cache.jobs.values()))
+                            self.assertTrue(self.cache.ready(path))
+                        self.assertEqual(self.cache.records[self.cache.target(path).stem]['duration'],0)
+
+    async def test_invalid_output_duration_never_passes_copy_integrity(self):
+        process=Mock(returncode=0);process.stdout.readline=AsyncMock(return_value=b'');process.wait=AsyncMock()
+        record={'clients':0,'duration':0,'requested':time.monotonic(),'progress':0}
+        for duration in ('N/A', 'NaN', 'Infinity', '-Infinity', '-1', None):
+            with self.subTest(duration=duration):
+                info=streams('h264');info['format']['duration']=duration
+                with patch('app.playback.asyncio.create_subprocess_exec',AsyncMock(return_value=process)),patch.object(self.cache,'probe',AsyncMock(return_value=info)):
+                    with self.assertRaisesRegex(RuntimeError,'完整性'):
+                        await self.cache._encode(self.source,self.root/'part.mp4',record)
+                self.assertEqual(self.source.read_bytes(),b'original-hevc')
+
+    async def test_unknown_source_duration_uses_maximum_conversion_timeout(self):
+        process=Mock(returncode=0);process.stdout.readline=AsyncMock(return_value=b'');process.wait=AsyncMock()
+        record={'clients':0,'duration':0,'requested':time.monotonic(),'progress':0}
+        timeouts=[];wait_for=asyncio.wait_for
+        async def observe(awaitable,timeout):
+            timeouts.append(timeout)
+            return await wait_for(awaitable,timeout)
+        with patch('app.playback.asyncio.create_subprocess_exec',AsyncMock(return_value=process)), \
+             patch('app.playback.asyncio.wait_for',side_effect=observe), \
+             patch.object(self.cache,'probe',AsyncMock(return_value=streams('h264'))):
+            await self.cache._encode(self.source,self.root/'part.mp4',record)
+        self.assertEqual(timeouts,[1800])
+
     def test_pruning_only_removes_generated_copies(self):
         other=self.cache.root/'keep-me.txt';other.write_bytes(b'user-content')
         old=self.cache.root/('a'*64+'.mp4');old.write_bytes(b'0'*900)

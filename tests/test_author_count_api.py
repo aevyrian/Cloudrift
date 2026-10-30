@@ -28,8 +28,8 @@ class FakeCore:
         self.max_active = 0
         self.started = Event()
 
-    async def author_count(self, sec_uid, cookie):
-        self.calls.append((sec_uid, cookie))
+    async def author_count(self, sec_uid):
+        self.calls.append(sec_uid)
         self.started.set()
         self.active += 1
         self.max_active = max(self.max_active, self.active)
@@ -73,7 +73,7 @@ class AuthorCountApiTests(unittest.TestCase):
         self.assertEqual(self.app.state.store.authors(), [])
         self.assertEqual(self.app.state.store.tasks(), [])
 
-    def test_zero_success_is_cached_and_cookie_change_invalidates(self):
+    def test_zero_success_is_cached_independently_of_login_cookie(self):
         first = self.get()
         self.assertEqual(first.status_code, 200)
         self.assertEqual(first.json(), {'sec_uid': 'valid_author', 'count': 0})
@@ -82,12 +82,12 @@ class AuthorCountApiTests(unittest.TestCase):
         self.assertEqual(len(self.core.calls), 1)
         self.app.state.store.set_setting('cookie', 'sessionid=new-cookie')
         self.core.value = 42
-        self.assertEqual(self.get().json()['count'], 42)
-        self.assertEqual(len(self.core.calls), 2)
+        self.assertEqual(self.get().json()['count'], 0)
+        self.assertEqual(self.core.calls, ['valid_author'])
         self.assertEqual(self.app.state.store.authors(), [])
         self.assertEqual(self.app.state.store.tasks(), [])
 
-    def test_failure_is_safe_cached_and_missing_cookie_does_not_query(self):
+    def test_failure_is_safe_cached_and_missing_cookie_still_queries_anonymously(self):
         self.core.error = RuntimeError('private-secret')
         for _ in range(2):
             response = self.get()
@@ -99,6 +99,9 @@ class AuthorCountApiTests(unittest.TestCase):
         self.app.state.store.set_setting('cookie', '')
         self.assertEqual(self.get().status_code, 503)
         self.assertEqual(len(self.core.calls), 1)
+        self.core.error = None
+        self.assertEqual(self.get('anonymous_author').status_code, 200)
+        self.assertEqual(self.core.calls, ['valid_author', 'anonymous_author'])
 
     def test_concurrent_same_author_is_one_query_and_download_lock_is_not_taken(self):
         self.core.delay = 0.1
@@ -136,7 +139,7 @@ class AuthorCountApiTests(unittest.TestCase):
         with patch('app.main.time', clock):
             self.core.value = 7
             self.assertEqual(self.get().json()['count'], 7)
-            now[0] += 299
+            now[0] += 1799
             self.assertEqual(self.get().json()['count'], 7)
             self.assertEqual(len(self.core.calls), 1)
             now[0] += 1
@@ -145,7 +148,7 @@ class AuthorCountApiTests(unittest.TestCase):
             self.core.error = RuntimeError('private')
             self.assertEqual(self.get('failed').status_code, 503)
             self.core.error = None
-            now[0] += 29
+            now[0] += 299
             self.assertEqual(self.get('failed').status_code, 503)
             now[0] += 1
             self.assertEqual(self.get('failed').status_code, 200)
@@ -155,15 +158,15 @@ class AuthorCountApiTests(unittest.TestCase):
             self.assertEqual(self.get().status_code, 200)
             self.assertEqual(len(self.core.calls), calls + 1, 'old cache entries must be evicted')
 
-    def test_cookie_change_during_request_rejects_stale_result(self):
+    def test_cookie_change_during_request_does_not_affect_anonymous_result(self):
         self.core.delay = 0.1
         with ThreadPoolExecutor(max_workers=1) as pool:
             pending = pool.submit(self.get)
             self.assertTrue(self.core.started.wait(timeout=3))
             self.app.state.store.set_setting('cookie', 'sessionid=new-cookie')
-            self.assertEqual(pending.result(timeout=3).status_code, 503)
+            self.assertEqual(pending.result(timeout=3).status_code, 200)
         self.assertEqual(self.get().status_code, 200)
-        self.assertEqual(len(self.core.calls), 2)
+        self.assertEqual(self.core.calls, ['valid_author'])
 
     def test_timeout_releases_slots_and_caches_failure(self):
         real_asyncio = asyncio

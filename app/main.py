@@ -2,11 +2,12 @@ import asyncio
 import hashlib
 import hmac
 import os
+import re
 import secrets
 import sqlite3
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -14,16 +15,19 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
+from starlette.background import BackgroundTask
 
 from .core import Core, download_directory, normalize_input
 from .store import Store, FREQUENCIES, BEIJING
 from .legacy import LegacyIndex, recorded_download, recorded_downloads
 from .playback import PlaybackCache
 from .cookie_sync import CookieSync
+from .comments import CommentService
+from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.3.6"
+VERSION = "1.4.0"
 BASE = Path(__file__).resolve().parent
 
 
@@ -53,6 +57,7 @@ class JobService:
         self.retry_delay = 2
         self.active_task_id = None
         self.active_download = None
+        self.comments = CommentService(store, core)
 
     async def initialize(self):
         try:
@@ -252,8 +257,12 @@ class JobService:
             try:
                 if needs_recovery:
                     self.store.recover()
+                    self.comments.recover()
                     needs_recovery = False
                 processed = await self.process_one()
+                if not processed:
+                    async with self.lock:
+                        processed = await self.comments.step()
                 self.queue_error = ""
                 remaining = self.store.setting('queue_resume_at', 0) - time.time()
                 await asyncio.sleep(min(30, max(0.5, remaining)) if not processed else 0)
@@ -328,6 +337,44 @@ class FavoriteInput(BaseModel):
     favorite: bool
 
 
+def browse_timestamp(value):
+    if not re.fullmatch(r'[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}\.[0-9]{3}Z', value):
+        raise ValueError('浏览时间格式无效')
+    return datetime.strptime(value, '%Y-%m-%dT%H:%M:%S.%fZ').replace(tzinfo=timezone.utc)
+
+
+class BrowseEvent(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    event_id: str = Field(pattern=r'^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$', min_length=36, max_length=36)
+    work_id: str = Field(pattern=r'^[0-9]{19}$', min_length=19, max_length=19)
+    url: str = Field(max_length=100)
+    title: str = Field(default='', max_length=500)
+    author_name: str = Field(default='', max_length=100)
+    author_url: str = Field(default='', max_length=160)
+    viewed_at: str = Field(min_length=24, max_length=24)
+    metadata_revision: int = Field(default=0, ge=0, le=9007199254740991, strict=True)
+
+    @model_validator(mode='after')
+    def validate_event(self):
+        if self.url not in (f'https://www.douyin.com/video/{self.work_id}', f'https://www.douyin.com/note/{self.work_id}'):
+            raise ValueError('作品链接无效')
+        if self.author_url and not re.fullmatch(r'https://www\.douyin\.com/user/[A-Za-z0-9_-]{6,128}', self.author_url):
+            raise ValueError('博主链接无效')
+        if browse_timestamp(self.viewed_at) > datetime.now(timezone.utc) + timedelta(days=1):
+            raise ValueError('浏览时间无效')
+        return self
+
+
+class BrowseHistoryInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    items: list[BrowseEvent] = Field(min_length=1, max_length=100)
+
+
+class CommentInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    action: Literal['save', 'update', 'continue'] = 'save'
+
+
 def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=None):
     os.umask(0o077)
     data_dir = Path(data_dir or os.environ.get("APP_DATA", "data"))
@@ -396,7 +443,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     @app.get("/health")
     async def health():
         alive = bool(service.running and service.worker and not service.worker.done())
-        healthy = alive and not service.queue_error and not service.schedule_error
+        healthy = alive and core.ready and not service.queue_error and not service.schedule_error
         return JSONResponse({"status": "ok" if healthy else "degraded", "version": VERSION,
                              "core_ready": core.ready, "worker_alive": alive, "queue_error": service.queue_error or service.schedule_error},
                             status_code=200 if healthy else 503)
@@ -437,16 +484,16 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def change_admin(body: AdminKeyInput, current=Depends(authorize)):
         return save_admin_key(body, current)
 
-    def settings_response():
+    def settings_response(current_key):
         return {"cookie_configured": bool(store.setting("cookie", "")),
                 "quality_policy": store.setting("quality_policy", "upstream"),
-                "interval_minutes": store.setting("interval_minutes", 60), "script_token": store.setting("access_token", ""),
+                "interval_minutes": store.setting("interval_minutes", 60), "script_token": current_key,
                 "download_dir": str(download_directory(store.setting("download_dir", ""), media_dir)),
                 "media_root": str(media_dir)}
 
-    @app.get("/api/settings", dependencies=[Depends(authorize)])
-    async def settings():
-        return settings_response()
+    @app.get("/api/settings")
+    async def settings(current=Depends(authorize)):
+        return JSONResponse(settings_response(current), headers={'Cache-Control': 'no-store'})
 
     @app.post("/api/cookie-sync")
     async def create_cookie_sync(owner=Depends(authorize)):
@@ -480,11 +527,16 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             raise HTTPException(409, "Cookie 同步请求已处理，请重新操作") from None
         return JSONResponse(result, status_code=202, headers={"Cache-Control": "no-store"})
 
-    @app.put("/api/settings", dependencies=[Depends(authorize)])
-    async def save_settings(body: SettingsInput):
+    @app.put("/api/settings")
+    async def save_settings(body: SettingsInput, current=Depends(authorize)):
         if body.quality_policy is not None and body.quality_policy not in {"confirm", "upstream"}:
             raise ValueError("请选择每次确认或明确接受原项目优选质量")
         async with service.lock:
+            def still_authorized():
+                if not hmac.compare_digest(current.encode(), store.setting('access_token', '').encode()):
+                    raise HTTPException(401, '管理员密钥已更改，请重新登录')
+
+            still_authorized()
             if body.download_dir is not None:
                 path = download_directory(body.download_dir, media_dir)
                 probe = path / (".write-check-" + secrets.token_hex(8))
@@ -495,11 +547,32 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                 except OSError:
                     raise ValueError("下载目录不可写，请检查 NAS 挂载和目录权限") from None
                 body.download_dir = path.relative_to(media_dir).as_posix()
-            for key, value in body.model_dump(exclude_none=True).items():
-                store.set_setting(key, value)
-            if body.cookie is not None or body.download_dir is not None:
-                await service.initialize()
-        return settings_response()
+            values = body.model_dump(exclude_none=True)
+            restart = body.cookie is not None or body.download_dir is not None
+            old_cookie, old_directory = store.setting('cookie', ''), store.setting('download_dir', '')
+            try:
+                if restart:
+                    await core.start(values.get('cookie', old_cookie), values.get('download_dir', old_directory))
+                    if not core.ready:
+                        raise RuntimeError('核心未就绪')
+                still_authorized()
+                store.set_settings(values)
+            except (Exception, asyncio.CancelledError) as exc:
+                restored = True
+                if restart:
+                    try:
+                        await core.start(old_cookie, old_directory)
+                        restored = bool(core.ready)
+                    except (Exception, asyncio.CancelledError):
+                        restored = False
+                    if not restored:
+                        core.ready = False
+                        core.error = '原配置已保留，但下载核心恢复失败，请检查设置后重试'
+                if isinstance(exc, (HTTPException, asyncio.CancelledError)):
+                    raise
+                message = '新设置未生效，原配置已保留，请检查后重试' if restored else core.error
+                raise HTTPException(503, message) from None
+        return JSONResponse(settings_response(current), headers={'Cache-Control': 'no-store'})
 
     def public_task(task):
         if not task:
@@ -575,6 +648,84 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         store.set_favorite(work_id,body.favorite)
         return {"favorite":body.favorite}
 
+    def comment_target(work_id):
+        if not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', work_id):
+            raise HTTPException(404, '作品不存在')
+        real_id = store.comment_work_id(work_id)
+        try:
+            work = store.work(work_id)
+        except RuntimeError:
+            work = None
+        state = store.comment_state(real_id) if real_id else store.comment_state('')
+        if not work and state['operation'] == 'unsaved':
+            raise HTTPException(404, '作品不存在')
+        return real_id, bool(real_id and work), state
+
+    @app.get('/api/works/{work_id}/comments', dependencies=[Depends(authorize)])
+    def comments(work_id: str, root_id: str = Query(default='', pattern=r'^(?:[0-9]{1,32})?$'),
+                 offset: int = Query(default=0, ge=0), limit: int = Query(default=50, ge=1, le=50)):
+        real_id, can_save, state = comment_target(work_id)
+        page = store.comment_page(real_id, root_id, offset, limit) if real_id else {'items': [], 'next_offset': None}
+        return JSONResponse({'work_id': real_id, 'can_save': can_save, 'status': state, **page},
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/works/{work_id}/comments', dependencies=[Depends(authorize)])
+    async def save_comments(work_id: str, body: CommentInput):
+        real_id, can_save, _ = comment_target(work_id)
+        if not can_save:
+            raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
+        return JSONResponse(service.comments.queue(real_id, body.action), status_code=202,
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/works/{work_id}/comments/cancel', dependencies=[Depends(authorize)])
+    async def cancel_comments(work_id: str):
+        real_id, _, state = comment_target(work_id)
+        return JSONResponse(service.comments.cancel(real_id) if real_id else state,
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.get('/api/works/{work_id}/comments/export', dependencies=[Depends(authorize)])
+    def export_comments(work_id: str, format: Literal['json', 'csv', 'zip'] = 'json'):
+        real_id, _, _ = comment_target(work_id)
+        if not real_id:
+            raise HTTPException(409, '此作品尚无可导出的评论存档')
+        try:
+            path, media_type, filename = export_snapshot(store.comment_snapshot(real_id), data_dir, format)
+        except (OSError, RuntimeError, ValueError):
+            raise HTTPException(503, '评论导出暂时失败，请检查可用空间后重试') from None
+        return FileResponse(path, media_type=media_type, filename=filename,
+                            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
+                            background=BackgroundTask(path.unlink, missing_ok=True))
+
+    @app.get('/api/comment-assets/{asset_id}', dependencies=[Depends(authorize)])
+    def comment_image(asset_id: str):
+        if not re.fullmatch(r'[a-f0-9]{32,64}', asset_id):
+            raise HTTPException(404, '本地评论图片不存在')
+        asset = store.comment_asset(asset_id)
+        if not asset:
+            raise HTTPException(404, '本地评论图片不存在')
+        try:
+            path = asset_path(data_dir, asset)
+        except (OSError, RuntimeError, ValueError, TypeError):
+            raise HTTPException(404, '本地评论图片不存在或尚未保存') from None
+        return FileResponse(path, headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff',
+                                          'Content-Security-Policy': "default-src 'none'; sandbox"})
+
+    @app.post('/api/browse-history', dependencies=[Depends(authorize)])
+    async def record_browse_history(body: BrowseHistoryInput):
+        return {'accepted': store.record_browse_history([item.model_dump() for item in body.items])}
+
+    @app.get('/api/browse-history', dependencies=[Depends(authorize)])
+    async def browse_history(limit: int = Query(default=50, ge=1, le=100), before: str | None = Query(default=None, max_length=61)):
+        if before is not None:
+            parts = before.split('|')
+            if len(parts) != 2 or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', parts[1]):
+                raise HTTPException(422, '历史游标无效')
+            try:
+                browse_timestamp(parts[0])
+            except ValueError:
+                raise HTTPException(422, '历史游标无效') from None
+        return JSONResponse(store.browse_history(limit, before), headers={'Cache-Control': 'no-store'})
+
     @app.get("/api/authors/history", dependencies=[Depends(authorize)])
     async def author_history():
         return store.author_history()
@@ -593,11 +744,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
 
     @app.get('/api/author-count', dependencies=[Depends(authorize)])
     async def author_count(sec_uid: str = Query(pattern=r'^[A-Za-z0-9_-]{1,128}$')):
-        cookie = store.setting('cookie', '') or ''
         headers = {'Cache-Control': 'no-store'}
-        if not cookie:
-            return JSONResponse({'detail': '无法获取博主作品数量'}, status_code=503, headers=headers)
-        key = (hashlib.sha256(cookie.encode()).hexdigest(), sec_uid)
+        key = sec_uid
         cached = count_cache.get(key)
         if cached and cached[0] > time.monotonic():
             count = cached[1]
@@ -605,12 +753,12 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             async def fetch_count():
                 try:
                     try:
-                        async with asyncio.timeout(45):
+                        async with asyncio.timeout(8):
                             async with count_limit:
-                                value = await core.author_count(sec_uid, cookie)
+                                value = await core.author_count(sec_uid)
                     except Exception:
                         value = None
-                    count_cache[key] = (time.monotonic() + (30 if value is None else 300), value)
+                    count_cache[key] = (time.monotonic() + (300 if value is None else 1800), value)
                     while len(count_cache) > 128:
                         count_cache.pop(next(iter(count_cache)))
                     return value
@@ -618,10 +766,12 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                     count_requests.pop(key, None)
 
             if key not in count_requests:
+                if len(count_requests) >= 8:
+                    return JSONResponse({'detail': '数量查询繁忙，请稍后重试'}, status_code=429, headers=headers)
                 count_requests[key] = asyncio.create_task(fetch_count())
             count = await asyncio.shield(count_requests[key])
-        if count is None or store.setting('cookie', '') != cookie:
-            return JSONResponse({'detail': '无法获取博主作品数量'}, status_code=503, headers=headers)
+        if count is None:
+            return JSONResponse({'detail': '匿名读取暂不可用，可打开博主页读取页面已显示的数量'}, status_code=503, headers=headers)
         return JSONResponse({'sec_uid': sec_uid, 'count': count}, headers=headers)
 
     @app.post("/api/authors", dependencies=[Depends(authorize)])

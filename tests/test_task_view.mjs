@@ -113,7 +113,7 @@ try {
     const context = vm.createContext({
       $: id => session.ids[id], state, switchView, taskView: session.controller, AbortSignal,
       document: { querySelectorAll: selector => selector === 'dialog[open]' ? [session.ids['task-detail-dialog'], session.ids['submit-dialog']].filter(dialog => dialog.open) : [] },
-      localStorage: { removeItem: key => stored.delete(key) },
+      localStorage: { getItem: key => stored.get(key), removeItem: key => stored.delete(key) },
       fetch: async () => ({ ok: false, status, json: async () => ({ detail: '请重新登录' }) })
     });
     vm.runInContext(webSource.slice(webSource.indexOf('  async function api('), webSource.indexOf('  async function initializeConnection(')), context);
