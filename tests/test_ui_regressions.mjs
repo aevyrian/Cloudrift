@@ -75,6 +75,11 @@ assert.equal(remaining[19].id,'21');
   assert.equal(player.requested.length,0,'关闭评论后不得补触发刚才的自动切换');
 }
 {
+  const player=browser(), first=player.append(work('first')), video=player.ready(first);let closed=0;
+  player.state.comments={isOpenFor:()=>true,close(){closed++;}};player.document.hidden=true;player.test.syncPlayback();
+  assert.equal(closed,0,'切换浏览器标签时保留评论面板');assert.equal(video.paused,true,'切换标签仍暂停播放');
+}
+{
   const moving=browser();moving.state.view='favorites';moving.state.nextOffset=20;moving.state.total=21;moving.state.hasMore=true;
   for(const item of all.slice(0,20))moving.append({...item,favorite:true});
   let resolveOld,resolveFresh;

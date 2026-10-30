@@ -68,7 +68,25 @@ class CommentStoreTests(unittest.TestCase):
         self.assertEqual(self.store.comment_asset(asset['id'])['status'], 'saved')
         replacement = {**attachment, 'source_url': 'https://example.invalid/b'}
         self.store.comment_commit_page(WORK, token, [item('111', attachments=[replacement])], checkpoint, None, 0)
-        self.assertEqual(self.store.comment_asset(asset['id'])['status'], 'pending')
+        current = self.store.comment_asset(asset['id'])
+        self.assertEqual((current['status'], current['relative_path'], current['refresh_pending']),
+                         ('saved', 'comment-assets/a.png', 1))
+
+    def test_upgrade_preserves_old_pending_reference(self):
+        token = self.store.comment_queue(WORK, 'save')['token']
+        self.store.comment_claim()
+        attachment = {'kind': 'image', 'source_url': 'https://example.invalid/a', 'status': 'pending', 'error': ''}
+        self.store.comment_commit_page(WORK, token, [item('111', attachments=[attachment])],
+                                       {'cursor': 0, 'root_done': False, 'replies': []}, None, 0)
+        asset = self.store.comment_next_asset(WORK)
+        self.store.comment_commit_asset(WORK, token, asset['id'], {'relative_path': 'comment-assets/a.png', 'sha256': 'a' * 64, 'bytes': 1}, 0)
+        # Simulate the previously released database while a replacement was in flight.
+        with self.store.connect() as db:
+            db.execute("UPDATE comment_assets SET status='pending' WHERE id=?", (asset['id'],))
+            db.execute('ALTER TABLE comment_assets DROP COLUMN refresh_pending')
+        restored = Store(self.store.root).comment_asset(asset['id'])
+        self.assertEqual((restored['status'], restored['relative_path'], restored['refresh_pending']),
+                         ('saved', 'comment-assets/a.png', 1))
 
 
 if __name__ == '__main__':

@@ -3,11 +3,17 @@ import csv
 import importlib.util
 import io
 import json
+import shutil
+import ssl
+import subprocess
 import tempfile
+import threading
+import time
 import unittest
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from unittest.mock import AsyncMock, patch
 
 
@@ -111,7 +117,19 @@ class CommentAssetsTests(unittest.IsolatedAsyncioTestCase):
         class Session:
             def __init__(self, **kwargs):
                 seen.append(kwargs)
+                self.options = kwargs
                 self.stream = stream
+            async def request(self, method, url, **kwargs):
+                from curl_cffi import CurlOpt
+                async with self.stream(method, url, **kwargs) as response:
+                    if int(response.headers.get('content-length', '0')) > self.options['curl_options'][CurlOpt.MAXFILESIZE_LARGE]:
+                        error = RuntimeError('file size exceeded')
+                        error.code = 63
+                        raise error
+                    async for chunk in response.aiter_content():
+                        if kwargs['content_callback'](chunk) != len(chunk):
+                            raise RuntimeError('transfer aborted')
+                    return response
             async def __aenter__(self):
                 return self
             async def __aexit__(self, *args):
@@ -119,6 +137,7 @@ class CommentAssetsTests(unittest.IsolatedAsyncioTestCase):
         return Session
 
     async def test_download_pins_public_dns_and_saves_by_content_hash_without_credentials(self):
+        from curl_cffi import CurlOpt
         png = b'\x89PNG\r\n\x1a\ncontent'
         seen = []
         response = [(200, {'content-type': 'image/png'}, [png[:4], png[4:]])]
@@ -132,6 +151,9 @@ class CommentAssetsTests(unittest.IsolatedAsyncioTestCase):
         options = seen[0]
         self.assertFalse(options['trust_env'])
         self.assertIn('p1.douyinpic.com:443:93.184.216.34', str(options['curl_options']))
+        self.assertGreater(options['curl_options'][CurlOpt.TIMEOUT_MS], 0)
+        self.assertLessEqual(options['curl_options'][CurlOpt.TIMEOUT_MS], 15000)
+        self.assertEqual(options['curl_options'][CurlOpt.MAXFILESIZE_LARGE], 100)
         request = seen[1][1]
         self.assertNotIn('Cookie', request['headers'])
         self.assertNotIn('Authorization', request['headers'])
@@ -172,7 +194,7 @@ class CommentAssetsTests(unittest.IsolatedAsyncioTestCase):
                 self.assets, 'AsyncSession', self.fake_session(response, seen)):
             with self.assertRaises(RuntimeError):
                 await self.assets.download_asset('https://p1.douyinpic.com/a', self.root, 100)
-        self.assertFalse((self.root / 'comment-assets').exists())
+        self.assertFalse(list(self.root.rglob('*.tmp')))
         wait_for = asyncio.wait_for
         async def brief_wait(awaitable, timeout):
             self.assertEqual(timeout, 15)
@@ -189,13 +211,101 @@ class CommentAssetsTests(unittest.IsolatedAsyncioTestCase):
         session = self.fake_session([], [])
         def slow_session(**kwargs):
             instance = session(**kwargs)
-            instance.stream = slow_stream
+            async def slow_request(*args, **kwargs):
+                async with slow_stream() as response:
+                    async for chunk in response.aiter_content():
+                        kwargs['content_callback'](chunk)
+                    return response
+            instance.request = slow_request
             return instance
         with patch.object(asyncio.get_running_loop(), 'getaddrinfo', AsyncMock(return_value=answers[0])), patch.object(
                 self.assets, 'AsyncSession', slow_session), patch.object(self.assets.asyncio, 'wait_for', brief_wait):
             with self.assertRaises(RuntimeError):
                 await self.assets.download_asset('https://p1.douyinpic.com/a', self.root, 100)
         self.assertFalse(list(self.root.rglob('*.tmp')))
+
+    async def test_real_curl_aborts_announced_and_unannounced_oversize_and_timeout(self):
+        from curl_cffi import CurlOpt
+        from curl_cffi.requests import AsyncSession as RealSession
+        openssl = shutil.which('openssl') or r'C:\Program Files\Git\usr\bin\openssl.exe'
+        if not Path(openssl).is_file():
+            self.skipTest('openssl is needed for the local trusted TLS fixture')
+        cert, key = self.root / 'cert.pem', self.root / 'key.pem'
+        subprocess.run([openssl, 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-keyout', str(key),
+                        '-out', str(cert), '-days', '1', '-subj', '/CN=p1.douyinpic.com',
+                        '-addext', 'subjectAltName=DNS:p1.douyinpic.com'], check=True, capture_output=True)
+        sent, done = {}, {}
+        png = b'\x89PNG\r\n\x1a\ncontent'
+        class Handler(BaseHTTPRequestHandler):
+            def log_message(self, *args):
+                pass
+            def do_GET(self):
+                path = self.path
+                sent[path] = 0
+                done[path] = threading.Event()
+                try:
+                    self.send_response(200)
+                    self.send_header('Content-Type', 'image/png')
+                    if path != '/unknown':
+                        self.send_header('Content-Length', str(64 * 1024 * 1024 if path == '/huge' else 100 if path == '/slow' else len(png)))
+                    self.end_headers()
+                    chunks = [png] if path == '/ok' else [b'x'] * 100 if path == '/slow' else [b'x' * 65536] * 1024
+                    for chunk in chunks:
+                        self.wfile.write(chunk)
+                        self.wfile.flush()
+                        sent[path] += len(chunk)
+                        if path != '/ok':
+                            time.sleep(.01 if path == '/slow' else .001)
+                except OSError:
+                    pass
+                finally:
+                    done[path].set()
+        try:
+            server = ThreadingHTTPServer(('127.0.0.1', 443), Handler)
+        except OSError:
+            self.skipTest('local TLS fixture requires an available loopback port 443')
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(cert, key)
+        server.socket = context.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        session_timeout = None
+        class LocalSession(RealSession):
+            def __init__(self, **kwargs):
+                kwargs['verify'] = str(cert)
+                if session_timeout is not None:
+                    kwargs['curl_options'][CurlOpt.TIMEOUT_MS] = min(kwargs['curl_options'][CurlOpt.TIMEOUT_MS], session_timeout)
+                super().__init__(**kwargs)
+        try:
+            with patch.object(self.assets, '_validated_target', AsyncMock(return_value=('p1.douyinpic.com', '127.0.0.1'))), patch.object(
+                    self.assets, 'AsyncSession', LocalSession):
+                saved = await self.assets.download_asset('https://p1.douyinpic.com/ok', self.root, 100)
+                self.assertEqual((self.root / saved['relative_path']).read_bytes(), png)
+                with self.assertRaises(self.assets.AssetLimit):
+                    await self.assets.download_asset('https://p1.douyinpic.com/ok', self.root, 10)
+                for endpoint, remaining in (('/huge', 100 * 1024 * 1024), ('/unknown', 65536)):
+                    with self.assertRaises(RuntimeError) as caught:
+                        await self.assets.download_asset('https://p1.douyinpic.com' + endpoint, self.root, remaining)
+                    self.assertNotIsInstance(caught.exception, self.assets.AssetStorageError)
+                    await asyncio.to_thread(done[endpoint].wait, 2)
+                    self.assertLess(sent[endpoint], 4 * 1024 * 1024, 'rejected body must stop real transfer, not collect it in a queue')
+                    self.assertFalse(list(self.root.rglob('*.tmp')))
+                session_timeout = 50
+                wait_for = asyncio.wait_for
+                async def brief_wait(awaitable, timeout):
+                    return await wait_for(awaitable, .05)
+                with patch.object(self.assets.asyncio, 'wait_for', brief_wait):
+                    start = time.monotonic()
+                    with self.assertRaises(RuntimeError) as caught:
+                        await self.assets.download_asset('https://p1.douyinpic.com/slow', self.root, 100)
+                    self.assertNotIsInstance(caught.exception, self.assets.AssetStorageError)
+                    self.assertLess(time.monotonic() - start, .3)
+                    self.assertIn('/slow', sent)
+                self.assertFalse(list(self.root.rglob('*.tmp')))
+        finally:
+            server.shutdown()
+            server.server_close()
+            thread.join()
 
 
 if __name__ == '__main__':

@@ -110,7 +110,7 @@ class Store:
                     id TEXT PRIMARY KEY, work_id TEXT NOT NULL, comment_id TEXT NOT NULL,
                     kind TEXT NOT NULL, source_url TEXT NOT NULL, relative_path TEXT NOT NULL DEFAULT '',
                     status TEXT NOT NULL, error TEXT NOT NULL DEFAULT '', sha256 TEXT NOT NULL DEFAULT '',
-                    bytes INTEGER NOT NULL DEFAULT 0);
+                    bytes INTEGER NOT NULL DEFAULT 0, refresh_pending INTEGER NOT NULL DEFAULT 0);
                 CREATE INDEX IF NOT EXISTS comment_assets_work ON comment_assets(work_id,comment_id,status);
                 CREATE TABLE IF NOT EXISTS authors (
                     id TEXT PRIMARY KEY, name TEXT NOT NULL, url TEXT NOT NULL UNIQUE,
@@ -123,6 +123,9 @@ class Store:
                     db.execute(f'ALTER TABLE authors ADD COLUMN {name} {kind}')
             if 'metadata_revision' not in {row[1] for row in db.execute('PRAGMA table_info(browse_history)')}:
                 db.execute('ALTER TABLE browse_history ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0')
+            if 'refresh_pending' not in {row[1] for row in db.execute('PRAGMA table_info(comment_assets)')}:
+                db.execute('ALTER TABLE comment_assets ADD COLUMN refresh_pending INTEGER NOT NULL DEFAULT 0')
+                db.execute("UPDATE comment_assets SET status='saved',refresh_pending=1 WHERE status='pending' AND relative_path!='' AND sha256!=''")
 
     @contextmanager
     def connect(self):
@@ -401,6 +404,8 @@ class Store:
             row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
             if row and row['operation'] in ('queued', 'running'):
                 return self._comment_job(row)
+            if action == 'continue':
+                db.execute("UPDATE comment_assets SET refresh_pending=1 WHERE work_id=? AND status='saved' AND error!='' AND source_url!=''", (work_id,))
             checkpoint = json.loads(row['checkpoint']) if row else {'cursor': 0, 'root_done': False, 'replies': []}
             if action in ('save', 'update') or (checkpoint['root_done'] and not checkpoint['replies']):
                 checkpoint = {'cursor': 0, 'root_done': False, 'replies': []}
@@ -449,7 +454,10 @@ class Store:
     def comment_block(self, work_id, token):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            result = db.execute("UPDATE comment_jobs SET operation='failed',integrity='partial',reason='评论访问需要登录、验证或暂时受限，请处理后重试',updated_at=? WHERE work_id=? AND token=? AND operation='running'", (stamp(), work_id, token))
+            result = db.execute("""UPDATE comment_jobs SET operation=CASE WHEN operation='stopped' THEN 'stopped' ELSE 'failed' END,
+                                integrity='partial',reason=CASE WHEN operation='stopped' THEN '已停止；评论访问受限，队列已暂停'
+                                ELSE '评论访问需要登录、验证或暂时受限，请处理后重试' END,updated_at=?
+                                WHERE work_id=? AND token=? AND operation IN ('running','stopped')""", (stamp(), work_id, token))
             if result.rowcount:
                 db.execute("INSERT INTO settings VALUES ('comment_queue_paused','true') ON CONFLICT(key) DO UPDATE SET value='true'")
 
@@ -472,10 +480,18 @@ class Store:
                 for index, asset in enumerate(item['attachments']):
                     asset_id = hashlib.sha256(f"{work_id}\0{item['id']}\0{index}".encode()).hexdigest()[:32]
                     db.execute('''INSERT INTO comment_assets(id,work_id,comment_id,kind,source_url,status,error) VALUES (?,?,?,?,?,?,?)
-                                  ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,source_url=excluded.source_url,
-                                  status=CASE WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.status
+                                  ON CONFLICT(id) DO UPDATE SET
+                                  kind=CASE WHEN comment_assets.status='saved' THEN comment_assets.kind ELSE excluded.kind END,
+                                  source_url=CASE WHEN comment_assets.status='saved' AND excluded.source_url='' THEN comment_assets.source_url ELSE excluded.source_url END,
+                                  status=CASE WHEN comment_assets.status='saved' THEN 'saved'
+                                              WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.status
                                               WHEN comment_assets.status='missing' AND excluded.status='pending' THEN 'pending' ELSE comment_assets.status END,
-                                  error=CASE WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.error
+                                  refresh_pending=CASE WHEN comment_assets.status='saved' AND excluded.status!='pending' THEN 0
+                                      WHEN comment_assets.status='saved' AND (comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind OR comment_assets.error!='') THEN 1
+                                      ELSE comment_assets.refresh_pending END,
+                                  error=CASE WHEN comment_assets.status='saved' AND excluded.status!='pending' THEN '新图片暂不支持，已保留本地副本'
+                                             WHEN comment_assets.status='saved' THEN comment_assets.error
+                                             WHEN comment_assets.source_url!=excluded.source_url OR comment_assets.kind!=excluded.kind THEN excluded.error
                                              WHEN comment_assets.status='missing' AND excluded.status='pending' THEN '' ELSE comment_assets.error END''',
                                (asset_id, work_id, item['id'], asset['kind'], asset['source_url'], asset['status'], asset['error']))
             db.execute("UPDATE comment_jobs SET checkpoint=?,requests=requests+1,new_comments=new_comments+?,active_seconds=active_seconds+?,integrity='partial',saved_at=?,platform_total=COALESCE(?,platform_total),updated_at=? WHERE work_id=? AND token=?",
@@ -484,7 +500,7 @@ class Store:
 
     def comment_next_asset(self, work_id):
         with self.connect() as db:
-            row = db.execute("SELECT * FROM comment_assets WHERE work_id=? AND status='pending' ORDER BY rowid LIMIT 1", (work_id,)).fetchone()
+            row = db.execute("SELECT * FROM comment_assets WHERE work_id=? AND (status='pending' OR refresh_pending=1) ORDER BY rowid LIMIT 1", (work_id,)).fetchone()
         return dict(row) if row else None
 
     def comment_commit_asset(self, work_id, token, asset_id, result, elapsed, error=''):
@@ -493,8 +509,15 @@ class Store:
             job = db.execute('SELECT token,operation FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
             if not job or job['token'] != token or job['operation'] not in ('running', 'stopped'):
                 return False
-            db.execute('''UPDATE comment_assets SET status=?,relative_path=?,sha256=?,bytes=?,error=? WHERE id=? AND work_id=? AND status='pending' ''',
-                       ('missing' if error else 'saved', result.get('relative_path', ''), result.get('sha256', ''), result.get('bytes', 0), error, asset_id, work_id))
+            db.execute('''UPDATE comment_assets SET
+                       status=CASE WHEN ? AND status='saved' THEN status WHEN ? THEN 'missing' ELSE 'saved' END,
+                       relative_path=CASE WHEN ? AND status='saved' THEN relative_path ELSE ? END,
+                       sha256=CASE WHEN ? AND status='saved' THEN sha256 ELSE ? END,
+                       bytes=CASE WHEN ? AND status='saved' THEN bytes ELSE ? END,
+                       error=CASE WHEN ? AND status='saved' THEN '图片更新失败，已保留本地副本，可继续保存' ELSE ? END,
+                       refresh_pending=0 WHERE id=? AND work_id=? AND (status='pending' OR refresh_pending=1)''',
+                       (bool(error), bool(error), bool(error), result.get('relative_path', ''), bool(error), result.get('sha256', ''),
+                        bool(error), result.get('bytes', 0), bool(error), error, asset_id, work_id))
             db.execute('UPDATE comment_jobs SET active_seconds=active_seconds+?,asset_bytes=asset_bytes+?,saved_at=?,updated_at=? WHERE work_id=? AND token=?',
                        (elapsed, result.get('bytes', 0), stamp(), stamp(), work_id, token))
             return True
@@ -505,10 +528,11 @@ class Store:
             job = db.execute('SELECT token,operation FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
             if not job or job['token'] != token or job['operation'] != 'running':
                 return
-            missing = db.execute("SELECT 1 FROM comment_assets WHERE work_id=? AND status!='saved' LIMIT 1", (work_id,)).fetchone()
+            missing = db.execute("SELECT 1 FROM comment_assets WHERE work_id=? AND (status!='saved' OR refresh_pending=1 OR error!='') LIMIT 1", (work_id,)).fetchone()
             integrity = 'finished-visible' if finished and not missing else 'partial'
             if finished and missing:
-                reason = '评论已保存，部分附件未保存或不受支持'
+                old_image = db.execute("SELECT 1 FROM comment_assets WHERE work_id=? AND status='saved' AND error!='' LIMIT 1", (work_id,)).fetchone()
+                reason = '部分图片更新失败，已保留本地副本，可继续保存' if old_image else '评论已保存，部分附件未保存或不受支持'
             db.execute('UPDATE comment_jobs SET operation=?,integrity=?,reason=?,updated_at=? WHERE work_id=? AND token=?',
                        (operation, integrity, reason, stamp(), work_id, token))
 

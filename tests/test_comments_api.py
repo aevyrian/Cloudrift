@@ -84,6 +84,13 @@ class CommentApiTests(unittest.TestCase):
             network.assert_not_awaited()
             self.assertFalse(list((self.store.root / 'comment-exports').glob('*')))
 
+    def test_export_invalid_or_unsatisfiable_ranges_leave_no_temporary_files(self):
+        for value, status in [('bytes=invalid', 400), ('bytes=999999999999-', 416), ('bytes=0-9', 206)]:
+            with self.subTest(value=value):
+                response = self.client.get(self.url + '/export?format=zip', headers={**self.auth, 'Range': value})
+                self.assertEqual(response.status_code, status)
+                self.assertFalse(list((self.store.root / 'comment-exports').glob('*')))
+
 
 if __name__ == '__main__':
     unittest.main()

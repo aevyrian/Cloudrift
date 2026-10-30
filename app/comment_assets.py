@@ -8,12 +8,15 @@ import json
 import os
 import socket
 import tempfile
+import time
 import zipfile
 from pathlib import Path, PurePosixPath
 from urllib.parse import urljoin, urlsplit
 
 from curl_cffi import CurlOpt
+from curl_cffi.curl import CURL_WRITEFUNC_ERROR
 from curl_cffi.requests import AsyncSession
+from curl_cffi.requests.exceptions import RequestException
 
 
 # Observed 2026-10-30 in real comment-list DOM: p3-pc-sign.douyinpic.com
@@ -104,65 +107,88 @@ def _matches_image(header, extension):
 
 async def _download(source_url, data_root, remaining_bytes):
     temporary = None
+    deadline = time.monotonic() + 15
     try:
         for hop in range(4):
             host, address = await _validated_target(source_url)
+            milliseconds = int((deadline - time.monotonic()) * 1000)
+            if milliseconds <= 0:
+                raise TimeoutError
             pinned = '[' + address + ']' if ':' in address else address
-            # Resolve pins the checked IP while preserving the original TLS hostname.
-            async with AsyncSession(trust_env=False, timeout=15, retry=0, discard_cookies=True,
-                                    curl_options={CurlOpt.RESOLVE: [f'{host}:443:{pinned}'],
-                                                  CurlOpt.PROXY: '', CurlOpt.NOPROXY: '*'}) as client:
-                async with client.stream('GET', source_url, allow_redirects=False, discard_cookies=True,
-                                         headers={'Accept': 'image/jpeg,image/png,image/gif,image/webp,image/avif'},
-                                         accept_encoding='identity') as response:
-                    if response.status_code in (301, 302, 303, 307, 308):
-                        location = response.headers.get('location')
-                        if hop == 3 or not location:
-                            raise RuntimeError('附件跳转过多或无效。')
-                        source_url = urljoin(source_url, location)
-                        continue
+            directory = _directory(data_root, 'comment-assets')
+            digest, size, header, transfer_error = hashlib.sha256(), 0, b'', None
+            with tempfile.NamedTemporaryFile(dir=directory, suffix='.tmp', delete=False) as output:
+                temporary = Path(output.name)
+
+                def receive(chunk):
+                    nonlocal size, header, transfer_error
+                    if size + len(chunk) > MAX_IMAGE_BYTES:
+                        transfer_error = RuntimeError('附件超过单文件大小限制。')
+                    elif size + len(chunk) > remaining_bytes:
+                        transfer_error = AssetLimit('本次附件保存额度已用完，请继续保存。')
+                    if transfer_error is not None:
+                        return CURL_WRITEFUNC_ERROR
+                    try:
+                        output.write(chunk)
+                    except OSError as error:
+                        transfer_error = error
+                        return CURL_WRITEFUNC_ERROR
+                    size += len(chunk)
+                    header = (header + chunk[:64])[:64]
+                    digest.update(chunk)
+                    return len(chunk)
+
+                # Non-stream callback avoids curl_cffi's unbounded stream queue and
+                # aclose() waiting for the entire rejected body. libcurl aborts here.
+                async with AsyncSession(trust_env=False, timeout=15, retry=0, discard_cookies=True,
+                                        curl_options={CurlOpt.RESOLVE: [f'{host}:443:{pinned}'],
+                                                      CurlOpt.PROXY: '', CurlOpt.NOPROXY: '*',
+                                                      CurlOpt.TIMEOUT_MS: milliseconds,
+                                                      CurlOpt.MAXFILESIZE_LARGE: min(MAX_IMAGE_BYTES, remaining_bytes)}) as client:
+                    try:
+                        response = await client.request('GET', source_url, allow_redirects=False,
+                                                        discard_cookies=True, stream=False, content_callback=receive,
+                                                        headers={'Accept': 'image/jpeg,image/png,image/gif,image/webp,image/avif'},
+                                                        accept_encoding='identity')
+                    except Exception as error:
+                        if transfer_error is not None:
+                            raise transfer_error from None
+                        if getattr(error, 'code', None) == 63 and remaining_bytes < MAX_IMAGE_BYTES:
+                            raise AssetLimit('本次附件保存额度已用完，请继续保存。') from None
+                        raise
+                if response.status_code in (301, 302, 303, 307, 308):
+                    location = response.headers.get('location')
+                    if hop == 3 or not location:
+                        raise RuntimeError('附件跳转过多或无效。')
+                    source_url = urljoin(source_url, location)
+                else:
                     if response.status_code != 200:
                         raise RuntimeError('附件下载未成功。')
                     extension = MIME_EXTENSIONS.get(response.headers.get('content-type', '').split(';')[0].strip().lower())
-                    if extension is None:
-                        raise RuntimeError('附件格式不受支持。')
+                    if extension is None or not size or not _matches_image(header, extension):
+                        raise RuntimeError('附件实际格式与类型不符。')
                     length = response.headers.get('content-length')
                     if length is not None:
                         try:
                             length = int(length)
                         except (TypeError, ValueError):
                             raise RuntimeError('附件大小无效。') from None
-                        if length < 0 or length > MAX_IMAGE_BYTES:
-                            raise RuntimeError('附件超过单文件大小限制。')
-                        if length > remaining_bytes:
-                            raise AssetLimit('本次附件保存额度已用完，请继续保存。')
-                    directory = _directory(data_root, 'comment-assets')
-                    digest, size, header = hashlib.sha256(), 0, b''
-                    with tempfile.NamedTemporaryFile(dir=directory, suffix='.tmp', delete=False) as output:
-                        temporary = Path(output.name)
-                        async for chunk in response.aiter_content():
-                            size += len(chunk)
-                            if size > MAX_IMAGE_BYTES:
-                                raise RuntimeError('附件超过单文件大小限制。')
-                            if size > remaining_bytes:
-                                raise AssetLimit('本次附件保存额度已用完，请继续保存。')
-                            header = (header + chunk[:64])[:64]
-                            digest.update(chunk)
-                            output.write(chunk)
-                        if not size or not _matches_image(header, extension):
-                            raise RuntimeError('附件实际格式与类型不符。')
-                        if length is not None and size != length:
+                        if size != length:
                             raise RuntimeError('附件传输不完整。')
-                        output.flush()
-                        os.fsync(output.fileno())
-                    sha256 = digest.hexdigest()
-                    destination = directory / f'{sha256}.{extension}'
-                    if destination.is_symlink():
-                        raise RuntimeError('本地附件路径不可用。')
-                    os.replace(temporary, destination)
-                    temporary = None
-                    return {'relative_path': destination.relative_to(Path(data_root).resolve()).as_posix(),
-                            'sha256': sha256, 'bytes': size}
+                    output.flush()
+                    os.fsync(output.fileno())
+            if response.status_code in (301, 302, 303, 307, 308):
+                temporary.unlink(missing_ok=True)
+                temporary = None
+                continue
+            sha256 = digest.hexdigest()
+            destination = directory / f'{sha256}.{extension}'
+            if destination.is_symlink():
+                raise RuntimeError('本地附件路径不可用。')
+            os.replace(temporary, destination)
+            temporary = None
+            return {'relative_path': destination.relative_to(Path(data_root).resolve()).as_posix(),
+                    'sha256': sha256, 'bytes': size}
         raise RuntimeError('附件跳转过多。')
     finally:
         if temporary is not None:
@@ -178,6 +204,9 @@ async def download_asset(source_url, data_root, remaining_bytes):
         raise
     except asyncio.CancelledError:
         raise
+    except (RequestException, TimeoutError):
+        # curl network errors and deadline expiry also inherit OSError.
+        raise RuntimeError('附件保存失败，来源、格式、大小或连接可能不可用。') from None
     except OSError:
         raise AssetStorageError('附件写入失败，请检查磁盘空间和目录权限。') from None
     except Exception:

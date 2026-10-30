@@ -16,7 +16,6 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
-from starlette.background import BackgroundTask
 
 from .core import Core, download_directory, normalize_input
 from .store import Store, FREQUENCIES, BEIJING
@@ -29,6 +28,14 @@ from .comment_assets import asset_path, export_snapshot
 
 VERSION = "1.4.0"
 BASE = Path(__file__).resolve().parent
+
+
+class ExportFileResponse(FileResponse):
+    async def __call__(self, scope, receive, send):
+        try:
+            await super().__call__(scope, receive, send)
+        finally:
+            Path(self.path).unlink(missing_ok=True)
 
 
 def safe_error(exc, store):
@@ -692,9 +699,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             path, media_type, filename = export_snapshot(store.comment_snapshot(real_id), data_dir, format)
         except (OSError, RuntimeError, ValueError):
             raise HTTPException(503, '评论导出暂时失败，请检查可用空间后重试') from None
-        return FileResponse(path, media_type=media_type, filename=filename,
-                            headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'},
-                            background=BackgroundTask(path.unlink, missing_ok=True))
+        return ExportFileResponse(path, media_type=media_type, filename=filename,
+                                  headers={'Cache-Control': 'no-store', 'X-Content-Type-Options': 'nosniff'})
 
     @app.get('/api/comment-assets/{asset_id}', dependencies=[Depends(authorize)])
     def comment_image(asset_id: str):

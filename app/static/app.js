@@ -23,11 +23,12 @@
   }
   function createCommentsPanel({ document, element, api, binary, objectURL, formatDate }) {
     let active = null, generation = 0, timer = 0, urls = [];
+    function releaseImages() { for (const url of urls) objectURL.revokeObjectURL(url); urls = []; }
     const path = id => `/api/works/${encodeURIComponent(id)}/comments`;
     const button = (text, fn) => { const node = element('button', 'secondary', text); node.type = 'button'; node.addEventListener('click', fn); return node; };
     function close(focus = false) {
       generation++; clearTimeout(timer); timer = 0;
-      for (const url of urls) objectURL.revokeObjectURL(url); urls = [];
+      releaseImages();
       if (active) { const previous = active; active = null; previous.panel.remove(); previous.trigger.setAttribute('aria-expanded', 'false'); if (focus) previous.trigger.focus(); }
     }
     function isOpenFor(card) { return Boolean(active && active.card === card); }
@@ -42,9 +43,9 @@
       const more = button('加载更多评论', () => loadPage(active.retryReset)); more.hidden = true;
       panel.append(header, summary, explanation, statusMessage, controls, exports, list, more);
       panel.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(true); } event.stopPropagation(); });
-      active = { serial, card, trigger, panel, offset: 0, canSave: false, busy: false, state: null, pageSerial: 0, pageLoading: false, retryReset: false, revision: 0 };
+      active = { serial, card, trigger, panel, offset: 0, canSave: false, busy: false, state: null, pageSerial: 0, renderedSerial: 0, pageLoading: false, retryReset: false, revision: 0 };
       card.append(panel); trigger.setAttribute('aria-expanded', 'true'); panel.focus();
-      const localPath = path(work.id);
+      const localPath = path(work.id); let exporting = false;
       function report(error) { if (current()) statusMessage.textContent = error?.message || '操作失败，请重试。'; }
       async function operation(action) {
         if (!current() || active.busy || !active.canSave) return;
@@ -61,11 +62,15 @@
         finally { if (current()) { active.busy = false; if (!active.pageLoading) more.disabled = false; } }
       }
       async function exportData(format) {
+        if (exporting) return;
+        exporting = true; for (const node of exports.children) node.disabled = true;
         try {
           const data = await binary(`${localPath}/export?format=${format}`); if (!current()) return;
-          const url = objectURL.createObjectURL(data); urls.push(url);
+          const url = objectURL.createObjectURL(data);
           const link = element('a'); link.href = url; link.download = `comments-${work.id}.${format}`; document.body.append(link); link.click(); link.remove();
+          const revokeTimer = setTimeout(() => objectURL.revokeObjectURL(url), 60000); revokeTimer?.unref?.();
         } catch (error) { report(error); }
+        finally { exporting = false; if (current()) for (const node of exports.children) node.disabled = false; }
       }
       function paintStatus(status, canSave) {
         if (!current()) return;
@@ -81,8 +86,9 @@
           const action = status.integrity === 'partial' || ['failed','interrupted','stopped'].includes(status.operation) ? 'continue' : status.integrity === 'unsaved' ? 'save' : 'update';
           const label = status.operation === 'failed' ? '重试' : action === 'save' ? '保存评论' : action === 'continue' ? '继续保存' : '更新评论';
           controls.append(button(label, () => operation(action)));
+          if (status.operation === 'failed') { const rescan = button('从头重新扫描', () => operation('update')); rescan.title = '从头读取并保留已有评论'; controls.append(rescan); }
         }
-        if (status.integrity !== 'unsaved' || total) for (const format of ['json', 'csv', 'zip']) exports.append(button(format === 'zip' ? '导出含图片 ZIP' : `导出 ${format.toUpperCase()}`, () => exportData(format)));
+        if (status.integrity !== 'unsaved' || total) for (const format of ['json', 'csv', 'zip']) { const exportButton = button(format === 'zip' ? '导出含图片 ZIP' : `导出 ${format.toUpperCase()}`, () => exportData(format)); exportButton.disabled = exporting; exports.append(exportButton); }
         clearTimeout(timer);
         if (['queued', 'running'].includes(status.operation)) timer = setTimeout(poll, 5000);
       }
@@ -96,6 +102,7 @@
         } catch (error) { report(error); if (current()) timer = setTimeout(poll, 10000); }
       }
       function renderComment(item, parent, isReply = false) {
+        const renderedSerial = active.renderedSerial, currentPage = () => current() && renderedSerial === active.renderedSerial;
         const row = element('article', 'comment-row'), text = element('p', 'comment-text', item.text || ''), meta = element('p', 'hint', `${item.nickname || '未知用户'}${item.reply_to_user ? ` 回复 ${item.reply_to_user}` : ''} · ${formatDate(item.created_at)} · ${Number(item.likes) || 0} 赞`);
         row.append(meta, text);
         if (item.reply_target_missing) row.append(element('p', 'hint', '上级评论未保存'));
@@ -103,19 +110,19 @@
           if (attachment.status !== 'saved') { row.append(element('p', 'hint', `图片未保存${attachment.error ? `：${attachment.error}` : ''}`)); continue; }
           const placeholder = element('span', 'hint', '正在读取本地图片…'); row.append(placeholder);
           binary(`/api/comment-assets/${encodeURIComponent(attachment.id)}`).then(blob => {
-            if (!current()) return; const url = objectURL.createObjectURL(blob); urls.push(url);
+            if (!currentPage()) return; const url = objectURL.createObjectURL(blob); urls.push(url);
             const image = element('img', 'comment-image'); image.alt = attachment.kind === 'sticker' ? '评论图片表情' : '评论图片'; image.src = url; image.loading = 'lazy'; placeholder.replaceChildren(image);
-          }).catch(() => { if (current()) placeholder.textContent = '本地图片无法读取'; });
+          }).catch(() => { if (currentPage()) placeholder.textContent = '本地图片无法读取'; });
         }
         if (!isReply && item.reply_count > 0) {
           const replies = element('div', 'comment-replies'); let offset = 0, loading = false;
           const show = button(`查看 ${item.reply_count} 条回复`, async () => {
-            if (loading || !current()) return; loading = true; show.disabled = true;
+            if (loading || !currentPage()) return; loading = true; show.disabled = true;
             try {
-              const result = await api(`${localPath}?offset=${offset}&limit=50&root_id=${encodeURIComponent(item.id)}`); if (!current()) return;
+              const result = await api(`${localPath}?offset=${offset}&limit=50&root_id=${encodeURIComponent(item.id)}`); if (!currentPage()) return;
               for (const reply of result.items) renderComment(reply, replies, true);
               offset = result.next_offset; if (offset == null) show.remove(); else show.textContent = '加载更多回复';
-            } catch (error) { report(error); } finally { loading = false; show.disabled = false; }
+            } catch (error) { if (currentPage()) report(error); } finally { loading = false; show.disabled = false; }
           }); row.append(show, replies);
         }
         parent.append(row);
@@ -128,7 +135,7 @@
         more.disabled = true;
         try {
           const result = await api(`${localPath}?offset=${offset}&limit=50&root_id=`); if (!current() || pageSerial !== active.pageSerial || revision !== active.revision) return;
-          if (reset) list.replaceChildren();
+          if (reset) { active.renderedSerial++; releaseImages(); list.replaceChildren(); }
           paintStatus(result.status, result.can_save);
           for (const item of result.items) renderComment(item, list);
           active.offset = result.next_offset; active.retryReset = false; more.textContent = '加载更多评论'; more.hidden = result.next_offset == null;
@@ -178,6 +185,7 @@
     button.addEventListener('click', async () => { button.disabled = true; try { await operation(); } catch (error) { notice(error.message, true); } finally { button.disabled = false; } }); return button;
   }
   function disconnect() {
+    state.authEpoch = (state.authEpoch || 0) + 1;
     state.comments?.close();
     state.cookieSyncGeneration=(state.cookieSyncGeneration||0)+1;
     const syncButton=$('cookie-sync-button'),syncLink=$('cookie-sync-link'),syncStatus=$('cookie-sync-status');if(syncButton)syncButton.disabled=false;if(syncLink)syncLink.hidden=true;if(syncStatus)syncStatus.hidden=true;
@@ -280,7 +288,7 @@
     playbackFrame=0;if(restoringFullscreen)return;const feed=$('feed'),cards=[...feed.querySelectorAll('.work')];
     const index=Math.max(0,Math.min(cards.length-1,Math.round(feed.scrollTop/feed.clientHeight)));
     const enabled=!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view);
-    const card=enabled?(document.fullscreenElement?.closest('.work')||cards[index]):null;
+    const card=!feed.hidden&&['library','favorites'].includes(state.view)?(document.fullscreenElement?.closest('.work')||cards[index]):null;
     const selected=card?cards.indexOf(card):-1;
     if(card!==activeCard){if(activeCard)state.comments?.close();clearTimeout(warmTimer);activeCard=card;}
     cards.forEach((item,i)=>{const v=item.querySelector('video');if(!v)return;
@@ -655,15 +663,18 @@
   });
   $('admin-key-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.target.querySelector('[type="submit"]'); button.disabled = true;
-    const key = $('new-admin-key').value, message = keyError(key, $('repeat-admin-key').value);
+    const key = $('new-admin-key').value, message = keyError(key, $('repeat-admin-key').value), token = state.token, epoch = state.authEpoch || 0;
+    const current = () => (state.authEpoch || 0) === epoch && state.token === token;
     try {
       if (message) throw new Error(message);
       await api('/api/auth/key', 'PUT', { key });
+      if (!current()) return;
       state.token = key; localStorage.setItem('library_access_key', key); state.auth.setup_required = false;
       event.target.reset(); await loadSettings();
+      if ((state.authEpoch || 0) !== epoch || state.token !== key) return;
       $('admin-key-message').textContent = '已修改。当前浏览器保持登录，请把 抖音收藏库助手 中的旧密钥换成新密钥。';
       notice('管理员密钥已修改，旧密钥已失效。');
-    } catch (error) { $('admin-key-message').textContent = error.message; }
+    } catch (error) { if (current() || ((state.authEpoch || 0) === epoch && state.token === key)) $('admin-key-message').textContent = error.message; }
     finally { button.disabled = false; }
   });
   $('reveal-token').addEventListener('click', () => { const visible = $('script-token').type === 'password'; $('script-token').type = visible ? 'text' : 'password'; $('reveal-token').textContent = visible ? '隐藏' : '显示'; });
