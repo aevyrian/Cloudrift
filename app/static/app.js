@@ -594,14 +594,15 @@
     const button=$('cookie-sync-button'),link=$('cookie-sync-link');if(button.disabled)return;
     const token=state.token,run=++state.cookieSyncGeneration,current=()=>Boolean(token)&&state.token===token&&state.cookieSyncGeneration===run;
     if(!token){showCookieSync('请先连接收藏库。',true);return;}
-    button.disabled=true;link.hidden=true;link.removeAttribute('href');let tab=null,opened=false;
+    button.disabled=true;link.hidden=true;link.removeAttribute('href');let tab=null,opened=false,returned=false;
+    const returnToLibrary=()=>{link.hidden=true;try{tab?.close();}catch{}if(!returned){returned=true;try{window.focus();}catch{}}};
     try{
       try{tab=window.open('about:blank','_blank');if(tab)tab.opener=null;}catch{try{tab?.close();}catch{}tab=null;}
       showCookieSync('正在准备同步…');
       const created=await api('/api/cookie-sync','POST');
       if(!current()){try{tab?.close();}catch{}return;}
       if(typeof created.id!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(created.id))throw new Error('invalid request');
-      const messages={waiting:'请确认已安装助手、登录抖音并允许读取 Cookie。',validating:'正在验证抖音登录状态…',waiting_apply:'已验证，等待当前下载结束后保存…',applying:'正在保存并更新下载设置…'};
+      const messages={waiting:'正在读取抖音登录信息…',validating:'正在同步…',waiting_apply:'等待当前下载结束后保存…',applying:'正在保存…'};
       const needsOpen=created.status==='waiting';
       if(needsOpen){
         const url=`https://www.douyin.com/jingxuan#library-cookie-sync=${created.id}`;
@@ -614,13 +615,15 @@
       while(current()&&Date.now()<deadline){
         await new Promise(resolve=>setTimeout(resolve,1200));if(!current())return;
         const result=await api(`/api/cookie-sync/${created.id}`);if(!current())return;
-        if(result.status==='success'){$('cookie-state').textContent='已配置';$('cookie-state').className='badge good';showCookieSync('Cookie 已验证并同步。');return;}
+        if(result.status!=='waiting')returnToLibrary();
+        if(result.status==='waiting'&&opened&&tab?.closed){returnToLibrary();showCookieSync('同步未完成，请确认助手已连接此收藏库并已允许读取抖音 Cookie。',true);return;}
+        if(result.status==='success'){$('cookie-state').textContent='已配置';$('cookie-state').className='badge good';showCookieSync('已同步。');return;}
         if(result.status==='failed'){showCookieSync(failures[result.reason]||'同步未完成，请检查抖音登录和助手权限后重试。',true);return;}
         if(!messages[result.status])throw new Error('invalid status');
         showCookieSync(result.status==='waiting'&&needsOpen&&!opened?'浏览器阻止了弹窗，请点击链接继续。':messages[result.status]);
       }
-      if(current())showCookieSync('同步等待超时，请重试。',true);
-    }catch{if(!opened)try{tab?.close();}catch{}if(current())showCookieSync('无法完成同步，请检查网站连接和助手设置后重试。',true);}
+      if(current()){returnToLibrary();showCookieSync('同步等待超时，请重试。',true);}
+    }catch{returnToLibrary();if(current())showCookieSync('无法完成同步，请检查网站连接和助手设置后重试。',true);}
     finally{if(state.cookieSyncGeneration===run){button.disabled=false;link.hidden=true;}}
   }
   $('cookie-sync-button').addEventListener('click',syncBrowserCookie);

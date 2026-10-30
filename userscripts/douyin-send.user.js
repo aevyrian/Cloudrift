@@ -3,7 +3,7 @@
 // @name:zh      抖音收藏库助手
 // @name:zh-CN   抖音收藏库助手
 // @namespace    douyin-local-library
-// @version      1.11.0
+// @version      1.11.1
 // @description  识别当前作品与博主，查看更新状态，按需下载并设置追更周期。
 // @match        https://www.douyin.com/*
 // @match        https://douyin.com/*
@@ -111,25 +111,21 @@
   }
   const cookieSync = douyinURL(location.href) && /^#library-cookie-sync=([A-Za-z0-9_-]{43})$/.exec(location.hash || '');
   if (cookieSync) {
-    const nonce=cookieSync[1], banner=node('div','','正在连接抖音收藏库…');
-    banner.setAttribute('role','status');banner.setAttribute('aria-live','polite');
-    banner.style.cssText='position:fixed;z-index:2147483647;top:16px;right:16px;max-width:320px;padding:12px 16px;background:#22252f;color:white;border:1px solid #ffffff38;border-radius:10px;font:14px/1.5 system-ui,sans-serif;box-shadow:0 4px 16px #0004';
-    document.body.append(banner);
+    const nonce=cookieSync[1], finish=()=>{try{window.close();}catch{}};
     try{globalThis.history.replaceState(globalThis.history.state,'',location.pathname+location.search);}catch{}
     let origin,token;
     try{origin=normalizeServer(GM_getValue('library_server',''));token=GM_getValue('library_token','');if(!token)throw new Error();}
-    catch{banner.textContent='请先在助手的连接设置中保存网站地址和密钥。';return;}
+    catch{finish();return;}
     const call=(method,data)=>new Promise((resolve,reject)=>GM_xmlhttpRequest({method,url:origin+'/api/cookie-sync/'+nonce,timeout:20000,
       headers:{'Content-Type':'application/json',Authorization:`Bearer ${token}`},...(data?{data:JSON.stringify(data)}:{}),
       onload(response){let value;try{value=JSON.parse(response.responseText);}catch{reject();return;}if(response.status>=200&&response.status<300)resolve(value);else reject();},
       onerror:reject,ontimeout:reject,onabort:reject}));
     async function report(error){
-      try{await call('POST',{error});banner.textContent=error==='permission_denied'?'未授权读取，请返回收藏库重试。':error==='not_logged_in'?'请先登录抖音，再返回收藏库重试。':'读取失败，请返回收藏库重试。';}
-      catch{banner.textContent='无法通知收藏库，请返回网站重试。';}
+      try{await call('POST',{error});}catch{}finally{finish();}
     }
     (async()=>{
       try{const state=await call('GET');if(state?.status!=='waiting')throw new Error();}
-      catch{banner.textContent='同步请求已失效，请返回收藏库重试。';return;}
+      catch{finish();return;}
       let cookies;
       try{
         if(typeof GM_cookie!=='function')throw new Error('unsupported');
@@ -141,8 +137,7 @@
       if(!allowed.some(c=>/^(sessionid|sessionid_ss|sid_tt)$/.test(c.name)&&c.value)){await report('not_logged_in');return;}
       const cookie=allowed.map(c=>c.name+'='+c.value).join('; ');
       if(cookie.length>30000){await report('read_failed');return;}
-      try{await call('POST',{cookie});banner.textContent='已提交验证，请返回抖音收藏库查看结果。';}
-      catch{banner.textContent='提交失败，请返回收藏库重试。';}
+      try{await call('POST',{cookie});}catch{}finally{finish();}
     })();
     return;
   }
@@ -190,7 +185,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   const preference=node('select');for(const [value,text] of [['detail','突出当前作品'],['author','突出博主更新']]){const option=node('option','',text);option.value=value;preference.append(option);}preference.value=defaultKind(GM_getValue('library_default_kind','author'));
   function field(text,control){const label=node('label','',text);label.append(control);form.append(label);}
   field('网站地址',serverInput);field('管理员密钥',tokenInput);field('默认下载操作',preference);const save=node('button','','保存设置');save.type='submit';form.append(save);settings.append(summary,form);
-  const footer=node('div','footer');footer.append(node('small','','助手 1.11.0'),node('span','','下载后在媒体库查看进度'));
+  const footer=node('div','footer');footer.append(node('small','','助手 1.11.1'),node('span','','下载后在媒体库查看进度'));
   panel.append(header,downloads,status,historyStatus,settings,footer);shadow.append(style,panel,toggle);document.body.append(host);
   let targets={detail:null,author:null},anchor=null,hadRail=false,authors=null,history=null,loading=null,generation=0,dataRevision=0,viewRevision=0,busy=false,frequencyDirty=false,settingsOverride=false,currentName='',stateAttempted=false;
   const recent=new Set(),feedback=new Map(),counts=new Map();

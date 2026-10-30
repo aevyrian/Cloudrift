@@ -45,7 +45,7 @@
       button.append(node('span', '', label), node('strong', '', '0'), node('small', '', help));
       button.addEventListener('click', () => { filter = value; render(); }); summary.append(button); summaryButtons.set(value, button);
     }
-    const summaryNote = node('div', 'task-summary-note'); summaryNote.append(node('strong', '', '下载一次，安心保存'), node('p', '', '已有作品自动跳过，追更由你决定。')); summary.append(summaryNote);
+    summary.append(byId('open-submit'));
     query.addEventListener('input', render);
     byId('task-dialog-close').addEventListener('click', () => dialog.close());
     dialog.addEventListener('click', event => { if (event.target === dialog) dialog.close(); });
