@@ -130,11 +130,15 @@ class CookieSync:
     async def _run(self, item, cookie):
         try:
             async with asyncio.timeout(self.APPLY_SECONDS):
-                if await verify_cookie(cookie) is not True:
-                    self._fail(item, 'verify_failed')
+                if not self._owner_ok(item['owner']):
+                    self._fail(item, 'changed')
                     return
-                item.update(status='waiting_apply', message='验证通过，等待当前下载结束后更新。')
-                async with self.service.lock:
+                item.update(status='waiting_apply', message='正在优先更新登录信息。')
+                context = self.service.configuration() if hasattr(self.service, 'configuration') else self.service.lock
+                async with context:
+                    if await verify_cookie(cookie) is not True:
+                        self._fail(item, 'verify_failed')
+                        return
                     old = self.store.setting('cookie', '') or ''
                     if not self._owner_ok(item['owner']) or not hmac.compare_digest(_digest(old), item['original']):
                         self._fail(item, 'changed')

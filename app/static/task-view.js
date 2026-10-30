@@ -1,8 +1,8 @@
 (function () {
   'use strict';
-  const ACTIVE = ['queued', 'parsing', 'downloading', 'paused'];
+  const ACTIVE = ['queued', 'parsing', 'downloading'];
   const ATTENTION = ['failed', 'interrupted', 'awaiting_confirmation'];
-  const FILTERS = [['all', '全部任务'], ['active', '进行中'], ['attention', '需处理'], ['completed', '已完成'], ['cancelled', '已取消']];
+  const FILTERS = [['all', '全部任务'], ['active', '进行中'], ['paused', '已暂停'], ['attention', '需处理'], ['completed', '已完成'], ['cancelled', '已取消']];
   function groupMatches(task, filter) {
     return filter === 'all' || (filter === 'active' ? ACTIVE.includes(task.status) : filter === 'attention' ? ATTENTION.includes(task.status) : task.status === filter);
   }
@@ -15,7 +15,7 @@
   }
   function taskCounts(tasks) { return Object.fromEntries(FILTERS.map(([filter]) => [filter, tasks.filter(task => groupMatches(task, filter)).length])); }
   function bulkEligible(task, action) {
-    return action === 'retry' ? ['failed','interrupted','cancelled'].includes(task.status) : action === 'cancel' ? !['completed','cancelled'].includes(task.status) : true;
+    return action === 'pause' ? ACTIVE.includes(task.status) : action === 'resume' ? task.status === 'paused' : action === 'retry' ? ['failed','interrupted','cancelled'].includes(task.status) : action === 'cancel' ? !['completed','cancelled'].includes(task.status) : true;
   }
   function create({ application, makeTaskCard, title, onBatch = async () => {} }) {
     const byId = id => document.getElementById(id);
@@ -25,12 +25,13 @@
     const filterButtons = new Map(), summaryButtons = new Map();
     let tasks = [], filter = 'all', selected = null, lastData = null, batching = false;
     const bulkButtons = new Map();
-    if (byId('task-bulk-actions')) for (const [value,label] of [['retry','全部重试'],['cancel','全部取消'],['delete','全部删除']]) {
+    if (byId('task-bulk-actions')) for (const [value,label] of [['pause','全部暂停'],['resume','全部继续'],['retry','全部重试'],['cancel','全部取消'],['delete','全部删除']]) {
       const button=node('button','secondary',label);button.type='button';
-      button.title='仅处理当前筛选和搜索结果；删除只移除任务记录，保留媒体文件';
+      button.title=['pause','resume'].includes(value)?'对全部符合状态的任务生效，不受当前筛选影响':'仅处理当前筛选和搜索结果；删除只移除任务记录，保留媒体文件';
       button.addEventListener('click',async()=>{
         if (batching) return;
-        const ids=filterTasks(tasks,filter,query.value,title).filter(task=>bulkEligible(task,value)).map(task=>task.id);
+        const selection=['pause','resume'].includes(value)?tasks:filterTasks(tasks,filter,query.value,title);
+        const ids=selection.filter(task=>bulkEligible(task,value)).map(task=>task.id);
         batching=true;render();try{await onBatch(value,ids);}finally{batching=false;render();}
       });byId('task-bulk-actions').append(button);bulkButtons.set(value,button);
     }
@@ -64,7 +65,7 @@
     }
     function render() {
       const counts = taskCounts(tasks), visible = filterTasks(tasks, filter, query.value, title);
-      for(const [value,button] of bulkButtons)button.disabled=batching||!visible.some(task=>bulkEligible(task,value));
+      for(const [value,button] of bulkButtons)button.disabled=batching||!(['pause','resume'].includes(value)?tasks:visible).some(task=>bulkEligible(task,value));
       for (const [value, button] of filterButtons) { button.setAttribute('aria-pressed', String(filter === value)); button.lastElementChild.textContent = counts[value]; }
       for (const [value, button] of summaryButtons) button.querySelector('strong').textContent = String(counts[value]).padStart(2, '0');
       byId('task-result-count').textContent = `${visible.length} 个任务`;

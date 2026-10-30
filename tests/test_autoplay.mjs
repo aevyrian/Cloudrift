@@ -39,7 +39,8 @@ function browser(){
   const author=new Node('select');author.value='';author.options=[];author.selectedOptions=[];
   const nodes={feed,'search-query':{value:''},'search-author':author,'library-label':{},'back-recommendations':{},'shuffle-library':{},'clear-search':{}};
   const state={view:'library',favoriteKind:'works',items:[],generation:0,hasMore:false,loadingLibrary:false,nextOffset:0,ceiling:null,seed:1,token:'test',muted:false};
-  const document={hidden:false,fullscreenElement:null,addEventListener:(event,fn)=>{listeners[event]=fn},exitFullscreen:async()=>{document.fullscreenElement=null;listeners.fullscreenchange?.()}};
+  const document={hidden:false,fullscreenElement:null,addEventListener:(event,fn)=>{listeners[event]=fn},exitFullscreen:async()=>{document.fullscreenElement=null;feed.clientHeight=100;listeners.fullscreenchange?.()}};
+  feed.requestFullscreen=async()=>{document.fullscreenElement=feed;feed.clientHeight=200;listeners.fullscreenchange?.()};feed.focus=()=>{};
   const context=vm.createContext({state,document,$:id=>nodes[id],element:(...args)=>new Node(...args),
     action:(label,operation)=>{const el=new Node('button','',label);el.addEventListener('click',async()=>{try{await operation()}catch(error){notices.push(error.message)}});return el},
     ...helpers,mediaURL:path=>path,formatDate:()=>'',empty(){},notice:text=>notices.push(text),
@@ -109,5 +110,40 @@ for(const reason of ['background','paused','different card','scrolling','differe
   b.document.fullscreenElement=first;b.test.setFullscreen(first);video.ended=true;video.dispatch('ended');await tick();
   assert.equal(b.document.fullscreenElement,null,'全屏播完退出当前作品全屏');
   assert.equal(b.requested.at(-1),'two','退出全屏后切换下一作品');
+}
+{
+  const b=browser();b.append(work('one'));const second=b.append(work('two'));const third=b.append(work('three'));
+  b.feed.scrollTop=100;const video=b.ready(second),controls=second.querySelector('.player-controls');
+  controls.children.find(el=>el.getAttribute('aria-label')==='全屏播放').click();b.flush();
+  assert.equal(b.document.fullscreenElement,b.feed,'全屏作用于作品流');
+  assert.equal(b.feed.scrollTop,200,'进入全屏时保持原作品');
+  video.ended=true;video.dispatch('ended');await tick();
+  assert.equal(b.document.fullscreenElement,b.feed,'播完切换仍保持全屏');
+  assert.equal(b.requested.at(-1),'three');b.test.syncPlayback();
+  await b.document.exitFullscreen();b.flush();
+  assert.equal(b.feed.scrollTop,200,'退出全屏后保持切换后的作品');
+  assert.equal(b.document.fullscreenElement,null);
+  assert.equal(third.dataset.work,'three');
+}
+{
+  const b=browser(),gallery=b.append({id:'gallery',type:'图集',files:[{name:'a.jpg',url:'/api/media/gallery/0'},{name:'b.jpg',url:'/api/media/gallery/1'}]});
+  const tools=gallery.querySelector('.work-tools');tools.children.find(el=>el.getAttribute('aria-label')==='全屏查看').click();b.flush();
+  assert.equal(b.document.fullscreenElement,b.feed,'图集可直接进入作品流全屏');
+  gallery.events.keydown[0]({target:{closest:()=>null},key:'ArrowRight',preventDefault(){}});
+  assert.equal(gallery.querySelector('.work-index').textContent,'2 / 2','全屏仍可使用左右键翻图');
+  gallery.events.keydown[0]({target:{closest:()=>({})},key:'ArrowLeft',preventDefault(){throw Error('控制条不应被拦截')}});
+  assert.equal(gallery.querySelector('.work-index').textContent,'2 / 2','操作控件时不误触图集翻页');
+}
+{
+  const listeners={},moves=[],feed={clientHeight:200,addEventListener:(name,fn)=>listeners[name]=fn,scrollBy:value=>moves.push(value)};
+  const start=source.indexOf("  $('feed').addEventListener('keydown',"),end=source.indexOf("  $('feed').addEventListener('scroll',",start);
+  vm.runInNewContext(source.slice(start,end),{$:()=>feed});
+  let prevented=false;listeners.keydown({key:'ArrowDown',target:{closest:()=>null},preventDefault(){prevented=true}});
+  assert.equal(prevented,true);assert.equal(moves[0].top,200,'上下键切换一屏作品');
+  for(const kind of ['button','input','select','textarea','a','video','[contenteditable="true"]','.comments-panel']){
+    let selector='';listeners.keydown({key:'ArrowUp',target:{closest:value=>{selector=value;return {}}},preventDefault(){throw Error('控件不得拦截')}});
+    assert.ok(selector.includes(kind));
+  }
+  assert.equal(moves.length,1,'控件或评论中按键不切换作品');
 }
 console.log('Autoplay checks passed: normal videos, galleries, pause, background, loading and fullscreen.');

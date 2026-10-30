@@ -15,7 +15,7 @@ WORKDIR /app
 LABEL org.opencontainers.image.title="Cloudrift" \
     org.opencontainers.image.source="https://github.com/aevyrian/Cloudrift" \
     org.opencontainers.image.licenses="GPL-3.0" \
-    org.opencontainers.image.version="1.4.0"
+    org.opencontainers.image.version="1.4.1"
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/python \
     APP_DATA=/data APP_MEDIA=/media APP_CORE=/app/vendor/TikTokDownloader
 COPY requirements.txt ./

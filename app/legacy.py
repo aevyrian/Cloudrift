@@ -4,6 +4,7 @@ import os
 import re
 import secrets
 import sqlite3
+import stat
 import threading
 import time
 from contextlib import closing
@@ -15,6 +16,7 @@ VIDEO = {'.mp4', '.mov', '.m4v', '.webm', '.mkv'}
 IMAGE = {'.jpg', '.jpeg', '.png', '.webp', '.avif'}
 EXCLUDED = {'Cache', 'Data', '@eaDir', '@Recycle'}
 FILENAME = re.compile(r'^(\d{4}-\d{2}-\d{2} \d{2}\.\d{2}\.\d{2})-(视频|图集|实况)-(.+)$')
+LEGACY_COMPARISON_BYTES = 512 * 1024 * 1024
 
 
 def recorded_download(root, work_id):
@@ -41,6 +43,48 @@ def recorded_downloads(root, work_ids):
             return found
     except sqlite3.Error as exc:
         raise RuntimeError('旧下载记录暂时无法读取，已停止以免重复下载，恢复后可重试') from exc
+
+
+def identical_legacy_copies(root, matches):
+    if len(matches) < 2 or not matches[0]['files']:
+        return matches
+    root = Path(root).resolve()
+    try:
+        paths = [[root / name for name in work['files']] for work in matches]
+        if any(len(files) != len(paths[0]) for files in paths):
+            return matches
+        total = 0
+        signatures = []
+        for files in paths:
+            copies = []
+            for index, path in enumerate(files):
+                if (not path.resolve().is_relative_to(root) or path.is_symlink()
+                        or path.suffix.lower() != paths[0][index].suffix.lower()):
+                    return matches
+                before = path.stat()
+                if not stat.S_ISREG(before.st_mode) or before.st_size <= 0:
+                    return matches
+                total += before.st_size
+                # shortcut: large duplicate candidates remain unresolved; use a background comparison if needed.
+                if total > LEGACY_COMPARISON_BYTES:
+                    return matches
+                digest = hashlib.sha256()
+                fd = os.open(path, os.O_RDONLY | getattr(os, 'O_NOFOLLOW', 0) | getattr(os, 'O_BINARY', 0))
+                with os.fdopen(fd, 'rb') as source:
+                    opened = os.fstat(source.fileno())
+                    if (before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns) != (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns):
+                        return matches
+                    for block in iter(lambda: source.read(1024 * 1024), b''):
+                        digest.update(block)
+                    after = os.fstat(source.fileno())
+                final = path.stat()
+                if not path.resolve().is_relative_to(root) or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns) or (opened.st_dev, opened.st_ino, opened.st_size, opened.st_mtime_ns) != (final.st_dev, final.st_ino, final.st_size, final.st_mtime_ns):
+                    return matches
+                copies.append((opened.st_size, digest.digest()))
+            signatures.append(copies)
+        return [matches[0]] if all(value == signatures[0] for value in signatures[1:]) else matches
+    except (OSError, ValueError):
+        return matches
 
 
 def directory_works(root, folder, names, state, stopped):

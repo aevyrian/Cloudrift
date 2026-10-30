@@ -18,15 +18,15 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 from .core import Core, download_directory, normalize_input
-from .store import Store, FREQUENCIES, BEIJING
-from .legacy import LegacyIndex, recorded_download, recorded_downloads
+from .store import Store, FREQUENCIES, BEIJING, AmbiguousAliasError
+from .legacy import LegacyIndex, recorded_download, recorded_downloads, identical_legacy_copies
 from .playback import PlaybackCache
 from .cookie_sync import CookieSync
 from .comments import CommentService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.0"
+VERSION = "1.4.1"
 BASE = Path(__file__).resolve().parent
 
 
@@ -57,6 +57,8 @@ class JobService:
         self.legacy_root = Path(legacy_root).resolve() if legacy_root else None
         self.media_root.mkdir(parents=True, exist_ok=True)
         self.lock = asyncio.Lock()
+        self.configuration_lock = asyncio.Lock()
+        self.configuration_pending = False
         self.running = False
         self.worker = None
         self.queue_error = ""
@@ -79,6 +81,52 @@ class JobService:
             raise ValueError("任务不存在")
         return self.store.requeue_task(task_id)
 
+    async def stop_active(self, task_id):
+        active = self.active_download if self.active_task_id == task_id else None
+        if active and not active.done():
+            active.cancel()
+            try:
+                await asyncio.wait_for(asyncio.shield(active), 20)
+            except asyncio.CancelledError:
+                if asyncio.current_task().cancelling():
+                    raise
+            except TimeoutError:
+                raise RuntimeError('下载器尚未停止，请稍后重试') from None
+
+    async def pause(self, task_id):
+        self.store.pause_task(task_id)
+        await self.stop_active(task_id)
+        return self.store.task(task_id)
+
+    async def pause_all(self):
+        changed = self.store.pause_queue()
+        await self.stop_active(self.active_task_id)
+        return changed
+
+    @asynccontextmanager
+    async def configuration(self):
+        async with self.configuration_lock:
+            self.configuration_pending = True
+            resume_id = None
+            interrupted = False
+            message = '正在更新抖音登录信息，更新后继续'
+            try:
+                task = self.store.task(self.active_task_id) if self.active_task_id else None
+                if task and task['status'] in {'parsing', 'downloading'}:
+                    resume_id = task['id']
+                    self.store.pause_task(resume_id)
+                    self.store.update_task(resume_id, message=message)
+                    await self.stop_active(resume_id)
+                    interrupted = True
+                async with self.lock:
+                    yield
+            finally:
+                self.configuration_pending = False
+                task = self.store.task(resume_id) if resume_id else None
+                if (interrupted and task and task['status'] == 'paused' and task['message'] == message
+                        and not self.store.setting('queue_paused', False)):
+                    self.store.resume_task(resume_id)
+
     async def cancel(self, task_id):
         task = self.store.task(task_id)
         if not task:
@@ -98,7 +146,8 @@ class JobService:
         task = self.store.task(task_id)
         if not task or task["status"] != "awaiting_confirmation":
             raise ValueError("该任务没有等待画质确认")
-        self.store.update_task(task_id, status="queued", accept_quality=True, message="已接受当前任务的原项目优选质量")
+        self.store.update_task(task_id, status='paused' if self.store.setting('queue_paused', False) else 'queued',
+                               accept_quality=True, message="已接受当前任务的原项目优选质量")
         return self.store.task(task_id)
 
     def complete(self, work):
@@ -109,10 +158,14 @@ class JobService:
             for file in work["files"]))
 
     def saved(self, item, legacy_cache=None):
-        work_id=str(item['id']); work=self.store.work(work_id)
+        work_id=str(item['id'])
+        try:
+            work=self.store.work(work_id)
+        except AmbiguousAliasError:
+            work=None
         if self.complete(work):
-            if item.get('type') in {'图集','实况'} and len(work['files'])!=len(item.get('downloads',[])):
-                raise RuntimeError('已保存作品的文件数量与当前作品不一致，已停止以免重复下载')
+            if item.get('type') in {'图集','实况'} and len(work['files']) < len(item.get('downloads',[])):
+                return False
             return True
         if not self.legacy_root:
             return False
@@ -127,13 +180,18 @@ class JobService:
             raise RuntimeError('作品发布时间无法识别，无法核对旧库，已停止以免重复下载') from exc
         matches=self.store.legacy_matches(uid,created,item.get('type',''))
         if len(matches)>1:
+            matches=identical_legacy_copies(self.legacy_root,matches)
+        if len(matches)>1:
             raise RuntimeError('匹配到多个旧作品，无法可靠区分，已停止以免重复下载')
         if matches:
             old=matches[0]
             expected=len(item.get('downloads',[])) if item.get('type') in {'图集','实况'} else None
-            if not self.complete(old) or (expected is not None and len(old['files'])!=expected):
-                raise RuntimeError('旧作品文件缺失或数量不一致，已保留原文件并停止，请核对后重试')
-            self.store.link_work(work_id,old['id'])
+            if not self.complete(old) or (expected is not None and len(old['files'])<expected):
+                return False
+            try:
+                self.store.link_work(work_id,old['id'])
+            except AmbiguousAliasError:
+                return False
             return True
         if legacy_cache is None:
             recorded = recorded_download(self.legacy_root, work_id)
@@ -157,6 +215,8 @@ class JobService:
         self.store.update_task(task['id'], pause_seconds=pause, **values)
 
     async def process_one(self):
+        if self.configuration_pending:
+            return False
         task = self.store.claim_task()
         if not task:
             return False
@@ -227,7 +287,7 @@ class JobService:
                     self.store.patch_author(task["author_id"], **values)
             except asyncio.CancelledError:
                 current = self.store.task(task['id'])
-                if current:
+                if current and current['status'] != 'paused':
                     self.finish(task, is_update, status='cancelled' if current['status'] == 'cancelled' else 'interrupted',
                                 message=current['message'] if current['status'] == 'cancelled' else '服务停止，任务已保留，可重试')
                 raise
@@ -241,6 +301,7 @@ class JobService:
     def schedule(self):
         now = time.time()
         if (not 8 <= datetime.fromtimestamp(now, BEIJING).hour < 18
+                or self.configuration_pending or self.store.setting('queue_paused', False)
                 or now < self.store.setting('queue_resume_at', 0) or self.store.author_queue_busy()):
             return
         for author in sorted(self.store.due_authors(), key=lambda a: a['next_check'])[:1]:
@@ -267,7 +328,7 @@ class JobService:
                     self.comments.recover()
                     needs_recovery = False
                 processed = await self.process_one()
-                if not processed:
+                if not processed and not self.configuration_pending and not self.store.setting('queue_paused', False):
                     async with self.lock:
                         processed = await self.comments.step()
                 self.queue_error = ""
@@ -335,7 +396,7 @@ class AuthorPatch(BaseModel):
 
 class TaskBatchInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
-    action: Literal['retry', 'cancel', 'delete']
+    action: Literal['retry', 'cancel', 'delete', 'pause', 'resume']
     ids: list[str] = Field(min_length=1, max_length=1000)
 
 
@@ -538,7 +599,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def save_settings(body: SettingsInput, current=Depends(authorize)):
         if body.quality_policy is not None and body.quality_policy not in {"confirm", "upstream"}:
             raise ValueError("请选择每次确认或明确接受原项目优选质量")
-        async with service.lock:
+        async with (service.configuration() if body.cookie is not None or body.download_dir is not None else service.lock):
             def still_authorized():
                 if not hmac.compare_digest(current.encode(), store.setting('access_token', '').encode()):
                     raise HTTPException(401, '管理员密钥已更改，请重新登录')
@@ -607,6 +668,22 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def retry(task_id: str):
         return public_task(service.retry(task_id))
 
+    @app.post('/api/tasks/{task_id}/pause', dependencies=[Depends(authorize)])
+    async def pause_task(task_id: str):
+        return public_task(await service.pause(task_id))
+
+    @app.post('/api/tasks/{task_id}/resume', dependencies=[Depends(authorize)])
+    async def resume_task(task_id: str):
+        return public_task(store.resume_task(task_id))
+
+    @app.post('/api/queue/pause', dependencies=[Depends(authorize)])
+    async def pause_queue():
+        return {'changed': await service.pause_all(), 'skipped': []}
+
+    @app.post('/api/queue/resume', dependencies=[Depends(authorize)])
+    async def resume_queue():
+        return {'changed': store.resume_queue(), 'skipped': []}
+
     @app.post("/api/tasks/{task_id}/confirm", dependencies=[Depends(authorize)])
     async def confirm(task_id: str):
         return public_task(service.confirm(task_id))
@@ -628,6 +705,10 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             try:
                 if body.action == 'retry':
                     service.retry(task_id)
+                elif body.action == 'pause':
+                    await service.pause(task_id)
+                elif body.action == 'resume':
+                    store.resume_task(task_id)
                 elif body.action == 'cancel':
                     task = store.task(task_id)
                     if not task or task['status'] in {'completed', 'cancelled'}:

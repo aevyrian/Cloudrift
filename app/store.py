@@ -18,6 +18,10 @@ FREQUENCIES = {"once": 129600, "daily": 1440, "three_days": 4320, "weekly": 1008
                "monthly": 43200, "quarterly": 129600, "yearly": 525600}
 
 
+class AmbiguousAliasError(RuntimeError):
+    pass
+
+
 def period_end(start, minutes):
     current = datetime.fromtimestamp(start, BEIJING)
     months = {43200: 1, 129600: 3, 525600: 12}.get(minutes)
@@ -175,14 +179,16 @@ class Store:
     def create_task(self, link, kind, accept_quality=False, author_id=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND status IN ('queued','parsing','downloading','awaiting_confirmation') ORDER BY created_at LIMIT 1",
+            row = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') ORDER BY created_at LIMIT 1",
                              (link, kind)).fetchone()
             if row:
                 return self.task_dict(row)
             task_id = secrets.token_hex(8)
             now = stamp()
-            db.execute("INSERT INTO tasks (id,kind,link,status,created_at,updated_at,accept_quality,author_id) VALUES (?,?,?,'queued',?,?,?,?)",
-                       (task_id, kind, link, now, now, int(accept_quality), author_id))
+            paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
+            paused = bool(json.loads(paused[0])) if paused else False
+            db.execute("INSERT INTO tasks (id,kind,link,status,message,created_at,updated_at,accept_quality,author_id) VALUES (?,?,?,?,?,?,?,?,?)",
+                       (task_id, kind, link, 'paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '', now, now, int(accept_quality), author_id))
         return self.task(task_id)
 
     def task(self, task_id):
@@ -217,13 +223,13 @@ class Store:
 
     def author_queue_busy(self):
         with self.connect() as db:
-            return db.execute("SELECT 1 FROM tasks WHERE kind='author' AND status IN ('queued','parsing','downloading') LIMIT 1").fetchone() is not None
+            return db.execute("SELECT 1 FROM tasks WHERE kind='author' AND status IN ('queued','parsing','downloading','paused') LIMIT 1").fetchone() is not None
 
     def claim_task(self):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            pause = db.execute("SELECT value FROM settings WHERE key='queue_resume_at'").fetchone()
-            if pause and time.time() < json.loads(pause[0]):
+            values = {row['key']: json.loads(row['value']) for row in db.execute("SELECT key,value FROM settings WHERE key IN ('queue_paused','queue_resume_at')")}
+            if values.get('queue_paused', False) or time.time() < values.get('queue_resume_at', 0):
                 return None
             row = db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
             if not row:
@@ -235,16 +241,57 @@ class Store:
         with self.connect() as db:
             db.execute('DELETE FROM tasks WHERE id=?', (task_id,))
 
+    def pause_task(self, task_id):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['status'] not in ('queued', 'parsing', 'downloading', 'paused'):
+                raise ValueError('只有排队或进行中的任务可以暂停')
+            db.execute("UPDATE tasks SET status='paused',message='已暂停，已保存内容保留',updated_at=? WHERE id=?", (stamp(), task_id))
+            return self.task_dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
+
+    def resume_task(self, task_id):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
+            if not row or row['status'] != 'paused':
+                raise ValueError('只有暂停的任务可以继续')
+            duplicate = db.execute("SELECT 1 FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') LIMIT 1", (row['link'], row['kind'], task_id)).fetchone()
+            if duplicate:
+                raise ValueError('同一链接已有进行中的任务，请等待它完成')
+            db.execute("INSERT INTO settings VALUES ('queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
+            db.execute("UPDATE tasks SET status='queued',message='已继续，等待队列处理',updated_at=? WHERE id=?", (stamp(), task_id))
+            return self.task_dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
+
+    def pause_queue(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = [row[0] for row in db.execute("SELECT id FROM tasks WHERE status IN ('queued','parsing','downloading') ORDER BY rowid")]
+            db.execute("INSERT INTO settings VALUES ('queue_paused','true') ON CONFLICT(key) DO UPDATE SET value='true'")
+            db.execute("UPDATE tasks SET status='paused',message='已暂停，已保存内容保留',updated_at=? WHERE status IN ('queued','parsing','downloading')", (stamp(),))
+            return ids
+
+    def resume_queue(self):
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            ids = [row[0] for row in db.execute("SELECT id FROM tasks WHERE status='paused' ORDER BY rowid")]
+            db.execute("INSERT INTO settings VALUES ('queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
+            db.execute("UPDATE tasks SET status='queued',message='已继续，等待队列处理',updated_at=? WHERE status='paused'", (stamp(),))
+            return ids
+
     def requeue_task(self, task_id):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if not task or task['status'] not in {'failed', 'interrupted', 'cancelled'}:
                 raise ValueError('只有失败、中断或取消的任务可重试')
-            duplicate = db.execute("SELECT id FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','awaiting_confirmation')", (task['link'], task['kind'], task_id)).fetchone()
+            duplicate = db.execute("SELECT id FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation')", (task['link'], task['kind'], task_id)).fetchone()
             if duplicate:
                 raise ValueError('同一链接已有进行中的任务，请等待它完成')
-            db.execute("UPDATE tasks SET status='queued',message='已加入重试队列',completed=0,updated_at=? WHERE id=?", (stamp(), task_id))
+            paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
+            paused = bool(json.loads(paused[0])) if paused else False
+            db.execute("UPDATE tasks SET status=?,message=?,completed=0,updated_at=? WHERE id=?",
+                       ('paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '已加入重试队列', stamp(), task_id))
         return self.task(task_id)
 
     def recover(self):
@@ -286,7 +333,7 @@ class Store:
             if row is None:
                 row = db.execute("SELECT w.* FROM works w JOIN work_aliases a ON a.work_id=w.id WHERE a.id=?",(work_id,)).fetchone()
                 if row and db.execute("SELECT 1 FROM work_aliases WHERE work_id=? AND id!=? LIMIT 1",(row['id'],work_id)).fetchone():
-                    raise RuntimeError('此旧作品已关联多个作品编号，无法可靠区分，已停止，请核对后重试')
+                    raise AmbiguousAliasError('此旧作品已关联多个作品编号，无法可靠区分，已停止，请核对后重试')
                 if row and row['id'].startswith('legacy-'):
                     files = json.loads(row['files'])
                     if not _legacy_created(files[0] if files else None):
@@ -297,7 +344,7 @@ class Store:
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             if db.execute("SELECT 1 FROM work_aliases WHERE work_id=? AND id!=? LIMIT 1",(local_id,work_id)).fetchone():
-                raise RuntimeError('此旧作品已关联另一作品编号，无法可靠区分，已停止，请核对后重试')
+                raise AmbiguousAliasError('此旧作品已关联另一作品编号，无法可靠区分，已停止，请核对后重试')
             db.execute("INSERT INTO work_aliases VALUES (?,?) ON CONFLICT(id) DO UPDATE SET work_id=excluded.work_id",(work_id,local_id))
 
     def legacy_matches(self, uid, created, kind):

@@ -51,9 +51,9 @@ jobs:
       - name: Save installation image
         if: github.event_name != 'pull_request'
         run: |
-          docker save cloudrift:1.4.0 | gzip > dist/cloudrift-v1.4.0-linux-amd64.tar.gz
+          docker save cloudrift:1.4.1 | gzip > dist/cloudrift-v1.4.1-linux-amd64.tar.gz
           cd dist
-          sha256sum cloudrift-v1.4.0-source.zip cloudrift-v1.4.0-files.sha256 douyin-send.user.js cloudrift-v1.4.0-linux-amd64.tar.gz > SHA256SUMS.txt
+          sha256sum cloudrift-v1.4.1-source.zip cloudrift-v1.4.1-files.sha256 douyin-send.user.js cloudrift-v1.4.1-linux-amd64.tar.gz > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:

@@ -275,7 +275,7 @@
       else await loadSettings();
     } catch (error) { if (navigation === state.navigation) notice(error.message, true); }
   }
-  let playbackFrame=0,warmTimer=0,activeCard=null,fullscreenCard=null,restoringFullscreen=false;
+  let playbackFrame=0,warmTimer=0,activeCard=null,fullscreenCard=null,restoringFullscreen=false,fullscreenRevision=0;
   async function fetchCommentBlob(path) {
     const token = state.token; let response;
     try { response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal: AbortSignal.timeout(60000) }); }
@@ -290,6 +290,7 @@
     const enabled=!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view);
     const card=!feed.hidden&&['library','favorites'].includes(state.view)?(document.fullscreenElement?.closest('.work')||cards[index]):null;
     const selected=card?cards.indexOf(card):-1;
+    if(document.fullscreenElement===feed&&card)fullscreenCard=card;
     if(card!==activeCard){if(activeCard)state.comments?.close();clearTimeout(warmTimer);activeCard=card;}
     cards.forEach((item,i)=>{const v=item.querySelector('video');if(!v)return;
       if(i!==selected)v.autoAdvancePending=false;
@@ -306,13 +307,19 @@
   function schedulePlayback(){if(!playbackFrame)playbackFrame=requestAnimationFrame(syncPlayback);}
   const feedObserver=new IntersectionObserver(schedulePlayback,{root:$('feed'),threshold:[.5]});
   document.addEventListener('fullscreenchange',()=>{
-    if(document.fullscreenElement){schedulePlayback();return;}
-    if(!fullscreenCard)return;
-    const card=fullscreenCard;fullscreenCard=null;restoringFullscreen=true;
-    const feed=$('feed');feed.style.scrollSnapType='none';
-    requestAnimationFrame(()=>{if(card.isConnected)feed.scrollTop=[...feed.children].indexOf(card)*feed.clientHeight;
-      requestAnimationFrame(()=>{feed.style.scrollSnapType='';restoringFullscreen=false;schedulePlayback();});});
+    const feed=$('feed'),entering=document.fullscreenElement===feed;
+    if(document.fullscreenElement&&!entering){schedulePlayback();return;}
+    if(!fullscreenCard){schedulePlayback();return;}
+    const card=fullscreenCard,revision=++fullscreenRevision;if(!entering)fullscreenCard=null;
+    restoringFullscreen=true;feed.style.scrollSnapType='none';
+    requestAnimationFrame(()=>{if(revision!==fullscreenRevision)return;const index=[...feed.children].indexOf(card);if(card.isConnected&&index>=0)feed.scrollTop=index*feed.clientHeight;
+      requestAnimationFrame(()=>{if(revision!==fullscreenRevision)return;feed.style.scrollSnapType='';restoringFullscreen=false;if(entering)feed.focus?.({preventScroll:true});schedulePlayback();});});
   });
+  function toggleFullscreen(card){
+    if(document.fullscreenElement){document.exitFullscreen()?.catch(()=>{});return;}
+    const feed=$('feed');if(!feed.requestFullscreen){notice('当前浏览器不支持全屏。',true);return;}
+    fullscreenCard=card;try{feed.requestFullscreen()?.catch(()=>{fullscreenCard=null;notice('无法进入全屏，请重试。',true);});}catch{fullscreenCard=null;notice('无法进入全屏，请重试。',true);}
+  }
   function renderWork(work, position) {
     const card = element('article', 'work'); card.dataset.work = String(work.id);
     const files = Array.isArray(work.files) ? work.files : [];
@@ -354,7 +361,7 @@
         toggle.addEventListener('click',()=>{if(current.paused){current.userPaused=false;current.playbackActive=false;playVisible(current,true);}else {current.userPaused=true;current.pause();}});
         current.addEventListener('click',()=>toggle.click());
         seek.addEventListener('input',()=>{if(Number.isFinite(current.duration))current.currentTime=current.duration*Number(seek.value)/100;});
-        fullscreen.addEventListener('click',()=>{if(!document.fullscreenElement)fullscreenCard=card;(document.fullscreenElement?document.exitFullscreen():card.requestFullscreen())?.catch(()=>{fullscreenCard=null;});});
+        fullscreen.addEventListener('click',()=>toggleFullscreen(card));
         for(const event of ['timeupdate','durationchange','play','pause'])current.addEventListener(event,updateControls);
         controls.append(toggle,clock,seek,fullscreen);card.append(controls);
         current.onAutoplayBlocked=()=>{message.textContent='点击画面播放';card.append(message);};
@@ -413,7 +420,7 @@
         count.textContent = `${index + 1} / ${files.length}`; previous.disabled = index === 0; next.disabled = index === files.length - 1;
       }
       previous.addEventListener('click', () => move(-1)); next.addEventListener('click', () => move(1)); previous.disabled = true;
-      card.addEventListener('keydown', event => { if(event.target.tagName==='INPUT')return;if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); move(event.key === 'ArrowLeft' ? -1 : 1); } });
+      card.addEventListener('keydown', event => { if(event.target.closest?.('button,input,select,textarea,a,video,[contenteditable="true"],.comments-panel'))return;if (event.key === 'ArrowLeft' || event.key === 'ArrowRight') { event.preventDefault(); move(event.key === 'ArrowLeft' ? -1 : 1); } });
       card.tabIndex = 0; card.append(previous, next);
     }
     const info = element('div', 'work-info'); const author = element('button', '', `@${work.author || '未知作者'}`);
@@ -428,7 +435,9 @@
     const comment = action('☰', () => state.comments.open(work, card, comment)); comment.className = 'work-tool'; comment.setAttribute('aria-label', '查看离线评论'); comment.setAttribute('aria-expanded', 'false'); comment.title = '评论';
     const favorite=action('',async()=>{const value=!work.favorite, generation=state.generation, loading=state.loadingLibrary;await api(`/api/favorites/${encodeURIComponent(work.id)}`,'PUT',{favorite:value});work.favorite=value;paintFavorite();if(state.view==='favorites'&&!value){if(state.comments?.isOpenFor(card))state.comments.close();card.querySelector('video')?.pause();feedObserver.unobserve(card);card.remove();state.items=state.items.filter(w=>w.id!==work.id);state.total--;state.nextOffset=Math.max(0,state.nextOffset-1);if(loading||state.loadingLibrary||generation!==state.generation||!state.items.length)await loadLibrary(true);}});favorite.className='work-tool favorite-tool';
     function paintFavorite(){favorite.textContent=work.favorite?'♥':'♡';favorite.setAttribute('aria-label',work.favorite?'取消收藏作品':'收藏作品');favorite.setAttribute('aria-pressed',String(Boolean(work.favorite)));}paintFavorite();
-    tools.append(avatar, favorite, comment, original, up, down); card.append(tools);
+    tools.append(avatar, favorite, comment, original, up, down);
+    if(gallery){const fullscreen=action('⛶',()=>toggleFullscreen(card));fullscreen.className='work-tool';fullscreen.setAttribute('aria-label','全屏查看');tools.append(fullscreen);}
+    card.append(tools);
     feedObserver.observe(card); return card;
   }
   async function loadLibrary(reset = false) {
@@ -462,13 +471,20 @@
     const stateClass = task.status === 'completed' ? 'good' : ['failed', 'interrupted'].includes(task.status) ? 'bad' : 'pending';
     heading.append(element('h2', '', taskTitle(task)), element('span', `badge ${stateClass}`, statusNames[task.status] || task.status));
     const source=element('a','source-link',task.kind==='author'?'查看博主主页 ↗':'查看作品链接 ↗');source.href=task.link.startsWith('https://')?task.link:`https://www.douyin.com/video/${task.link}`;source.target='_blank';source.rel='noopener noreferrer';
-    content.append(heading,source,element('p', '', task.message || '等待处理'));
+    const needsAttention = ['failed', 'interrupted'].includes(task.status);
+    const summary = needsAttention && Number(task.total) > 0
+      ? `已保存 ${task.completed} 个，${Math.max(0, Number(task.total) - Number(task.completed))} 个需要处理`
+      : needsAttention ? '任务未完成，请展开查看原因' : task.message || '等待处理';
+    content.append(heading,source,element('p', '', summary));
+    if (needsAttention && task.message) { const reason=element('details');reason.append(element('summary','','查看原因'),element('p','',task.message));content.append(reason); }
     if (Number(task.total) > 0) {
       const bar = element('div', 'progress'); const fill = element('span'); fill.style.width = `${Math.min(100, Math.max(0, Number(task.completed) / Number(task.total) * 100))}%`; bar.append(fill);
       content.append(bar, element('p', 'muted', `已完整保存 ${task.completed} / ${task.total} 条`));
     }
     content.append(element('p', 'hint', `${task.kind==='author'?'博主全部作品':'单个作品'} · 更新于 ${formatDate(task.updated_at || task.created_at)} · 任务 ${task.id}`));
     const actions = element('div', 'record-actions');
+    if (['queued','parsing','downloading'].includes(task.status)) actions.append(action('暂停', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/pause`, 'POST'); await loadTasks(); }));
+    if (task.status === 'paused') actions.append(action('继续', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, 'POST'); await loadTasks(); }));
     if (['failed', 'interrupted', 'cancelled'].includes(task.status)) actions.append(action('重试', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/retry`, 'POST'); await loadTasks(); }));
     if (task.status === 'awaiting_confirmation') {
       content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
@@ -485,6 +501,7 @@
     card.append(content, actions); return card;
   }
   const taskView = window.CloudriftTaskView.create({ application: $('application'), makeTaskCard: taskCard, title: taskTitle, onBatch:async(action,ids)=>{
+    if (['pause','resume'].includes(action)) { try { await api(`/api/queue/${action}`,'POST');await loadTasks();notice(action==='pause'?'全部任务已暂停，已保存内容保留。':'已继续，队列将按原顺序处理。'); } catch(error) { notice(error.message,true); } return; }
     try{let changed=0,skipped=0;for(let i=0;i<ids.length;i+=1000){const result=await api('/api/tasks/batch','POST',{action,ids:ids.slice(i,i+1000)});changed+=result.changed.length;skipped+=result.skipped.length;}await loadTasks();notice(`已处理 ${changed} 个任务${skipped?`，${skipped} 个因状态变化或同链接正在处理而跳过`:''}。媒体文件保留。`);}catch(error){notice(error.message,true);}
   } });
   async function loadBrowseHistory(reset = false) {
@@ -602,7 +619,7 @@
       const created=await api('/api/cookie-sync','POST');
       if(!current()){try{tab?.close();}catch{}return;}
       if(typeof created.id!=='string'||!/^[A-Za-z0-9_-]{43}$/.test(created.id))throw new Error('invalid request');
-      const messages={waiting:'正在读取抖音登录信息…',validating:'正在同步…',waiting_apply:'等待当前下载结束后保存…',applying:'正在保存…'};
+      const messages={waiting:'正在读取抖音登录信息…',validating:'正在同步…',waiting_apply:'正在优先更新登录信息…',applying:'正在保存…'};
       const needsOpen=created.status==='waiting';
       if(needsOpen){
         const url=`https://www.douyin.com/jingxuan#library-cookie-sync=${created.id}`;
@@ -682,10 +699,10 @@
   });
   $('reveal-token').addEventListener('click', () => { const visible = $('script-token').type === 'password'; $('script-token').type = visible ? 'text' : 'password'; $('reveal-token').textContent = visible ? '隐藏' : '显示'; });
   $('feed').addEventListener('keydown', event => {
-    if (!['ArrowUp', 'ArrowDown'].includes(event.key) || ['VIDEO','INPUT'].includes(event.target.tagName)) return;
+    if (!['ArrowUp', 'ArrowDown'].includes(event.key) || event.target.closest?.('button,input,select,textarea,a,video,[contenteditable="true"],.comments-panel')) return;
     event.preventDefault(); $('feed').scrollBy({ top: $('feed').clientHeight * (event.key === 'ArrowUp' ? -1 : 1), behavior: 'smooth' });
   });
-  $('feed').addEventListener('scroll',()=>{schedulePlayback();const f=$('feed');if(state.hasMore&&!state.loadingLibrary&&f.scrollHeight-f.scrollTop-f.clientHeight<f.clientHeight*2)loadLibrary().catch(error=>notice(error.message,true));},{passive:true});
+  $('feed').addEventListener('scroll',()=>{schedulePlayback();const f=$('feed');if(!restoringFullscreen&&document.fullscreenElement===f)fullscreenCard=[...f.querySelectorAll('.work')][Math.round(f.scrollTop/f.clientHeight)]||fullscreenCard;if(state.hasMore&&!state.loadingLibrary&&f.scrollHeight-f.scrollTop-f.clientHeight<f.clientHeight*2)loadLibrary().catch(error=>notice(error.message,true));},{passive:true});
   document.addEventListener('visibilitychange',syncPlayback);
   setInterval(() => {
     if (!state.token || document.hidden || state.busy) return;

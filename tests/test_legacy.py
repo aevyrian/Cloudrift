@@ -241,7 +241,7 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         index.scan(); self.assertEqual(self.store.work(WORK_ID)['id'],local_id)
         self.assertEqual(before,(p.stat().st_size,p.stat().st_mtime_ns))
 
-    async def test_two_work_ids_cannot_claim_the_same_old_video(self):
+    async def test_second_work_is_downloaded_without_rewriting_the_old_alias(self):
         self.original(); LegacyIndex(self.store,self.media).scan()
         first=await self.run_job()
         self.assertEqual(first['status'],'completed')
@@ -250,12 +250,15 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.item['id']='7431234567890123457'
         second=self.store.create_task(self.item['id'],'detail',accept_quality=True)
         await self.service.process_one()
-        self.assertEqual(self.store.task(second['id'])['status'],'failed')
-        self.assertIsNone(self.store.work(self.item['id']))
+        self.assertEqual(self.store.task(second['id'])['status'],'completed')
+        self.assertEqual(self.store.work(self.item['id'])['id'], self.item['id'])
         self.assertEqual(self.store.work(WORK_ID)['id'],local_id)
-        self.assertEqual(self.core.download_calls,0)
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual((self.media/'作品'/self.item['id']/(self.item['id']+'.mp4')).read_bytes(),b'test-video')
+        with self.store.connect() as db:
+            self.assertEqual([tuple(row) for row in db.execute('SELECT id,work_id FROM work_aliases')], [(WORK_ID,local_id)])
 
-    async def test_existing_conflicting_aliases_fail_without_rewriting_old_rows(self):
+    async def test_existing_conflicting_aliases_download_separately_without_rewriting_old_rows(self):
         original=self.original(); LegacyIndex(self.store,self.media).scan()
         local_id=self.store.library()['items'][0]['id']
         aliases=[(WORK_ID,local_id),('7431234567890123457',local_id)]
@@ -266,13 +269,14 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
                 self.item['id']=work_id
                 task=self.store.create_task(work_id,'detail',accept_quality=True)
                 await self.service.process_one()
-                self.assertEqual(self.store.task(task['id'])['status'],'failed')
-                self.assertIn('无法可靠区分',self.store.task(task['id'])['message'])
+                self.assertEqual(self.store.task(task['id'])['status'],'completed')
+                self.assertEqual(self.store.work(work_id)['id'], work_id)
+                self.assertEqual((self.media/'作品'/work_id/(work_id+'.mp4')).read_bytes(),b'test-video')
         with self.store.connect() as db:
             self.assertEqual([tuple(row) for row in db.execute('SELECT id,work_id FROM work_aliases ORDER BY id')],aliases)
         self.assertEqual(self.store.work(local_id)['id'],local_id)
         self.assertEqual(original.read_bytes(),b'original')
-        self.assertEqual(self.core.download_calls,0)
+        self.assertEqual(self.core.download_calls,2)
 
     async def test_existing_alias_to_invalid_date_fails_without_rewriting_old_rows(self):
         original=self.author/'2025-02-30 12.30.00-视频-旧名字-旧描述.mp4'
@@ -290,6 +294,20 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.work(local_id)['id'],local_id)
         self.assertEqual(before,(original.read_bytes(),original.stat().st_mtime_ns))
         self.assertEqual(self.core.download_calls,0)
+
+    async def test_invalid_date_alias_stays_blocked_if_current_author_uid_changed(self):
+        original=self.author/'2025-02-30 12.30.00-视频-旧名字-旧描述.mp4'
+        original.write_bytes(b'original')
+        LegacyIndex(self.store,self.media).scan()
+        local_id=self.store.library()['items'][0]['id']
+        with self.store.connect() as db:
+            db.execute('INSERT INTO work_aliases VALUES (?,?)',(WORK_ID,local_id))
+        self.item['uid']='different-author'
+        job=await self.run_job()
+        self.assertEqual(job['status'],'failed')
+        self.assertIn('无法识别时间',job['message'])
+        self.assertEqual(self.core.download_calls,0)
+        self.assertEqual(original.read_bytes(),b'original')
 
     async def test_invalid_calendar_date_in_existing_index_blocks_download_and_alias(self):
         original=self.author/'2025-02-30 12.30.00-视频-旧名字-旧描述.mp4'
@@ -310,12 +328,50 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.core.download_calls,0)
         self.assertEqual(before,(original.read_bytes(),original.stat().st_mtime_ns))
 
-    async def test_incomplete_old_gallery_stops_without_redownloading(self):
+    async def test_incomplete_old_gallery_downloads_separately_without_changing_original(self):
         self.item.update(type='图集',downloads=['one','two'])
-        self.original('图集','_1','.jpeg'); LegacyIndex(self.store,self.media).scan()
+        original=self.original('图集','_1','.jpeg'); LegacyIndex(self.store,self.media).scan()
+        async def download(item):
+            self.core.download_calls += 1
+            directory=self.media/'作品'/item['id'];directory.mkdir(parents=True,exist_ok=True)
+            files=[]
+            for index in (1,2):
+                path=directory/f'{item["id"]}_{index}.jpeg';path.write_bytes(f'new-{index}'.encode())
+                files.append(path.relative_to(self.media).as_posix())
+            return files
+        self.core.download=download
         job=await self.run_job()
-        self.assertEqual(job['status'],'failed'); self.assertIn('旧作品',job['message'])
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual(original.read_bytes(),b'original')
+        self.assertEqual(len(self.store.work(WORK_ID)['files']),2)
+        self.assertEqual(self.store.work(WORK_ID)['id'],WORK_ID)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM work_aliases').fetchone()[0],0)
+
+    async def test_extra_old_gallery_files_are_kept_and_do_not_force_redownload(self):
+        self.item.update(type='图集',downloads=['one','two'])
+        originals=[self.original('图集',f'_{index}', '.jpeg') for index in (1,2,3)]
+        LegacyIndex(self.store,self.media).scan()
+        job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
         self.assertEqual(self.core.download_calls,0)
+        self.assertEqual(len(self.store.work(WORK_ID)['files']),3)
+        self.assertTrue(all(path.read_bytes()==b'original' for path in originals))
+
+    async def test_indexed_old_missing_file_downloads_separately(self):
+        original=self.original()
+        LegacyIndex(self.store,self.media).scan()
+        local_id=self.store.library()['items'][0]['id']
+        self.store.link_work(WORK_ID,local_id)
+        original.unlink()
+        job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual((self.media/'作品'/WORK_ID/(WORK_ID+'.mp4')).read_bytes(),b'test-video')
+        self.assertFalse(original.exists())
+        with self.store.connect() as db:
+            self.assertEqual([tuple(row) for row in db.execute('SELECT id,work_id FROM work_aliases')],[(WORK_ID,local_id)])
 
     async def test_unfinished_index_and_unlocatable_old_record_do_not_redownload(self):
         self.original()
@@ -353,6 +409,20 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.service.retry(job['id']); await self.service.process_one()
         self.assertIn('无法识别时间',self.store.task(job['id'])['message'])
         self.assertEqual(self.core.download_calls,0)
+
+    async def test_byte_identical_legacy_copies_are_folded_without_touching_either(self):
+        first=self.original()
+        other=self.media/'UID123_另一个名字_发布作品';other.mkdir()
+        second=other/'2025-12-01 12.30.00-视频-另一个名字-不同作品.mp4'
+        second.write_bytes(first.read_bytes())
+        LegacyIndex(self.store,self.media).scan()
+        before=[(p.read_bytes(),p.stat().st_mtime_ns) for p in (first,second)]
+        job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,0)
+        self.assertTrue(self.store.work(WORK_ID)['id'].startswith('legacy-'))
+        self.assertEqual([(p.read_bytes(),p.stat().st_mtime_ns) for p in (first,second)],before)
+        self.assertEqual(self.store.library()['total'],2)
 
 
 if __name__ == '__main__':

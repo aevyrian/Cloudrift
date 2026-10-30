@@ -16,7 +16,8 @@ const tasks = [
   { id: 'paused', kind: 'detail', status: 'paused', total: 2, completed: 1, preview: [{ desc: '稍后继续' }] }
 ];
 assert.deepEqual(view.filterTasks(tasks, 'attention', '', taskTitle).map(t => t.id), ['failed', 'confirm']);
-assert.deepEqual(view.filterTasks(tasks, 'active', '稍后', taskTitle).map(t => t.id), ['paused']);
+assert.deepEqual(view.filterTasks(tasks, 'active', '稍后', taskTitle).map(t => t.id), []);
+assert.deepEqual(view.filterTasks(tasks, 'paused', '稍后', taskTitle).map(t => t.id), ['paused']);
 assert.equal(view.selectedTask(view.filterTasks(tasks, 'all', '山野', taskTitle), 'failed').id, 'running');
 assert.equal(view.selectedTask([], 'failed'), undefined);
 
@@ -53,17 +54,20 @@ function fixture({ saved = null, readError = false, writeError = false, onBatch 
 try {
   const operations=[];const bulk=fixture({onBatch:async(action,ids)=>operations.push({action,ids})});bulk.controller.update(tasks);
   bulk.ids['task-filters'].children.find(b=>b.dataset.filter==='attention').click();
-  await bulk.ids['task-bulk-actions'].children[0].click();assert.deepEqual(operations.at(-1),{action:'retry',ids:['failed']});
-  await bulk.ids['task-bulk-actions'].children[2].click();assert.deepEqual(operations.at(-1),{action:'delete',ids:['failed','confirm']});
+  const bulkButton = name => bulk.ids['task-bulk-actions'].children.find(button => button.textContent === name);
+  await bulkButton('全部重试').click();assert.deepEqual(operations.at(-1),{action:'retry',ids:['failed']});
+  await bulkButton('全部删除').click();assert.deepEqual(operations.at(-1),{action:'delete',ids:['failed','confirm']});
+  await bulkButton('全部暂停').click();assert.deepEqual(operations.at(-1),{action:'pause',ids:['running']},'暂停全部任务不能被筛选限制');
+  await bulkButton('全部继续').click();assert.deepEqual(operations.at(-1),{action:'resume',ids:['paused']},'继续全部任务不能被筛选限制');
   let finishBatch;
   const pending = fixture({ onBatch: () => new Promise(resolve => { finishBatch = resolve; }) });
   pending.controller.update(tasks);
-  const retry = pending.ids['task-bulk-actions'].children[0];
+  const retry = pending.ids['task-bulk-actions'].children.find(button => button.textContent === '全部重试');
   const request = retry.click();
   assert.ok(pending.ids['task-bulk-actions'].children.every(button => button.disabled), '批量操作期间应阻止其他批量操作');
   pending.controller.update(tasks.map(task => task.id === 'running' ? { ...task, completed: 7 } : task));
   assert.equal(retry.disabled, true, '任务进度刷新期间，正在进行的批量操作必须保持禁用');
-  await pending.ids['task-bulk-actions'].children[2].click();
+  await pending.ids['task-bulk-actions'].children.find(button => button.textContent === '全部删除').click();
   pending.ids['task-filters'].children.find(button => button.dataset.filter === 'attention').click();
   assert.equal(retry.disabled, true, '切换筛选期间，正在进行的批量操作必须保持禁用');
   finishBatch(); await request;
