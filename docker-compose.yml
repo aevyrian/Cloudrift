@@ -1,6 +1,6 @@
 services:
   douyin-library:
-    image: cloudrift:1.4.1
+    image: cloudrift:1.4.2
     build: .
     restart: unless-stopped
     ports:

@@ -21,12 +21,12 @@ from .core import Core, download_directory, normalize_input
 from .store import Store, FREQUENCIES, BEIJING, AmbiguousAliasError
 from .legacy import LegacyIndex, recorded_download, recorded_downloads, identical_legacy_copies
 from .playback import PlaybackCache
-from .cookie_sync import CookieSync
+from .cookie_sync import CookieAccount, CookieSync
 from .comments import CommentService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.1"
+VERSION = "1.4.2"
 BASE = Path(__file__).resolve().parent
 
 
@@ -456,7 +456,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     legacy = LegacyIndex(store, legacy_dir or os.environ.get("APP_LEGACY"))
     service = JobService(store, core, media_dir, legacy.root)
     playback = PlaybackCache(data_dir / 'playback-cache')
-    cookie_sync = CookieSync(store, service)
+    cookie_account = CookieAccount(store, service)
+    cookie_sync = CookieSync(store, service, cookie_account)
     count_cache, count_requests = {}, {}
     count_limit = asyncio.Semaphore(2)
 
@@ -475,6 +476,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                 task.cancel()
             await asyncio.gather(*pending_counts, return_exceptions=True)
             await cookie_sync.close()
+            await cookie_account.close()
             await playback.close()
             await legacy.close()
             service.running = False
@@ -552,8 +554,10 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def change_admin(body: AdminKeyInput, current=Depends(authorize)):
         return save_admin_key(body, current)
 
-    def settings_response(current_key):
-        return {"cookie_configured": bool(store.setting("cookie", "")),
+    def settings_response(current_key, probe=False):
+        configured = bool(store.setting("cookie", ""))
+        return {"cookie_configured": configured, "cookie_effective": bool(configured and core.ready),
+                **cookie_account.current(schedule=probe),
                 "quality_policy": store.setting("quality_policy", "upstream"),
                 "interval_minutes": store.setting("interval_minutes", 60), "script_token": current_key,
                 "download_dir": str(download_directory(store.setting("download_dir", ""), media_dir)),
@@ -561,7 +565,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
 
     @app.get("/api/settings")
     async def settings(current=Depends(authorize)):
-        return JSONResponse(settings_response(current), headers={'Cache-Control': 'no-store'})
+        return JSONResponse(settings_response(current, probe=True), headers={'Cache-Control': 'no-store'})
 
     @app.post("/api/cookie-sync")
     async def create_cookie_sync(owner=Depends(authorize)):
@@ -616,6 +620,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                     raise ValueError("下载目录不可写，请检查 NAS 挂载和目录权限") from None
                 body.download_dir = path.relative_to(media_dir).as_posix()
             values = body.model_dump(exclude_none=True)
+            if body.cookie is not None:
+                values['cookie_account_cache'] = None
             restart = body.cookie is not None or body.download_dir is not None
             old_cookie, old_directory = store.setting('cookie', ''), store.setting('download_dir', '')
             try:
@@ -625,6 +631,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                         raise RuntimeError('核心未就绪')
                 still_authorized()
                 store.set_settings(values)
+                if body.cookie is not None:
+                    cookie_account.invalidate()
             except (Exception, asyncio.CancelledError) as exc:
                 restored = True
                 if restart:

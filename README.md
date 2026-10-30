@@ -17,7 +17,7 @@
 - 助手在面板关闭时也记录实际浏览的作品链接，网站“历史”按时间展示；断网时先暂存在助手中，连接恢复后重试。仅记录启用后的浏览，后台标签预加载不算观看。
 - 作品数优先复用当前页面资料；额外查询采用未登录的独立会话，不使用已配置的抖音 Cookie，平台限制可能使数量暂不可用。
 - 对选择的作品手动保存评论和回复，在本地阅读支持的评论图片，并可导出 JSON、CSV 或含附件的 ZIP；不自动采集全部作品，旧作品须有可信原作编号。
-- 在“下载”页添加下载；在“设置 → 下载设置”标题右侧点击“一键同步抖音 Cookie”，由助手读取当前浏览器登录状态后自动关闭临时抖音页，结果仅显示在设置中。同步优先暂停当前下载并更新登录信息，完成后自动继续；用户主动暂停的任务保持暂停，失败保留原配置。首次需允许助手读取抖音 Cookie。
+- 在“下载”页添加下载；在“设置 → 下载设置”标题右侧点击“更新 Cookie”，由助手读取当前浏览器登录状态后自动关闭临时抖音页，结果仅显示在设置中并约2秒后隐藏。同步优先暂停当前下载并更新登录信息，完成后自动继续；用户主动暂停的任务保持暂停，失败保留原配置。状态旁显示可读取到的本人昵称/抖音号；清除须点击按钮并确认。首次需允许助手读取抖音 Cookie。
 - 旧媒体目录可只读接入。不搬迁、改名或重下旧文件；发现匹配歧义、索引未完成或文件不完整时停止任务并提示处理。
 
 ## 安装
@@ -42,7 +42,7 @@ docker compose up -d --build
 
 ### 已发行的旧版镜像
 
-当前源码为 1.4.1 试用版，请按上面的步骤自行构建。现有 [Docker Hub](https://hub.docker.com/r/aevyrian/cloudrift)、[GHCR](https://github.com/users/aevyrian/packages/container/package/cloudrift) 和 [v1.3.6 Release](https://github.com/aevyrian/Cloudrift/releases/tag/v1.3.6) 仍是 1.3.6，不包含此版本的历史和评论功能。
+当前源码为 1.4.2 试用版，请按上面的步骤自行构建。现有 [Docker Hub](https://hub.docker.com/r/aevyrian/cloudrift)、[GHCR](https://github.com/users/aevyrian/packages/container/package/cloudrift) 和 [v1.3.6 Release](https://github.com/aevyrian/Cloudrift/releases/tag/v1.3.6) 仍是 1.3.6，不包含此版本的历史和评论功能。
 
 如需使用 1.3.6 镜像，请使用 v1.3.6 Release 自带的源码包与 Compose 文件，按该版本包内 README 操作；不要将旧镜像重新标记为 1.4.0。已有部署先阅读 [迁移说明](docs/migration.md)，保留原 `.env` 和挂载。
 

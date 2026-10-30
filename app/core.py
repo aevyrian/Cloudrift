@@ -171,6 +171,54 @@ class Core:
                 await asyncio.to_thread(app.params_task.join, 5)
         self.parser = None
 
+    async def cookie_account(self, cookie):
+        try:
+            if str(self.source) not in sys.path:
+                sys.path.insert(0, str(self.source))
+            from curl_cffi.requests import AsyncSession
+            from src.custom import DATA_HEADERS, IMPERSONATE, USERAGENT
+            from src.encrypt import DouYinParams
+            from src.interface.template import API
+            from src.tools import cookie_str_to_dict
+
+            class Silent:
+                def __getattr__(self, name):
+                    return lambda *args, **kwargs: None
+
+            current = self.app.parameter if self.ready and self.app and self.app.parameter else None
+            allowed = {'accept', 'accept-encoding', 'content-type', 'referer', 'user-agent', 'x-tt-argus'}
+            headers = {key: value for key, value in (current.headers if current else DATA_HEADERS).items() if key.lower() in allowed}
+            params = SimpleNamespace(headers=headers, logger=Silent(), console=Silent(),
+                                     douyin_params=current.douyin_params if current else DouYinParams(),
+                                     max_retry=0, timeout=5, client=None,
+                                     impersonate=current.impersonate if current else IMPERSONATE,
+                                     user_agent=current.user_agent if current else USERAGENT)
+            query = API(params, cookie=cookie)
+            query.api = 'https://www.douyin.com/aweme/v1/web/user/profile/self/'
+            query.set_referer('https://www.douyin.com/user/self')
+            credentials = {key.lower(): value for key, value in cookie_str_to_dict(cookie).items()}
+            values = {key: value for key, value in query.generate_params().items() if key.lower() not in {'mstoken', 'uifid', 'webid'}}
+            values['uifid'] = credentials.get('uifid', '')
+            values['msToken'] = credentials.get('mstoken', '')
+            signed = query.deal_url_params(query.api, values)
+            async with asyncio.timeout(6):
+                async with AsyncSession(impersonate=params.impersonate, timeout=5, verify=True, allow_redirects=False, trust_env=False) as client:
+                    response = await client.get(f'{query.api}?{signed}', headers=query.headers, timeout=5, allow_redirects=False)
+            if response.status_code != 200 or not response.content:
+                return None
+            data = response.json()
+            if not isinstance(data, dict) or type(data.get('status_code')) is not int or data['status_code'] != 0:
+                return None
+            user = data.get('user')
+            if not isinstance(user, dict):
+                return None
+            def clean(value):
+                return ''.join(c for c in value if ord(c) >= 32 and ord(c) != 127).strip()[:100] if isinstance(value, str) else ''
+            nickname, unique_id = clean(user.get('nickname')), clean(user.get('unique_id'))
+            return {'nickname': nickname, 'unique_id': unique_id} if nickname or unique_id else None
+        except Exception:
+            return None
+
     async def author_count(self, sec_uid):
         try:
             if str(self.source) not in sys.path:

@@ -249,7 +249,7 @@
   function showStatus(status) {
     $('connection-state').textContent = status.core_ready ? '下载核心就绪' : '核心需要检查';
     if (!status.core_ready) notice(status.core_error || '下载核心尚未就绪，请检查容器日志。', true);
-    const values = [['版本', status.version], ['下载核心', status.core_ready ? '就绪' : status.core_error || '未就绪'], ['Cookie', status.cookie_configured ? '已配置（不代表仍然有效）' : '尚未配置'], ['新媒体目录', status.media_root], ['已保存作品', status.stats?.works ?? 0]];
+    const values = [['版本', status.version], ['下载核心', status.core_ready ? '就绪' : status.core_error || '未就绪'], ['Cookie', status.cookie_configured ? (status.core_ready ? '配置生效中' : '配置待生效') : '尚未配置'], ['新媒体目录', status.media_root], ['已保存作品', status.stats?.works ?? 0]];
     $('system-status').replaceChildren();
     for (const [name, value] of values) $('system-status').append(element('dt', '', name), element('dd', '', value ?? '暂无'));
   }
@@ -569,13 +569,32 @@
     }
     if(!visible.length)empty(container,favoritesOnly?'还没有收藏博主':'还没有历史博主','在订阅页点“收藏博主”，或添加博主页。收藏不会自动开启下载。');
   }
+  function paintCookieStatus(settings) {
+    state.cookieConfigured=Boolean(settings.cookie_configured);
+    const effective=Boolean(settings.cookie_effective);
+    $('cookie-state').textContent=state.cookieConfigured?(effective?'配置生效中':'配置待生效'):'未配置';
+    $('cookie-state').className=`badge ${effective?'good':state.cookieConfigured?'pending':''}`;
+    const account=settings.cookie_account;
+    $('cookie-account').textContent=account?[account.nickname,account.unique_id?`抖音号：${account.unique_id}`:''].filter(Boolean).join(' · '):state.cookieConfigured?(settings.cookie_account_loading?'正在读取账号…':'账号信息暂不可用'):'';
+    $('clear-cookie').disabled=!state.cookieConfigured||Boolean(state.cookieClearing);
+  }
+  function pollCookieAccount(settings,serial,navigation,attempt=0) {
+    clearTimeout(state.cookieAccountTimer);
+    if(!settings.cookie_account_loading||attempt>=8)return;
+    state.cookieAccountTimer=setTimeout(async()=>{
+      if(serial!==state.cookieStatusSerial||navigation!==state.navigation||state.view!=='settings')return;
+      try{const next=await api('/api/settings');if(serial!==state.cookieStatusSerial||navigation!==state.navigation||state.view!=='settings')return;paintCookieStatus(next);pollCookieAccount(next,serial,navigation,attempt+1);}catch{}
+    },1000);
+  }
   async function loadSettings() {
     const navigation = state.navigation;
+    const serial=state.cookieStatusSerial=(state.cookieStatusSerial||0)+1;
+    clearTimeout(state.cookieAccountTimer);
     await Promise.all([
       api('/api/settings').then(settings => {
-        if (navigation !== state.navigation || state.view !== 'settings') return;
-        $('cookie-state').textContent = settings.cookie_configured ? '已配置' : '未配置'; $('cookie-state').className = `badge ${settings.cookie_configured ? 'good' : ''}`;
-        $('cookie').value = ''; $('clear-cookie').checked = false; $('quality-policy').value = settings.quality_policy || 'upstream';
+        if (navigation !== state.navigation || state.view !== 'settings'||serial!==state.cookieStatusSerial) return;
+        paintCookieStatus(settings);pollCookieAccount(settings,serial,navigation);
+        $('cookie').value = ''; $('quality-policy').value = settings.quality_policy || 'upstream';
         $('download-dir').value = settings.download_dir; $('download-dir-hint').textContent = `可用范围：${settings.media_root} 及其子目录。修改不搬迁已有文件；更换 NAS 磁盘请修改 Compose 挂载。`;
         $('script-server').value = location.origin; $('script-token').value = settings.script_token || state.token; $('script-token').type = 'password'; $('reveal-token').textContent = '显示';
       }),
@@ -606,7 +625,7 @@
   $('clear-search').addEventListener('click', () => { $('search-query').value = ''; $('search-author').value = ''; loadLibrary(true).catch(error => notice(error.message, true)); });
   $('shuffle-library').addEventListener('click',()=>{$('search-query').value='';$('search-author').value='';loadLibrary(true).catch(error=>notice(error.message,true));});
   $('back-recommendations').addEventListener('click',()=>{$('search-query').value='';$('search-author').value='';loadLibrary(true).catch(error=>notice(error.message,true));});
-  function showCookieSync(message,error=false){const status=$('cookie-sync-status');$('cookie-sync-message').textContent=message;status.className=`notice${error?' error':''}`;status.hidden=!message;}
+  function showCookieSync(message,error=false,finished=false){clearTimeout(state.cookieNoticeTimer);const status=$('cookie-sync-status');$('cookie-sync-message').textContent=message;status.className=`notice${error?' error':''}`;status.hidden=!message;if(message&&(error||finished))state.cookieNoticeTimer=setTimeout(()=>{status.hidden=true;$('cookie-sync-message').textContent='';},2000);}
   async function syncBrowserCookie(){
     const button=$('cookie-sync-button'),link=$('cookie-sync-link');if(button.disabled)return;
     const token=state.token,run=++state.cookieSyncGeneration,current=()=>Boolean(token)&&state.token===token&&state.cookieSyncGeneration===run;
@@ -634,8 +653,8 @@
         const result=await api(`/api/cookie-sync/${created.id}`);if(!current())return;
         if(result.status!=='waiting')returnToLibrary();
         if(result.status==='waiting'&&opened&&tab?.closed){returnToLibrary();showCookieSync('同步未完成，请确认助手已连接此收藏库并已允许读取抖音 Cookie。',true);return;}
-        if(result.status==='success'){$('cookie-state').textContent='已配置';$('cookie-state').className='badge good';showCookieSync('已同步。');return;}
-        if(result.status==='failed'){showCookieSync(failures[result.reason]||'同步未完成，请检查抖音登录和助手权限后重试。',true);return;}
+        if(result.status==='success'){$('cookie-state').textContent='配置生效中';$('cookie-state').className='badge good';$('cookie-account').textContent='正在读取账号…';showCookieSync('更新成功。',false,true);loadSettings().catch(()=>{});return;}
+        if(result.status==='failed'){showCookieSync('更新失败：'+(failures[result.reason]||'请检查抖音登录和助手权限后重试。'),true);return;}
         if(!messages[result.status])throw new Error('invalid status');
         showCookieSync(result.status==='waiting'&&needsOpen&&!opened?'浏览器阻止了弹窗，请点击链接继续。':messages[result.status]);
       }
@@ -644,6 +663,15 @@
     finally{if(state.cookieSyncGeneration===run){button.disabled=false;link.hidden=true;}}
   }
   $('cookie-sync-button').addEventListener('click',syncBrowserCookie);
+  $('clear-cookie').addEventListener('click',async()=>{
+    if(state.cookieClearing||!state.cookieConfigured||!window.confirm('是否清除已保存的 Cookie？'))return;
+    const token=state.token,epoch=state.authEpoch||0,current=()=>state.token===token&&(state.authEpoch||0)===epoch;
+    state.cookieClearing=true;state.cookieSyncGeneration++;state.cookieStatusSerial=(state.cookieStatusSerial||0)+1;clearTimeout(state.cookieAccountTimer);
+    $('clear-cookie').disabled=true;$('cookie-sync-button').disabled=true;showCookieSync('正在清除…');
+    try{await api('/api/settings','PUT',{cookie:''});if(!current())return;$('cookie').value='';paintCookieStatus({cookie_configured:false});showCookieSync('已清除。',false,true);loadSettings().catch(()=>{});}
+    catch(error){if(current())showCookieSync('清除失败：'+error.message,true);}
+    finally{state.cookieClearing=false;if(current()){$('cookie-sync-button').disabled=false;$('clear-cookie').disabled=!state.cookieConfigured;}}
+  });
   function paintSound(){const button=$('sound-toggle');button.textContent=state.muted?'声音：关':'声音：开';button.setAttribute('aria-pressed',String(!state.muted));button.title=state.muted?'打开所有视频声音':'关闭所有视频声音';}
   paintSound();
   $('sound-toggle').addEventListener('click',()=>{state.muted=!state.muted;applySound($('feed').querySelectorAll('video'),state.muted);paintSound();const v=activeCard?.querySelector('video');if(v){v.playbackActive=false;playVisible(v,true);}});
@@ -677,9 +705,9 @@
   });
   $('settings-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.target.querySelector('[type="submit"]'); button.disabled = true;
-    const body = { quality_policy: $('quality-policy').value, download_dir: $('download-dir').value.trim() }; if ($('clear-cookie').checked) body.cookie = ''; else if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
-    try { await api('/api/settings', 'PUT', body); $('cookie').value = ''; await loadSettings(); notice('设置已保存。Cookie 仅显示配置状态。'); }
-    catch (error) { notice(error.message, true); } finally { button.disabled = false; }
+    const body = { quality_policy: $('quality-policy').value, download_dir: $('download-dir').value.trim() }; if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
+    try { await api('/api/settings', 'PUT', body); $('cookie').value = ''; await loadSettings(); showCookieSync('保存成功。',false,true); }
+    catch (error) { showCookieSync('保存失败：'+error.message,true); } finally { button.disabled = false; }
   });
   $('admin-key-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.target.querySelector('[type="submit"]'); button.disabled = true;

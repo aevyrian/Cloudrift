@@ -39,6 +39,68 @@ def _digest(value):
     return hashlib.sha256(value.encode('utf-8')).digest()
 
 
+class CookieAccount:
+    def __init__(self, store, service):
+        self.store = store
+        self.service = service
+        self.tasks = {}
+        self.memory = None
+
+    def invalidate(self):
+        self.memory = None
+        for task in self.tasks.values():
+            task.cancel()
+
+    def current(self, schedule=True):
+        cookie = self.store.setting('cookie', '') or ''
+        if not cookie:
+            return {'cookie_account': None, 'cookie_account_status': 'unconfigured', 'cookie_account_loading': False}
+        fingerprint = _digest(cookie).hex()
+        cache = self.memory if self.memory and self.memory.get('digest') == fingerprint else self.store.setting('cookie_account_cache', None)
+        if isinstance(cache, dict) and cache.get('digest') == fingerprint:
+            account = cache.get('account')
+            if isinstance(account, dict):
+                account = {key: account.get(key, '')[:100] if isinstance(account.get(key, ''), str) else '' for key in ('nickname', 'unique_id')}
+                if not any(account.values()):
+                    account = None
+            else:
+                account = None
+            return {'cookie_account': account, 'cookie_account_status': 'ready' if account else 'unavailable', 'cookie_account_loading': False}
+        if schedule and fingerprint not in self.tasks:
+            task = asyncio.create_task(self._probe(fingerprint))
+            self.tasks[fingerprint] = task
+            task.add_done_callback(lambda done: self.tasks.pop(fingerprint, None))
+        return {'cookie_account': None, 'cookie_account_status': 'unavailable', 'cookie_account_loading': fingerprint in self.tasks}
+
+    async def _probe(self, fingerprint):
+        try:
+            cookie = self.store.setting('cookie', '') or ''
+            if _digest(cookie).hex() != fingerprint:
+                return
+            try:
+                account = await self.service.core.cookie_account(cookie)
+            except Exception:
+                account = None
+            if isinstance(account, dict):
+                account = {key: account.get(key, '')[:100] if isinstance(account.get(key, ''), str) else '' for key in ('nickname', 'unique_id')}
+                if not any(account.values()):
+                    account = None
+            else:
+                account = None
+            if _digest(self.store.setting('cookie', '') or '').hex() != fingerprint:
+                return
+            self.memory = {'digest': fingerprint, 'account': account}
+            self.store.set_setting('cookie_account_cache', self.memory)
+        except Exception:
+            return
+
+    async def close(self):
+        tasks = list(self.tasks.values())
+        for task in tasks:
+            task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
+
+
 class _ConfigurationChanged(Exception):
     pass
 
@@ -48,9 +110,10 @@ class CookieSync:
     APPLY_SECONDS = 1800
     ACTIVE = {'waiting', 'validating', 'waiting_apply', 'applying'}
 
-    def __init__(self, store, service):
+    def __init__(self, store, service, account=None):
         self.store = store
         self.service = service
+        self.account = account
         self.item = None
         self.task = None
         self.create_lock = asyncio.Lock()
@@ -140,6 +203,7 @@ class CookieSync:
                         self._fail(item, 'verify_failed')
                         return
                     old = self.store.setting('cookie', '') or ''
+                    old_account = self.store.setting('cookie_account_cache', None)
                     if not self._owner_ok(item['owner']) or not hmac.compare_digest(_digest(old), item['original']):
                         self._fail(item, 'changed')
                         return
@@ -154,12 +218,18 @@ class CookieSync:
                             raise _ConfigurationChanged
                         write_attempted = True
                         self.store.set_setting('cookie', cookie)
+                        self.store.set_setting('cookie_account_cache', None)
+                        if self.account:
+                            self.account.invalidate()
                     except BaseException as error:
                         self.recovering = True
                         try:
                             current = self.store.setting('cookie', '') or ''
                             if write_attempted and current == cookie and current != old:
                                 self.store.set_setting('cookie', old)
+                                self.store.set_setting('cookie_account_cache', old_account)
+                                if self.account:
+                                    self.account.invalidate()
                                 current = old
                             await self.service.core.start(current, self.store.setting('download_dir', '') or '')
                             if not self.service.core.ready:
