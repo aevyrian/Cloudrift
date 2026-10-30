@@ -26,7 +26,7 @@ from .comments import CommentService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.2"
+VERSION = "1.4.3"
 BASE = Path(__file__).resolve().parent
 
 
@@ -75,11 +75,11 @@ class JobService:
             self.core.ready = False
             self.core.error = safe_error(exc, self.store)
 
-    def retry(self, task_id):
+    def retry(self, task_id, existing_task_id=None):
         task = self.store.task(task_id)
         if not task:
             raise ValueError("任务不存在")
-        return self.store.requeue_task(task_id)
+        return self.store.requeue_task(task_id, existing_task_id)
 
     async def stop_active(self, task_id):
         active = self.active_download if self.active_task_id == task_id else None
@@ -182,7 +182,8 @@ class JobService:
         if len(matches)>1:
             matches=identical_legacy_copies(self.legacy_root,matches)
         if len(matches)>1:
-            raise RuntimeError('匹配到多个旧作品，无法可靠区分，已停止以免重复下载')
+            # 旧索引不能证明归属时按原作品编号保存，保留旧档，不猜测关联。
+            return False
         if matches:
             old=matches[0]
             expected=len(item.get('downloads',[])) if item.get('type') in {'图集','实况'} else None
@@ -673,8 +674,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return public_task(store.create_task(link, kind, body.accept_quality))
 
     @app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(authorize)])
-    async def retry(task_id: str):
-        return public_task(service.retry(task_id))
+    async def retry(task_id: str, existing_task_id: str | None = Query(default=None, pattern=r'^[0-9a-f]{16}$')):
+        return public_task(service.retry(task_id, existing_task_id))
 
     @app.post('/api/tasks/{task_id}/pause', dependencies=[Depends(authorize)])
     async def pause_task(task_id: str):

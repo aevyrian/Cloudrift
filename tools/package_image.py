@@ -19,7 +19,7 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "python:3.12-slim-bookworm@sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0"
-TAG = "cloudrift:1.4.2"
+TAG = "cloudrift:1.4.3"
 HEALTH = ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
 ENV = {"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": "/opt/python", "APP_DATA": "/data", "APP_MEDIA": "/media", "APP_CORE": "/app/vendor/TikTokDownloader"}
 EXCLUDED = {".git", ".venv", ".comet", "__pycache__", "Volume", "data", "media", "node_modules"}
@@ -225,7 +225,7 @@ def main():
                "--exposed-ports", "8090/tcp", "--label", "org.opencontainers.image.title=Cloudrift",
                "--label", "org.opencontainers.image.source=https://github.com/aevyrian/Cloudrift",
                "--label", "org.opencontainers.image.licenses=GPL-3.0",
-               "--label", "org.opencontainers.image.version=1.4.2",
+               "--label", "org.opencontainers.image.version=1.4.3",
                "--label", "org.opencontainers.image.vendor-core=473c90ff70c663cfb69310fff2b8d5192f200661",
                "--tag", TAG, "--output", raw]
     for key, value in ENV.items():

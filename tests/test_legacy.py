@@ -396,18 +396,14 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue((self.media/'作品'/WORK_ID/(WORK_ID+'.mp4')).is_file())
         self.assertFalse((self.media/'Cloudrift').exists())
 
-    async def test_ambiguous_or_malformed_old_names_stop_without_redownloading(self):
+    async def test_malformed_old_names_still_stop_without_redownloading(self):
         self.original()
-        other=self.media/'UID123_另一个名字_发布作品'; other.mkdir()
-        (other/'2025-12-01 12.30.00-视频-另一个名字-不同作品.mp4').write_bytes(b'other')
-        LegacyIndex(self.store,self.media).scan()
-        job=await self.run_job(); self.assertEqual(job['status'],'failed')
-        self.assertIn('多个旧作品',job['message']); self.assertEqual(self.core.download_calls,0)
         self.item['create_time']='2025-12-03 12:30:00'
         (self.author/'日期错误-图集-旧名字-描述_1.jpeg').write_bytes(b'unknown')
         LegacyIndex(self.store,self.media).scan()
-        self.service.retry(job['id']); await self.service.process_one()
-        self.assertIn('无法识别时间',self.store.task(job['id'])['message'])
+        job=await self.run_job()
+        self.assertEqual(job['status'],'failed')
+        self.assertIn('无法识别时间',job['message'])
         self.assertEqual(self.core.download_calls,0)
 
     async def test_byte_identical_legacy_copies_are_folded_without_touching_either(self):
@@ -423,6 +419,59 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(self.store.work(WORK_ID)['id'].startswith('legacy-'))
         self.assertEqual([(p.read_bytes(),p.stat().st_mtime_ns) for p in (first,second)],before)
         self.assertEqual(self.store.library()['total'],2)
+
+    async def test_different_legacy_candidates_download_by_real_id_without_linking_them(self):
+        first=self.original()
+        other=self.media/'UID123_另一个名字_发布作品';other.mkdir()
+        second=other/'2025-12-01 12.30.00-视频-另一个名字-不同作品.mp4'
+        second.write_bytes(b'different')
+        LegacyIndex(self.store,self.media).scan()
+        before=[(path.read_bytes(),path.stat().st_mtime_ns) for path in (first,second)]
+        job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual(self.store.work(WORK_ID)['id'],WORK_ID)
+        self.assertEqual((self.media/'作品'/WORK_ID/(WORK_ID+'.mp4')).read_bytes(),b'test-video')
+        self.assertEqual([(path.read_bytes(),path.stat().st_mtime_ns) for path in (first,second)],before)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM work_aliases').fetchone()[0],0)
+        again=await self.run_job()
+        self.assertEqual(again['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual([(path.read_bytes(),path.stat().st_mtime_ns) for path in (first,second)],before)
+        with self.store.connect() as db:
+            self.assertEqual(db.execute('SELECT COUNT(*) FROM work_aliases').fetchone()[0],0)
+
+    async def test_comparison_limit_falls_back_to_real_id_without_guessing(self):
+        first=self.original()
+        other=self.media/'UID123_另一个名字_发布作品';other.mkdir()
+        second=other/'2025-12-01 12.30.00-视频-另一个名字-不同作品.mp4'
+        second.write_bytes(first.read_bytes())
+        LegacyIndex(self.store,self.media).scan()
+        with patch('app.legacy.LEGACY_COMPARISON_BYTES', 1):
+            job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual(self.store.work(WORK_ID)['id'],WORK_ID)
+        self.assertEqual(first.read_bytes(),b'original')
+        self.assertEqual(second.read_bytes(),b'original')
+
+    async def test_ambiguous_old_record_does_not_choose_a_path_by_guess(self):
+        first=self.original()
+        other=self.media/'UID123_另一个名字_发布作品';other.mkdir()
+        second=other/'2025-12-01 12.30.00-视频-另一个名字-不同作品.mp4'
+        second.write_bytes(b'different')
+        with sqlite3.connect(self.media/'DouK-Downloader.db') as db:
+            db.execute('CREATE TABLE download_data(ID TEXT PRIMARY KEY)')
+            db.execute('INSERT INTO download_data VALUES (?)',(WORK_ID,))
+        db.close()
+        LegacyIndex(self.store,self.media).scan()
+        job=await self.run_job()
+        self.assertEqual(job['status'],'completed')
+        self.assertEqual(self.core.download_calls,1)
+        self.assertEqual(self.store.work(WORK_ID)['id'],WORK_ID)
+        self.assertEqual(first.read_bytes(),b'original')
+        self.assertEqual(second.read_bytes(),b'different')
 
 
 if __name__ == '__main__':

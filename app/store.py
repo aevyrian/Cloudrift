@@ -279,15 +279,33 @@ class Store:
             db.execute("UPDATE tasks SET status='queued',message='已继续，等待队列处理',updated_at=? WHERE status='paused'", (stamp(),))
             return ids
 
-    def requeue_task(self, task_id):
+    def requeue_task(self, task_id, existing_task_id=None):
+        if existing_task_id is not None and (not isinstance(existing_task_id, str) or not re.fullmatch(r'[0-9a-f]{16}', existing_task_id)):
+            raise ValueError('接续任务编号无效')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             task = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if not task or task['status'] not in {'failed', 'interrupted', 'cancelled'}:
                 raise ValueError('只有失败、中断或取消的任务可重试')
-            duplicate = db.execute("SELECT id FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation')", (task['link'], task['kind'], task_id)).fetchone()
+            previous = re.match(r'^已由同链接任务 #([0-9a-f]{16}) 接续，已保存内容保留。原结果：', task['message'])
+            if previous:
+                if existing_task_id is not None and existing_task_id != previous[1]:
+                    raise ValueError('该任务已由其他任务接续')
+                linked = db.execute('SELECT * FROM tasks WHERE id=? AND link=? AND kind=? AND id!=?',
+                                    (previous[1], task['link'], task['kind'], task_id)).fetchone()
+                if not linked:
+                    raise ValueError('接续任务已不存在，请重新提交链接')
+                return self.task_dict(linked)
+            if existing_task_id is not None:
+                duplicate = db.execute("SELECT * FROM tasks WHERE id=? AND link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','completed')", (existing_task_id, task['link'], task['kind'], task_id)).fetchone()
+                if not duplicate:
+                    raise ValueError('指定的接续任务不存在、不匹配或未完成')
+            else:
+                duplicate = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') ORDER BY created_at,rowid LIMIT 1", (task['link'], task['kind'], task_id)).fetchone()
             if duplicate:
-                raise ValueError('同一链接已有进行中的任务，请等待它完成')
+                message = f"已由同链接任务 #{duplicate['id']} 接续，已保存内容保留。原结果：{task['message']}"
+                db.execute("UPDATE tasks SET status='cancelled',message=?,updated_at=? WHERE id=?", (message, stamp(), task_id))
+                return self.task_dict(duplicate)
             paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
             paused = bool(json.loads(paused[0])) if paused else False
             db.execute("UPDATE tasks SET status=?,message=?,completed=0,updated_at=? WHERE id=?",

@@ -107,6 +107,25 @@ class TaskControlTests(unittest.IsolatedAsyncioTestCase):
 
 
 class ControlApiTests(unittest.TestCase):
+    def test_retry_expected_successor_auth_validation_and_completion_race(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root=Path(tmp);app=make_app(root/'data',root/'media',token='test-token',core=FakeCore(root/'media'));store=app.state.store
+            store.set_setting('queue_paused',True)
+            old=store.create_task(WORK_ID,'detail');store.update_task(old['id'],status='failed',message='old',completed=1)
+            current=store.create_task(WORK_ID,'detail');store.update_task(current['id'],status='completed')
+            headers={'Authorization':'Bearer test-token'}
+            url=f"/api/tasks/{old['id']}/retry?existing_task_id={current['id']}"
+            with TestClient(app) as client:
+                self.assertEqual(client.post(url).status_code,401)
+                self.assertEqual(client.post(url+'bad',headers=headers).status_code,422)
+                self.assertEqual(store.task(old['id'])['status'],'failed')
+                result=client.post(url,headers=headers)
+                self.assertEqual(result.status_code,200)
+                self.assertEqual(result.json()['id'],current['id'])
+                self.assertEqual(store.task(old['id'])['status'],'cancelled')
+                self.assertEqual(store.task(old['id'])['completed'],1)
+                self.assertEqual(len(store.tasks()),2)
+
     def test_bulk_delete_cancel_retry_auth_and_favorites_are_independent(self):
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);app=make_app(root/'data',root/'media',token='test-token',core=FakeCore(root/'media'));store=app.state.store
@@ -115,11 +134,15 @@ class ControlApiTests(unittest.TestCase):
             with TestClient(app) as client:
                 first=store.create_task(WORK_ID,'detail');store.update_task(first['id'],status='failed')
                 duplicate=store.create_task(WORK_ID,'detail');store.update_task(duplicate['id'],status='failed')
+                store.set_setting('queue_paused',True)
                 self.assertEqual(client.post('/api/tasks/batch',json={'action':'delete','ids':[first['id']]}).status_code,401)
                 cancelled=client.post('/api/tasks/batch',headers=headers,json={'action':'cancel','ids':[first['id'],duplicate['id']]}).json()
                 self.assertEqual(len(cancelled['changed']),2)
                 retried=client.post('/api/tasks/batch',headers=headers,json={'action':'retry','ids':[first['id'],duplicate['id']]}).json()
-                self.assertEqual(len(retried['changed']),1);self.assertEqual(len(retried['skipped']),1)
+                self.assertEqual(len(retried['changed']),2);self.assertEqual(len(retried['skipped']),0)
+                self.assertEqual(store.task(first['id'])['status'],'paused')
+                self.assertEqual(store.task(duplicate['id'])['status'],'cancelled')
+                self.assertIn('#'+first['id'],store.task(duplicate['id'])['message'])
                 deleted=client.post('/api/tasks/batch',headers=headers,json={'action':'delete','ids':[first['id'],duplicate['id']]}).json()
                 self.assertEqual(len(deleted['changed']),2);self.assertEqual(original.read_bytes(),b'keep')
                 for frequency,minutes in [('three_days',4320),('weekly',10080),('monthly',43200),('quarterly',129600),('yearly',525600)]:
