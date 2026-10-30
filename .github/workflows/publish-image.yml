@@ -1,0 +1,57 @@
+name: Publish release image
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      IMAGE: ghcr.io/aevyrian/cloudrift
+      VERSION: 1.3.6
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Download verified release image
+        run: |
+          gh release download "v${VERSION}" --repo "$GITHUB_REPOSITORY" \
+            --pattern "cloudrift-v${VERSION}-linux-amd64.tar.gz"
+          echo "770892f30871247afa59fd66260cdf4a70be9bbf722e1bd6e69f50421a9d1e01  cloudrift-v${VERSION}-linux-amd64.tar.gz" | sha256sum -c -
+          docker load -i "cloudrift-v${VERSION}-linux-amd64.tar.gz"
+          test "$(docker image inspect "cloudrift:${VERSION}" --format '{{.Id}}')" = \
+            "sha256:782121d1c484103a6f8d232e5bfda11414513de08a173e9165185814734f516f"
+      - name: Publish version and latest tags
+        env:
+          REGISTRY_TOKEN: ${{ github.token }}
+        run: |
+          printf '%s' "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_REPOSITORY_OWNER" --password-stdin
+          docker tag "cloudrift:${VERSION}" "${IMAGE}:${VERSION}"
+          docker tag "cloudrift:${VERSION}" "${IMAGE}:latest"
+          docker push "${IMAGE}:${VERSION}"
+          docker push "${IMAGE}:latest"
+      - name: Pull and verify published image
+        run: |
+          docker pull "${IMAGE}:${VERSION}"
+          test "$(docker image inspect "${IMAGE}:${VERSION}" --format '{{.Id}}')" = \
+            "sha256:782121d1c484103a6f8d232e5bfda11414513de08a173e9165185814734f516f"
+          docker run -d --name cloudrift-registry-check -p 127.0.0.1:8090:8090 "${IMAGE}:${VERSION}"
+          for attempt in $(seq 1 45); do
+            if curl --fail --silent http://127.0.0.1:8090/health > /tmp/health.json &&
+              python -c 'import json; d=json.load(open("/tmp/health.json")); assert d["status"] == "ok" and d["core_ready"] and d["worker_alive"]'; then
+              cat /tmp/health.json
+              docker image inspect "${IMAGE}:${VERSION}" --format '{{json .RepoDigests}}'
+              exit 0
+            fi
+            sleep 2
+          done
+          docker logs cloudrift-registry-check
+          exit 1
+      - name: Clean up verification container and login
+        if: always()
+        run: |
+          docker rm -f cloudrift-registry-check || true
+          docker logout ghcr.io || true

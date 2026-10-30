@@ -35,7 +35,7 @@ PUBLIC_SOURCE_FILES = (
     "Dockerfile", "docker-compose.yml", "docker-compose.legacy.yml", "docker-compose.vaapi.yml",
     ".dockerignore", ".gitignore", ".gitattributes", ".env.example", "requirements.txt", "requirements-dev.txt",
     "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
-    ".github/workflows/ci.yml", "docs/architecture.md", "docs/migration.md",
+    ".github/workflows/ci.yml", ".github/workflows/publish-image.yml", "docs/architecture.md", "docs/migration.md",
     "vendor/TikTokDownloader/PATCHES.md",
     "tools/package_image.py", "tools/prepare_ffmpeg.py", "tools/build_vaapi.sh",
     "tools/ffmpeg/.gitkeep", "tools/vaapi/.gitkeep", "tools/wheels/.gitkeep",
