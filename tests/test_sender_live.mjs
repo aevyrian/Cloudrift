@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import {createRequire} from 'node:module';
+const require=createRequire(import.meta.url);
+const {pageTargets,reactAuthor}=require('../userscripts/douyin-send.user.js');
+const id='7421234567890123456',url=`https://www.douyin.com/video/${id}`,author='https://www.douyin.com/user/MS4wLjABAAAA_live_author';
+const live={href:'https://live.douyin.com/123456789012'},valid={href:author};
+const scope={matches:()=>true,querySelector:s=>s.startsWith('a[data-e2e')?live:s.startsWith('[data-e2e="user-info"]')?valid:null};
+assert.equal(pageTargets(scope,url).targets.author,author,'直播链接不能挡住同一作品里的博主页链接');
+assert.equal(pageTargets({...scope,querySelector:()=>null},`${author}?modal_id=${id}`).targets.author,null,'缺少当前作者时不能误认背景主页作者');
+assert.equal(typeof reactAuthor,'function');
+const work=(awemeId,secUid)=>({awemeId,authorInfo:{secUid}});
+const node={__reactFiber$test:{memoizedProps:{awemeInfo:work('7421234567890123457','MS4wLjABAAAA_other')},return:{memoizedProps:{awemeInfo:work(id,'MS4wLjABAAAA_live_author')}}}};
+const reactScope={querySelector:()=>node};
+assert.equal(reactAuthor(reactScope,url),author,'直播头像没有博主页链接时，从当前作品数据识别作者');
+assert.equal(reactAuthor(reactScope,'https://www.douyin.com/video/7421234567890123458'),null,'不能借用另一作品的作者');
+for(const secUid of ['short','https://evil.test/author',null]){node.__reactFiber$test.return.memoizedProps.awemeInfo.authorInfo.secUid=secUid;assert.equal(reactAuthor(reactScope,url),null,'无效作者标识不可提交');}
+node.__reactFiber$test.return=node.__reactFiber$test;
+assert.equal(reactAuthor(reactScope,url),null,'异常循环不能卡住页面');
+assert.equal(reactAuthor(null,url),null);
+console.log('PASS: 直播博主识别、当前作品归属与背景作者隔离');

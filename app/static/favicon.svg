@@ -1,0 +1,10 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64">
+  <title>抖音收藏库</title>
+  <rect width="64" height="64" rx="16" fill="#161722"/>
+  <path d="M18 45a10 10 0 0 1-1-20 15 15 0 0 1 29-1 10.5 10.5 0 0 1-1 21Z" fill="none" stroke="#25f4ee" stroke-width="4" stroke-linejoin="round" transform="translate(-2 2)"/>
+  <path d="M18 45a10 10 0 0 1-1-20 15 15 0 0 1 29-1 10.5 10.5 0 0 1-1 21Z" fill="none" stroke="#fe2c55" stroke-width="4" stroke-linejoin="round" transform="translate(2 -1)"/>
+  <path d="M18 45a10 10 0 0 1-1-20 15 15 0 0 1 29-1 10.5 10.5 0 0 1-1 21Z" fill="#161722" stroke="#f7f7fa" stroke-width="3" stroke-linejoin="round"/>
+  <path d="M28 25v16l14-8Z" fill="#25f4ee" transform="translate(-1 1)"/>
+  <path d="M28 25v16l14-8Z" fill="#fe2c55" transform="translate(1 -1)"/>
+  <path d="M28 25v16l14-8Z" fill="#f7f7fa"/>
+</svg>

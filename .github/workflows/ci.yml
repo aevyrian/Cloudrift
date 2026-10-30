@@ -1,0 +1,65 @@
+name: Verify and package
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - name: Install dependencies
+        run: python -m pip install --only-binary=:all: -r requirements-dev.txt
+      - name: Test Python and browser scripts
+        run: |
+          python -m unittest discover -s tests -v
+          for test in tests/test_*.mjs; do node "$test"; done
+          node --check app/static/app.js
+      - name: Package source
+        run: python tools/package_image.py --source-only
+      - name: Build clean Linux amd64 image
+        run: docker compose build
+      - name: Verify fresh container startup
+        run: |
+          docker compose up -d --no-build
+          for attempt in $(seq 1 45); do
+            if curl --fail --silent http://127.0.0.1:8090/health > /tmp/health.json &&
+              python -c 'import json; d=json.load(open("/tmp/health.json")); assert d["status"] == "ok" and d["core_ready"] and d["worker_alive"]'; then
+              cat /tmp/health.json
+              curl --fail --silent http://127.0.0.1:8090/ > /tmp/index.html
+              exit 0
+            fi
+            sleep 2
+          done
+          docker compose logs
+          exit 1
+      - name: Save installation image
+        if: github.event_name != 'pull_request'
+        run: |
+          docker save cloudrift:1.3.6 | gzip > dist/cloudrift-v1.3.6-linux-amd64.tar.gz
+          cd dist
+          sha256sum cloudrift-v1.3.6-source.zip cloudrift-v1.3.6-files.sha256 douyin-send.user.js cloudrift-v1.3.6-linux-amd64.tar.gz > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        if: github.event_name != 'pull_request'
+        with:
+          name: cloudrift-installation
+          path: dist/
+          retention-days: 7
+          compression-level: 0
+      - name: Stop test container
+        if: always()
+        run: docker compose down

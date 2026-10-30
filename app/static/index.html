@@ -1,0 +1,107 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="theme-color" content="#111217">
+  <title>抖音收藏库 · 下载与浏览</title>
+  <link rel="icon" type="image/svg+xml" href="favicon.svg?v=20261028-name1">
+  <link rel="stylesheet" href="style.css?v=1.3.5-1">
+  <link rel="stylesheet" href="/static/task-view.css?v=1.3.0">
+  <script src="/static/task-view.js?v=1.3.4-name1" defer></script>
+  <script src="app.js?v=1.3.5-1" defer></script>
+</head>
+<body>
+  <section id="connection" class="connection" aria-label="抖音收藏库 管理员入口">
+    <header class="welcome-header"><a class="welcome-brand" href="#"><span class="brand-mark" aria-hidden="true">☁</span> 抖音收藏库<span class="welcome-tag">本地收藏</span></a><span class="welcome-local"><i class="dot"></i> Made for your NAS</span></header>
+    <div class="welcome-layout">
+      <div class="welcome-story">
+        <p class="eyebrow">SAVE THE MOMENT. KEEP THE FEELING.</p>
+        <h1>喜欢的抖音，<br>收进你的<span>收藏库。</span></h1>
+        <p class="welcome-description">把刷到的心动，变成随时能重温的收藏。<br>视频、图集、实况，在自己的空间慢慢看。</p>
+        <div class="welcome-preview" aria-label="媒体库风格预览，非真实作品">
+          <div class="preview-card preview-coast"><span class="preview-kind">VIDEO · 00:18</span><div class="preview-art"><span class="preview-sun"></span><span class="preview-hill"></span><span class="preview-hill back"></span></div><div class="preview-caption"><span class="preview-play" aria-hidden="true">▶</span><small>@ Somewhere</small><strong>海风经过的地方</strong></div></div>
+          <div class="preview-card preview-night"><span class="preview-kind">LIVE · 01 / 06</span><div class="preview-art"><span class="preview-orbit"></span><span class="preview-cloud" aria-hidden="true">☁</span></div><div class="preview-caption"><small>@ Afterglow</small><strong>让时间慢一点</strong><span class="preview-dots" aria-hidden="true">● ○ ○ ○</span></div></div>
+          <span class="preview-floating">☁ YOUR MOMENTS, YOUR SPACE</span>
+        </div>
+        <div class="welcome-features"><span>↓ 链接收藏</span><span>▧ 沉浸观看</span><span>◷ 博主追更</span></div>
+      </div>
+      <div class="welcome-access">
+        <form id="connect-form" class="connect-card">
+          <div class="access-emblem" aria-hidden="true">☁</div><p id="access-eyebrow" class="eyebrow">欢迎使用抖音收藏库</p>
+          <h2 id="access-title">进入抖音收藏库</h2><p id="access-description" class="muted">正在连接你的媒体库…</p>
+          <div id="legacy-key-field" hidden><label for="legacy-key">原网站密钥</label><input id="legacy-key" type="password" autocomplete="current-password" placeholder="原部署生成的密钥"><p class="hint">旧站点已受保护，请先验证原密钥。现有作品和 Cookie 会保留。</p></div>
+          <label id="access-key-label" for="access-key">管理员密钥</label>
+          <input id="access-key" type="password" required maxlength="128" autocomplete="current-password" placeholder="输入管理员密钥" aria-describedby="access-hint">
+          <div id="confirm-key-field" hidden><label for="confirm-key">再输入一次</label><input id="confirm-key" type="password" maxlength="128" autocomplete="new-password" placeholder="再次输入管理员密钥"></div>
+          <p id="access-hint" class="hint">仅在自己的设备上登录。密钥会保存在当前浏览器。</p>
+          <button id="connect-button" class="primary" type="submit" disabled>正在连接… <span aria-hidden="true">↗</span></button>
+          <p id="connect-message" role="status" aria-live="polite" class="error"></p>
+          <div class="access-footer"><span class="dot"></span> 本地收藏 · 由你掌控</div>
+        </form>
+        <section id="local-preview" class="connect-card" hidden><p class="eyebrow">LOCAL PREVIEW</p><h2>请先启动自己的媒体库</h2><p class="muted">当前是本地设计预览。请按部署说明启动服务，再访问自己的主机地址进行下载、播放和管理员设置。</p><a class="primary" href="https://github.com/aevyrian/Cloudrift#安装">查看部署说明 ↗</a></section>
+      </div>
+    </div>
+    <footer class="welcome-footer"><span>抖音收藏库 · 下载与浏览</span><span>视频 · 图集 · 实况</span></footer>
+  </section>
+  <div id="application" class="application" hidden>
+    <aside class="sidebar">
+      <a class="brand" href="#library"><span class="brand-mark" aria-hidden="true">☁</span><span>抖音收藏库<small>抖音下载与收藏</small></span></a>
+      <nav aria-label="主导航">
+        <button class="nav-item active" data-view="library"><span aria-hidden="true">▦</span> 作品库</button>
+        <button class="nav-item" data-view="tasks"><span aria-hidden="true">↓</span> 下载</button>
+        <button class="nav-item" data-view="authors"><span aria-hidden="true">◎</span> 订阅</button>
+        <button class="nav-item" data-view="favorites"><span aria-hidden="true">♡</span> 收藏</button>
+        <button class="nav-item" data-view="settings"><span aria-hidden="true">⚙</span> 设置</button>
+      </nav>
+      <div class="sidebar-bottom"><span class="dot"></span><span id="connection-state">已连接</span><p>你的收藏，随时重温</p><button id="disconnect" class="text-button">断开连接</button></div>
+    </aside>
+    <main>
+      <header class="topbar"><div><p class="eyebrow" id="page-eyebrow">MY COLLECTION</p><h1 id="page-title">作品库</h1></div><div class="library-toolbar">
+        <strong class="recommendations"><button id="back-recommendations" class="text-button" type="button" hidden>← 返回推荐</button><span id="library-label">随机推荐</span><button id="shuffle-library" class="text-button" type="button">换一批 ↻</button></strong>
+        <form id="search-form" class="searchbar"><label class="sr-only" for="search-query">搜索作品文字、博主或作品编号</label><input id="search-query" type="search" placeholder="搜索作品、博主或作品编号…"><label class="sr-only" for="search-author">按作者筛选</label><select id="search-author"><option value="">全部作者</option></select><button type="submit" class="secondary">搜索</button><button id="clear-search" type="button" class="secondary" hidden>清空</button></form>
+            <div class="library-options"><button id="sound-toggle" class="sound-toggle" type="button" aria-pressed="true">声音：开</button></div>
+      </div><div class="topbar-actions"><button id="open-submit" class="primary">＋ 添加下载</button><button id="cookie-sync-button" class="secondary" type="button">一键同步抖音 Cookie</button></div></header>
+      <div id="notice" class="notice" role="status" hidden></div>
+      <div id="cookie-sync-status" class="notice" role="status" aria-live="polite" hidden><span id="cookie-sync-message"></span> <a id="cookie-sync-link" href="#" target="_blank" rel="noopener noreferrer" hidden>打开抖音继续同步 ↗</a></div>
+      <section id="view-library" class="view">
+        <div id="favorite-toolbar" class="collection-toolbar" hidden><button type="button" class="secondary" data-favorite-kind="works" aria-pressed="true">收藏作品</button><button type="button" class="secondary" data-favorite-kind="authors" aria-pressed="false">收藏博主</button></div>
+        <div id="favorite-authors" hidden><form id="favorite-author-form" class="form-row"><label class="sr-only" for="favorite-author-url">要收藏的博主页</label><input id="favorite-author-url" type="url" required placeholder="粘贴博主页链接，只收藏，不开启下载"><button type="submit" class="secondary">＋ 收藏博主</button></form><div id="favorite-author-list" class="card-list"></div></div>
+        <div id="feed" class="feed" tabindex="0" aria-label="作品流"></div>
+      </section>
+      <section id="view-tasks" class="view" hidden>
+        <div id="task-summary" class="task-summary" aria-label="任务概况"></div>
+        <div class="task-workspace">
+          <section class="task-queue" aria-label="下载任务列表">
+            <div id="task-filters" class="task-filters" role="group" aria-label="按状态筛选"></div>
+            <div class="task-search-row">
+              <label for="task-query" class="sr-only">搜索作品、博主或任务编号</label>
+              <input id="task-query" type="search" placeholder="搜索作品、博主或任务编号…">
+              <span id="task-result-count" aria-live="polite"></span>
+              <button id="refresh-tasks" class="secondary" type="button">刷新</button>
+            </div>
+            <div id="task-bulk-actions" class="task-bulk-actions" role="group" aria-label="批量处理当前筛选结果"></div>
+            <div id="task-list" class="card-list"><p class="muted" role="status">正在读取下载任务…</p></div>
+            <p class="task-queue-footer">默认只下载一次 · 已有作品核对后跳过 · 需要追更时在“订阅”中设置</p>
+          </section>
+          <aside id="task-detail" class="task-detail" aria-label="选中任务详情" hidden></aside>
+        </div>
+      </section>
+      <section id="view-authors" class="view" hidden>
+        <div class="panel"><h2>添加博主</h2><p class="muted">默认下载一次，不订阅。需要追更时选择3天／7天／每月／季度／每年，下载过的博主会保留在下方历史中。</p><form id="author-form" class="form-row"><label class="sr-only" for="author-url">博主页地址</label><input id="author-url" type="url" required placeholder="https://www.douyin.com/user/…"><label class="sr-only" for="author-name">备注名</label><input id="author-name" placeholder="备注名（可选）"><label class="followup-label" for="author-frequency">后续更新<select id="author-frequency"><option value="once">仅下载一次（默认）</option><option value="three_days">每3天更新</option><option value="weekly">每7天更新</option><option value="monthly">每月更新</option><option value="quarterly">每季度更新</option><option value="yearly">每年更新</option></select></label><button class="primary" type="submit">开始下载</button></form></div>
+        <div class="collection-toolbar"><label for="author-sort">排序</label><select id="author-sort"><option value="star">星标优先</option><option value="last">最近检查</option><option value="next">下次更新时间</option><option value="name">博主名字</option></select><span class="hint">北京时间08:00–18:00分散更新，每次只登记一位博主</span></div><div id="author-list" class="card-list"></div>
+      </section>
+      <section id="view-settings" class="view settings-grid" hidden>
+        <form id="settings-form" class="panel settings-panel"><h2>下载设置</h2><label for="cookie">抖音 Cookie <span id="cookie-state" class="badge"></span></label><textarea id="cookie" rows="4" autocomplete="off" spellcheck="false" placeholder="粘贴新的 Cookie；留空保留现有配置"></textarea><p class="hint">也可点击右上角“一键同步抖音 Cookie”；请先在当前浏览器安装助手并登录抖音，首次可能需要允许读取。Cookie 仅写入服务端，不会回显。</p><label class="check"><input id="clear-cookie" type="checkbox">清除已保存的 Cookie</label><label for="download-dir">下载目录（容器内路径）</label><input id="download-dir" required placeholder="/media 或 /media/收藏"><p id="download-dir-hint" class="hint">文件保存在媒体挂载目录内；更换 NAS 磁盘请修改 Compose 挂载。修改后已有作品仍可观看。</p><label for="quality-policy">下载方式</label><select id="quality-policy"><option value="upstream">自动采用核心优选画质（默认）</option><option value="confirm">每次先让我确认画质</option></select><p class="hint">默认提交就下载，不保证最高画质或无水印；需要逐次确认时可自行切换。博主追更只在博主页按需选择。</p><button type="submit" class="primary">保存设置</button></form>
+        <div class="settings-side">
+          <section id="legacy-panel" class="panel" hidden><p class="eyebrow">EXISTING COLLECTION</p><h2>原有作品</h2><p class="muted">只读浏览原有文件，图片按作品合并。不会搬迁、改名或自动追更；新下载直接使用同一 Volume，已有作品核对后跳过。</p><p id="legacy-state" role="status" aria-live="polite"></p><button id="scan-legacy" class="secondary" type="button">重新扫描文件</button><p class="hint">旧下载工具又添加了文件时，点这里更新目录。扫描时先暂停无法核对的新下载，任务保留可重试。</p></section>
+          <form id="admin-key-form" class="panel settings-panel"><p class="eyebrow">ADMINISTRATOR</p><h2>管理员密钥</h2><p class="muted">这是你设置的网站管理密码，可管理下载、Cookie 和追更。</p><label for="new-admin-key">新管理员密钥</label><input id="new-admin-key" type="password" required minlength="8" maxlength="128" autocomplete="new-password" placeholder="8–128 位英文、数字或符号"><label for="repeat-admin-key">确认新密钥</label><input id="repeat-admin-key" type="password" required minlength="8" maxlength="128" autocomplete="new-password" placeholder="再次输入新密钥"><p class="hint">保存后旧密钥立即失效，其他浏览器需重新登录，抖音收藏库助手 也需重新填写密钥。</p><button class="primary" type="submit">保存新密钥</button><p id="admin-key-message" class="hint" role="status" aria-live="polite"></p></form>
+          <section class="panel"><h2>抖音收藏库助手</h2><p class="muted">在抖音推荐视频、作品或博主页点圆角方形下载按钮，可下载当前作品、立即更新博主，或设置更新周期。网站地址和密钥在助手的连接设置中填写。</p><a href="/douyin-send.user.js" class="secondary link-button">安装发送脚本 ↗</a><label for="script-server">网站地址</label><input id="script-server" readonly><label for="script-token">管理员密钥（供脚本连接）</label><div class="secret-row"><input id="script-token" type="password" readonly autocomplete="off"><button id="reveal-token" class="secondary" type="button">显示</button></div><p class="hint">脚本目前使用同一个管理员密钥，请只配置到自己的浏览器。仅点击同步时读取 Cookie，下载提交不附带 Cookie。</p></section><section class="panel"><h2>运行状态</h2><dl id="system-status"></dl></section>
+        </div>
+      </section>
+    </main>
+  </div>
+    <dialog id="task-detail-dialog" aria-labelledby="task-dialog-title"><div class="dialog-heading"><h2 id="task-dialog-title">任务详情</h2><button type="button" id="task-dialog-close" class="icon-button" aria-label="关闭任务详情">×</button></div><div id="task-dialog-body"></div></dialog>
+    <dialog id="submit-dialog"><form id="task-form"><div class="dialog-heading"><h2>下载到 抖音收藏库</h2><button type="button" id="close-submit" class="icon-button" aria-label="关闭">×</button></div><p class="muted">粘贴作品分享内容或博主页，自动识别并下载。</p><label for="task-link">分享内容或链接</label><textarea id="task-link" rows="4" required placeholder="把喜欢的链接放进来…"></textarea><p class="hint">这次下载完就结束。需要3天／7天／每月／季度／每年更新时，在“订阅”中自行选择。</p><button type="submit" class="primary">开始下载</button><p id="submit-message" role="status"></p></form></dialog>
+</body>
+</html>

@@ -1,0 +1,11 @@
+services:
+  douyin-library:
+    environment:
+      APP_LEGACY: /legacy
+    volumes:
+      - type: bind
+        source: ${APP_LEGACY_DIR:?请填写旧库目录 APP_LEGACY_DIR}
+        target: /legacy
+        read_only: true
+        bind:
+          create_host_path: false
