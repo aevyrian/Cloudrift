@@ -55,3 +55,17 @@ jobs:
         run: |
           docker rm -f cloudrift-registry-check || true
           docker logout ghcr.io || true
+
+  verify-docker-hub:
+    needs: publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Pull Docker Hub mirror without signing in
+        run: |
+          docker pull aevyrian/cloudrift:1.3.6
+          test "$(docker image inspect aevyrian/cloudrift:1.3.6 --format '{{.Id}}')" = \
+            "sha256:782121d1c484103a6f8d232e5bfda11414513de08a173e9165185814734f516f"
+          docker image inspect aevyrian/cloudrift:1.3.6 --format '{{json .RepoDigests}}'
