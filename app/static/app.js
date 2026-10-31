@@ -37,7 +37,7 @@
       const panel = element('section', 'comments-panel'); panel.setAttribute('role', 'region'); panel.setAttribute('aria-label', '离线评论'); panel.tabIndex = -1;
       const header = element('div', 'comments-header'), title = element('h2', '', '离线评论');
       const dismiss = button('×', () => close(true)); dismiss.setAttribute('aria-label', '关闭评论'); header.append(title, dismiss);
-      const summary = element('p', 'comments-summary'), explanation = element('p', 'hint', '评论为本地累计保存，可能需要分次保存；打开面板不会自动采集。');
+      const summary = element('p', 'comments-summary'), explanation = element('p', 'hint', '评论为本地累计保存，可能需要分次保存；默认优先使用当前抖音页面的助手采集通道，助手不可用时自动改用服务器通道，两个通道共用同一份评论并按评论编号去重；打开面板不会自动采集。');
       const statusMessage = element('p', 'hint'); statusMessage.setAttribute('role', 'status'); statusMessage.setAttribute('aria-live', 'polite');
       const controls = element('div', 'comments-actions'), exports = element('div', 'comments-actions'), list = element('div', 'comments-list');
       const more = button('加载更多评论', () => loadPage(active.retryReset)); more.hidden = true;
@@ -79,7 +79,8 @@
         const integrity = status.integrity === 'finished-visible' ? '本次可见内容已遍历' : status.integrity === 'partial' ? '部分保存' : '尚未保存';
         summary.textContent = `已保存 ${total} 条评论 · 其中回复 ${replies} 条 · ${integrity}${status.saved_at ? ` · 保存于 ${formatDate(status.saved_at)}` : ''}${status.platform_total != null ? ` · 平台报告数量 ${status.platform_total}` : ''}`;
         const operations = { queued: '等待保存', running: '正在保存', stopped: '已停止', failed: '保存失败', interrupted: '保存中断', finished: '本次保存结束', unsaved: '尚未保存评论' };
-        statusMessage.textContent = `${operations[status.operation] || '状态未知'}${status.reason ? ` · ${status.reason}` : ''}${status.queue_paused ? ' · 评论队列已暂停' : ''}${!canSave ? ' · 暂时无法识别原作品，不能保存评论' : ''}`;
+        const channels = { assistant: '助手采集通道', server: '服务器通道' };
+        statusMessage.textContent = `${operations[status.operation] || '状态未知'}${status.reason ? ` · ${status.reason}` : ''}${channels[status.channel] ? ` · ${channels[status.channel]}` : ''}${status.queue_paused ? ' · 评论队列已暂停' : ''}${!canSave ? ' · 暂时无法识别原作品，不能保存评论' : ''}`;
         controls.replaceChildren(); exports.replaceChildren();
         if (['queued', 'running'].includes(status.operation)) controls.append(button('停止保存', cancel));
         else if (canSave) {
@@ -598,6 +599,7 @@
         if (navigation !== state.navigation || state.view !== 'settings'||serial!==state.cookieStatusSerial) return;
         paintCookieStatus(settings);pollCookieAccount(settings,serial,navigation);
         $('cookie').value = ''; $('quality-policy').value = settings.quality_policy || 'upstream';
+        $('assistant-batch').checked = Boolean(settings.assistant_batch);
         $('download-dir').value = settings.download_dir; $('download-dir-hint').textContent = `可用范围：${settings.media_root} 及其子目录。修改不搬迁已有文件；更换 NAS 磁盘请修改 Compose 挂载。`;
         $('script-server').value = location.origin; $('script-token').value = settings.script_token || state.token; $('script-token').type = 'password'; $('reveal-token').textContent = '显示';
       }),
@@ -708,7 +710,7 @@
   });
   $('settings-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.target.querySelector('[type="submit"]'); button.disabled = true;
-    const body = { quality_policy: $('quality-policy').value, download_dir: $('download-dir').value.trim() }; if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
+    const body = { quality_policy: $('quality-policy').value, download_dir: $('download-dir').value.trim(), assistant_batch: $('assistant-batch').checked }; if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
     try { await api('/api/settings', 'PUT', body); $('cookie').value = ''; await loadSettings(); showCookieSync('保存成功。',false,true); }
     catch (error) { showCookieSync('保存失败：'+error.message,true); } finally { button.disabled = false; }
   });

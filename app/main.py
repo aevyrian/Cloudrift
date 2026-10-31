@@ -449,6 +449,7 @@ class SettingsInput(BaseModel):
     quality_policy: str | None = None
     interval_minutes: int | None = Field(default=None, ge=5, le=525600)
     download_dir: str | None = Field(default=None, max_length=1000)
+    assistant_batch: bool | None = Field(default=None, strict=True)
 
 
 class CookieSyncInput(BaseModel):
@@ -656,6 +657,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return {"cookie_configured": configured, "cookie_effective": bool(configured and core.ready),
                 **cookie_account.current(schedule=probe),
                 "quality_policy": store.setting("quality_policy", "upstream"),
+                "assistant_batch": bool(store.setting("assistant_batch", False)),
                 "interval_minutes": store.setting("interval_minutes", 60), "script_token": current_key,
                 "download_dir": str(download_directory(store.setting("download_dir", ""), media_dir)),
                 "media_root": str(media_dir)}

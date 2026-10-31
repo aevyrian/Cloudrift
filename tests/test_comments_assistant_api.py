@@ -152,6 +152,37 @@ class AssistantCommentApiTests(unittest.TestCase):
                                     json={'action': 'save', 'channel': 'other'})
         self.assertEqual(response.status_code, 422)
 
+    def test_settings_expose_channel_copy_and_batch_switch_defaults_off(self):
+        settings = self.client.get('/api/settings', headers=self.auth).json()
+        self.assertIs(settings['assistant_batch'], False)
+        self.assertIsNone(self.store.setting('assistant_batch'))
+
+        response = self.client.put('/api/settings', headers=self.auth, json={'assistant_batch': True})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()['assistant_batch'], True)
+        self.assertIs(self.store.setting('assistant_batch'), True)
+        self.assertIs(self.client.get('/api/settings', headers=self.auth).json()['assistant_batch'], True)
+
+        response = self.client.put('/api/settings', headers=self.auth, json={'assistant_batch': False})
+        self.assertEqual(response.status_code, 200)
+        self.assertIs(response.json()['assistant_batch'], False)
+
+    def test_batch_switch_rejects_non_boolean_values(self):
+        for value in ('yes', 1, []):
+            with self.subTest(value=value):
+                response = self.client.put('/api/settings', headers=self.auth,
+                                           json={'assistant_batch': value})
+                self.assertEqual(response.status_code, 422)
+        self.assertIsNone(self.store.setting('assistant_batch'))
+
+    def test_comment_status_reports_active_channel(self):
+        self.client.post(f'/api/works/{WORK}/comments', headers=self.auth, json={'action': 'save'})
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'assistant')
+        self.store.comment_cancel(WORK)
+        self.client.post(f'/api/works/{WORK}/comments', headers=self.auth,
+                         json={'action': 'save', 'channel': 'server'})
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'server')
+
 
 class AssistantDirectJobClaimTests(unittest.TestCase):
     def setUp(self):

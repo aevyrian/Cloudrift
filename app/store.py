@@ -439,9 +439,11 @@ class Store:
         job = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
         counts = db.execute("SELECT COUNT(*),COALESCE(SUM(root_id!=''),0) FROM comments WHERE work_id=?", (work_id,)).fetchone()
         paused = db.execute("SELECT value FROM settings WHERE key='comment_queue_paused'").fetchone()
+        channel = channel_checkpoint(json.loads(job['checkpoint']))['channel'] if job else None
         return {'operation': job['operation'] if job else 'unsaved', 'integrity': job['integrity'] if job else 'unsaved',
                 'reason': job['reason'] if job else '', 'total': counts[0], 'replies': counts[1],
                 'saved_at': job['saved_at'] if job else None, 'platform_total': job['platform_total'] if job else None,
+                'channel': channel,
                 'queue_paused': bool(json.loads(paused[0])) if paused else False}
 
     def comment_state(self, work_id):

@@ -29,11 +29,13 @@ panel.open({ id: 'legacy-a' }, card, button);
 assert.equal(calls[0].method, 'GET', '打开评论只能读取本地');
 respond({ work_id: null, can_save: false, status, items: [], next_offset: null }); await wait();
 assert.match(flatten(card).map(n => n.textContent).join(' '), /暂时无法识别原作品/);
+assert.match(flatten(card).map(n => n.textContent).join(' '), /助手采集通道.*服务器通道/, '评论面板须说明两个采集通道');
 assert.ok(!flatten(card).some(n => n.textContent === '保存评论'), '身份不明时不能采集');
 panel.close(true); assert.equal(button.focused, true);
 
 panel.open({ id: '1234567890123456789' }, card, button);
-respond({ work_id: '1234567890123456789', can_save: true, status, items: [], next_offset: null }); await wait();
+respond({ work_id: '1234567890123456789', can_save: true, status: { ...status, channel: 'assistant' }, items: [], next_offset: null }); await wait();
+assert.match(flatten(card).map(n => n.textContent).join(' '), /助手采集通道/, '状态须标明助手采集通道');
 const save = flatten(card).find(n => n.textContent === '保存评论'); assert.ok(save);
 save.click(); assert.equal(calls.at(-1).method, 'POST'); assert.equal(calls.at(-1).body.action, 'save');
 respond({}); await wait();
@@ -62,7 +64,8 @@ respond({ work_id: 'two', can_save: true, status, items: [], next_offset: null }
 assert.equal(panel.isOpenFor(card), true);
 panel.close(false); assert.equal(panel.isOpenFor(card), false);
 panel.open({ id: '1234567890123456789' }, card, button);
-respond({ work_id: '1234567890123456789', can_save: true, status: { ...status, operation:'failed', reason:'读取失败' }, items: [], next_offset:null }); await wait();
+respond({ work_id: '1234567890123456789', can_save: true, status: { ...status, operation:'failed', reason:'读取失败', channel:'server' }, items: [], next_offset:null }); await wait();
+assert.match(flatten(card).map(n => n.textContent).join(' '), /服务器通道/, '回退后状态须标明服务器通道');
 const retry = flatten(card).find(n => n.textContent === '重试'); assert.ok(retry, '首次失败应提供重试');
 const rescan = flatten(card).find(n => n.textContent === '从头重新扫描'); assert.ok(rescan, '失败后应可选择从头扫描');
 rescan.click(); assert.equal(calls.at(-1).body.action, 'update', '从头扫描应发 update 保留已有评论');

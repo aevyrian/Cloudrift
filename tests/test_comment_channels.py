@@ -84,12 +84,18 @@ class ChannelStoreTests(unittest.TestCase):
     def test_queue_defaults_to_assistant_and_honors_explicit_channel(self):
         self.assertEqual(self.store.comment_queue(WORK, 'save')['checkpoint'],
                          {'channel': 'assistant', 'cursor': 0, 'root_done': False, 'replies': []})
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'assistant')
         self.store.comment_cancel(WORK)
         self.assertEqual(self.store.comment_queue(WORK, 'save', 'server')['checkpoint']['channel'], 'server')
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'server')
         self.store.comment_cancel(WORK)
         self.assertEqual(self.store.comment_queue(WORK, 'save', 'assistant')['checkpoint']['channel'], 'assistant')
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'assistant')
         with self.assertRaises(ValueError):
             self.store.comment_queue(WORK, 'save', 'other')
+
+    def test_unsaved_status_does_not_claim_a_channel(self):
+        self.assertIsNone(self.store.comment_state(WORK)['channel'])
 
     def test_continue_preserves_legacy_and_assistant_checkpoints(self):
         self.store.comment_queue(WORK, 'save', 'assistant')
@@ -166,6 +172,7 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         fetch.assert_awaited_once_with(WORK, cursor=0, root_id=None)
         job = self.store.comment_job(WORK)
         self.assertEqual(job['checkpoint']['channel'], 'assistant')
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'assistant')
         self.assertEqual(self.store.comment_state(WORK)['total'], 1)
         self.assertTrue(await service.step())
         self.assertEqual(self.store.comment_state(WORK)['operation'], 'finished')
@@ -176,6 +183,7 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await service.step())
         state = self.store.comment_state(WORK)
         self.assertFalse(state['queue_paused'])
+        self.assertEqual(state['channel'], 'server')
         self.assertEqual(self.core.calls, [(WORK, 0, None)])
         self.assertEqual(self.store.comment_job(WORK)['checkpoint']['channel'], 'server')
         self.assertTrue(await service.step())
@@ -194,6 +202,7 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(job['checkpoint']['channel'], 'server')
         self.assertIn('服务器通道', job['reason'])
         self.assertNotIn('private', job['reason'])
+        self.assertEqual(self.store.comment_state(WORK)['channel'], 'server')
         self.assertEqual(self.store.comment_state(WORK)['total'], 1)
 
     async def test_fallback_reuses_saved_comments_and_comment_id_dedup(self):
@@ -234,6 +243,7 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         state = self.store.comment_state(WORK)
         self.assertEqual(state['operation'], 'failed')
         self.assertTrue(state['queue_paused'])
+        self.assertEqual(state['channel'], 'assistant')
         self.assertNotIn('private', state['reason'])
         self.assertIn('登录', state['reason'])
         self.assertEqual(self.core.calls, [])

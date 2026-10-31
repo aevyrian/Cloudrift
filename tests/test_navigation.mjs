@@ -10,6 +10,9 @@ vm.runInContext(source.slice(source.indexOf('  const state ='), source.indexOf('
 assert.equal(stateContext.state.muted, false, '刷新作品库默认打开声音');
 const html = readFileSync(new URL('../app/static/index.html', import.meta.url), 'utf8');
 assert.match(html, /id="sound-toggle"[^>]*aria-pressed="true">声音：开<\/button>/, '初始声音按钮应显示声音开启');
+assert.match(html, /id="assistant-batch"[^>]*type="checkbox"/, '设置页须提供批量助手采集开关');
+assert.doesNotMatch(html, /id="assistant-batch"[^>]*checked/, '批量助手采集开关默认关闭');
+assert.match(html, /助手通道.*服务器通道/, '设置页须说明两个采集通道');
 const button = { events: {}, setAttribute() {}, addEventListener(type, callback) { this.events[type] = callback; } };
 const videos = [{ muted: true }];
 const soundContext = vm.createContext({ state: stateContext.state, $: id => id === 'sound-toggle' ? button : { querySelectorAll: () => videos }, localStorage: { setItem() {} }, applySound, activeCard: null });
@@ -17,15 +20,16 @@ vm.runInContext(source.slice(source.indexOf('  function paintSound()'), source.i
 button.events.click(); assert.equal(videos[0].muted, true, '用户可以手动关闭声音');
 button.events.click(); assert.equal(videos[0].muted, false, '用户可以再次打开声音');
 
-const ids = Object.fromEntries(['cookie-state', 'cookie', 'clear-cookie', 'cookie-account', 'quality-policy', 'download-dir', 'download-dir-hint', 'script-server', 'script-token', 'reveal-token'].map(id => [id, {}]));
+const ids = Object.fromEntries(['cookie-state', 'cookie', 'clear-cookie', 'cookie-account', 'quality-policy', 'assistant-batch', 'download-dir', 'download-dir-hint', 'script-server', 'script-token', 'reveal-token'].map(id => [id, {}]));
 let resolveStatus; let statusPainted = false; let legacyLoaded = false;
 const status = new Promise(resolve => { resolveStatus = resolve; });
 const state = { navigation: 1, view: 'settings', token: 'synthetic-test' };
-const settingsContext = vm.createContext({ state, $: id => ids[id], location: { origin: 'https://test.example' }, showStatus() { statusPainted = true; }, loadLegacy: async () => { legacyLoaded = true; }, setTimeout: fn => { queueMicrotask(fn); return 1; }, clearTimeout() {}, api: path => path === '/api/status' ? status : Promise.resolve({ cookie_configured: false, quality_policy: 'upstream', download_dir: '/media', media_root: '/media' }) });
+const settingsContext = vm.createContext({ state, $: id => ids[id], location: { origin: 'https://test.example' }, showStatus() { statusPainted = true; }, loadLegacy: async () => { legacyLoaded = true; }, setTimeout: fn => { queueMicrotask(fn); return 1; }, clearTimeout() {}, api: path => path === '/api/status' ? status : Promise.resolve({ cookie_configured: false, quality_policy: 'upstream', assistant_batch: false, download_dir: '/media', media_root: '/media' }) });
 vm.runInContext(source.slice(source.indexOf('  function paintCookieStatus('), source.indexOf('  async function loadLegacy(')) + '\nglobalThis.loadSettings = loadSettings;', settingsContext);
 const loading = settingsContext.loadSettings();
 await tick();
 assert.equal(ids['download-dir'].value, '/media', '设置表单无需等待慢状态统计');
+assert.equal(ids['assistant-batch'].checked, false, '批量助手采集开关默认关闭');
 assert.equal(legacyLoaded, true, '旧库状态应并行加载');
 state.navigation++; state.view = 'tasks';
 resolveStatus({}); await loading;
