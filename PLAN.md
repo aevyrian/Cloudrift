@@ -269,3 +269,4 @@ A0 parse 不支持类型改为计数跳过 → A1 计数/首次判定函数 → 
 - A4 f8b3a91：RateLimited 异常；本次完成 >600 且限流 → 暂停作者，1 小时后自动恢复（264）
 - A5 55aa4f9：回归测试与文案（266，node 13/13）
 - 待做：B 部分（油猴评论新通道，默认优先、失败回退服务器）；部署到飞牛 NAS 后实测
+- B3 fd371c1：userscript: on logged-in douyin work page hook page's own first comment request as template, re-issue via in-page XHR replacing aweme_id/cursor/comment_id (page SDK signs), fetch top-level and replies, pace 2-4s per request and extra 8-15s every 15 requests, upload pages to B2 API; single work only. On login expired/captcha stop and report via existing pause style. Bump userscript @version (1.11.1 -> 1.12.0) per repo convention and add CHANGELOG.md entry. Keep old server comment channel unchanged. Both channels share comment table, field mapping (_comment_item) and comment-ID dedup.
