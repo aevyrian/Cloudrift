@@ -470,7 +470,8 @@
     const card = element('article', 'record'); const content = element('div', 'record-content'); const heading = element('div', 'record-title');
     const stateClass = task.status === 'completed' ? 'good' : ['failed', 'interrupted'].includes(task.status) ? 'bad' : 'pending';
     const countConfirm = task.status === 'awaiting_confirmation' && task.confirm_reason === 'count';
-    heading.append(element('h2', '', taskTitle(task)), element('span', `badge ${stateClass}`, countConfirm ? '等待数量确认' : statusNames[task.status] || task.status));
+    const rateLimitedPause = task.status === 'paused' && Number(task.resume_at) > 0;
+    heading.append(element('h2', '', taskTitle(task)), element('span', `badge ${stateClass}`, countConfirm ? '等待数量确认' : rateLimitedPause ? '限流暂停' : statusNames[task.status] || task.status));
     const source=element('a','source-link',task.kind==='author'?'查看博主主页 ↗':'查看作品链接 ↗');source.href=task.link.startsWith('https://')?task.link:`https://www.douyin.com/video/${task.link}`;source.target='_blank';source.rel='noopener noreferrer';
     const needsAttention = ['failed', 'interrupted'].includes(task.status);
     const summary = needsAttention && Number(task.total) > 0
@@ -478,6 +479,7 @@
       : needsAttention ? '任务未完成，请展开查看原因' : task.message || '等待处理';
     content.append(heading,source,element('p', '', summary));
     if (needsAttention && task.message) { const reason=element('details');reason.append(element('summary','','查看原因'),element('p','',task.message));content.append(reason); }
+    if (rateLimitedPause) content.append(element('p', 'hint', '抖音暂时限制访问，已保存作品不会重复下载；任务将按提示时间自动继续，也可手动继续。'));
     if (Number(task.total) > 0) {
       const bar = element('div', 'progress'); const fill = element('span'); fill.style.width = `${Math.min(100, Math.max(0, Number(task.completed) / Number(task.total) * 100))}%`; bar.append(fill);
       content.append(bar, element('p', 'muted', `已完整保存 ${task.completed} / ${task.total} 条`));

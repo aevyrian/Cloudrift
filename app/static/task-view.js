@@ -41,7 +41,7 @@
       button.append(node('span', '', label), node('span', 'task-filter-count', '0'));
       button.addEventListener('click', () => { filter = value; render(); }); filters.append(button); filterButtons.set(value, button);
     }
-    for (const [value, label, help] of [['active', '进行中', '下载与排队'], ['attention', '需要处理', '重试或确认画质'], ['completed', '完整保存', '已进入作品库']]) {
+    for (const [value, label, help] of [['active', '进行中', '下载与排队'], ['attention', '需要处理', '重试、确认数量或画质'], ['completed', '完整保存', '已进入作品库']]) {
       const button = node('button', 'task-summary-item'); button.type = 'button';
       button.append(node('span', '', label), node('strong', '', '0'), node('small', '', help));
       button.addEventListener('click', () => { filter = value; render(); }); summary.append(button); summaryButtons.set(value, button);

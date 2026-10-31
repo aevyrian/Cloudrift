@@ -8,8 +8,10 @@ from unittest.mock import patch
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "vendor" / "TikTokDownloader"))
 
 from app.core import Core, RateLimited
-from app.main import RATE_LIMIT_COMPLETED_THRESHOLD, RATE_LIMIT_PAUSE_SECONDS, JobService
+from app.main import (RATE_LIMIT_COMPLETED_THRESHOLD, RATE_LIMIT_PAUSE_SECONDS, JobService,
+                      make_app)
 from app.store import Store
+from fastapi.testclient import TestClient
 from tests.test_backend import FakeCore, WORK_ID
 
 
@@ -243,3 +245,33 @@ class RateLimitTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task["status"], "completed")
         self.assertEqual(self.store.stats()["works"], len(items))
         self.assertEqual(core.download_calls, len(items))
+
+
+class RateLimitPauseApiTests(unittest.TestCase):
+    def test_api_exposes_rate_limit_pause_message_and_resume_time(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = make_app(root / "data", root / "media", token="test-token",
+                           core=FakeCore(root / "media"))
+            store = app.state.store
+            service = JobService(store, FakeCore(root / "media"), root / "media")
+            job = store.create_task(AUTHOR_URL, "author")
+            completed = RATE_LIMIT_COMPLETED_THRESHOLD + 1
+            with patch("app.main.time.time", return_value=1000):
+                resume_at = service.pause_rate_limited(
+                    store.task(job["id"]), completed, RateLimited("访问过于频繁，请稍后重试"))
+            self.assertEqual(resume_at, 1000 + RATE_LIMIT_PAUSE_SECONDS)
+
+            headers = {"Authorization": "Bearer test-token"}
+            client = TestClient(app)  # No lifespan: the download worker never starts.
+            try:
+                tasks = client.get("/api/tasks", headers=headers).json()
+                exposed = next(item for item in tasks if item["id"] == job["id"])
+                self.assertEqual(exposed["status"], "paused")
+                self.assertEqual(exposed["completed"], completed)
+                self.assertEqual(exposed["resume_at"], resume_at)
+                self.assertIn(str(completed), exposed["message"])
+                self.assertIn("自动继续", exposed["message"])
+                self.assertIn("不会重复下载", exposed["message"])
+            finally:
+                client.close()

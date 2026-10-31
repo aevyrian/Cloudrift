@@ -142,7 +142,7 @@ try {
 const calls = [];
 const cardContext = vm.createContext({
   element: (tag, className, text) => { const node = new Element(tag, text); node.className = className; return node; },
-  taskTitle, statusNames: {}, formatDate: () => '刚刚',
+  taskTitle, statusNames: { paused: '已暂停', awaiting_confirmation: '等待画质确认' }, formatDate: () => '刚刚',
   action: (label, callback) => { const node = new Element('button', label); node.invoke = callback; return node; },
   api: async (url, method) => { calls.push({ url, method }); }, loadTasks: async () => {}, notice:()=>{}
 });
@@ -159,8 +159,21 @@ const countActions = countCard.querySelector('.record-actions').children;
 const countButton = countActions.find(node => node.textContent === '确认数量并继续');
 assert.ok(countButton, '数量确认须使用独立按钮文案');
 assert.equal(countActions.some(node => node.textContent === '接受此任务原项目优选'), false);
+const countBadge = countCard.querySelector('.record-title').children[1];
+assert.equal(countBadge.textContent, '等待数量确认', '数量确认状态须使用独立徽标文案');
+const countHints = countCard.children[0].children.filter(node => node.className === 'hint').map(node => node.textContent);
+assert.ok(countHints.some(text => text.includes('1000')), '数量确认须说明 1000 个阈值');
 await countButton.invoke();
 assert.deepEqual(calls.at(-1), { url: '/api/tasks/count%2Fa/confirm', method: 'POST' });
+const rateLimitCard = cardContext.makeCard({ id: 'rate/a', status: 'paused', resume_at: 4600, completed: 601, message: '本次已完整保存 601 个作品后触发抖音访问限制，已暂停该作者任务；将于 19:40 自动继续，已保存作品不会重复下载', kind: 'author', link: 'https://www.douyin.com/user/rate', preview: [] });
+const rateLimitBadge = rateLimitCard.querySelector('.record-title').children[1];
+assert.equal(rateLimitBadge.textContent, '限流暂停', '限流暂停须与普通暂停区分');
+const rateLimitHints = rateLimitCard.children[0].children.filter(node => node.className === 'hint').map(node => node.textContent);
+assert.ok(rateLimitHints.some(text => text.includes('自动继续') && text.includes('不会重复下载')), '限流暂停须说明自动继续且不重复下载');
+assert.ok(rateLimitCard.querySelector('.record-actions').children.some(node => node.textContent === '继续'), '限流暂停仍须支持手动继续');
+const plainPausedCard = cardContext.makeCard({ id: 'paused/a', status: 'paused', resume_at: 0, message: '已暂停，已保存内容保留', kind: 'detail', link: 'https://www.douyin.com/video/123', preview: [] });
+assert.equal(plainPausedCard.querySelector('.record-title').children[1].textContent, '已暂停', '普通暂停不能显示为限流暂停');
+assert.equal(plainPausedCard.children[0].children.some(node => node.className === 'hint' && node.textContent.includes('自动继续')), false);
 const deleting=cardContext.makeCard({id:'remove/a',status:'downloading',kind:'detail',link:'https://www.douyin.com/video/123',preview:[]});
 await deleting.querySelector('.record-actions').children.find(n=>n.textContent==='删除').invoke();
 assert.deepEqual(calls.at(-1),{url:'/api/tasks/remove%2Fa',method:'DELETE'});

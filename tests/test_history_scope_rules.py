@@ -4,8 +4,9 @@ from pathlib import Path
 from unittest.mock import patch
 
 from app.main import (CONFIRM_REASON_COUNT, CONFIRM_REASON_QUALITY, FIRST_HISTORY_COUNT_LIMIT,
-                      QUALITY_CONFIRM_MESSAGE, JobService, count_media_items, task_history_flags)
+                      QUALITY_CONFIRM_MESSAGE, JobService, count_media_items, make_app, task_history_flags)
 from app.store import Store
+from fastapi.testclient import TestClient
 from tests.test_backend import FakeCore
 
 
@@ -193,6 +194,39 @@ class FirstHistoryCountRuleTests(unittest.IsolatedAsyncioTestCase):
         await service.process_one()
         self.assertEqual(self.store.task(job["id"])["status"], "completed")
         self.assertEqual(core.download_calls, 0)
+
+
+class CountConfirmationApiTests(unittest.TestCase):
+    def test_api_exposes_count_confirmation_text_and_confirm_continues(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            app = make_app(root / "data", root / "media", token="test-token",
+                           core=FakeCore(root / "media"))
+            store = app.state.store
+            job = store.create_task(AUTHOR_URL, "author")
+            message = (f"已解析首次历史作品：视频和图集共 {FIRST_HISTORY_COUNT_LIMIT + 1} 个，"
+                       f"超过 {FIRST_HISTORY_COUNT_LIMIT} 个；请确认数量后继续下载")
+            store.update_task(job["id"], status="awaiting_confirmation",
+                              confirm_reason=CONFIRM_REASON_COUNT, message=message)
+            headers = {"Authorization": "Bearer test-token"}
+            client = TestClient(app)  # No lifespan: the download worker never starts.
+            try:
+                tasks = client.get("/api/tasks", headers=headers).json()
+                exposed = next(item for item in tasks if item["id"] == job["id"])
+                self.assertEqual(exposed["status"], "awaiting_confirmation")
+                self.assertEqual(exposed["confirm_reason"], CONFIRM_REASON_COUNT)
+                self.assertEqual(exposed["message"], message)
+                self.assertIn(str(FIRST_HISTORY_COUNT_LIMIT), exposed["message"])
+                self.assertIn("数量", exposed["message"])
+
+                confirmed = client.post(f"/api/tasks/{job['id']}/confirm", headers=headers).json()
+                self.assertEqual(confirmed["status"], "queued")
+                self.assertTrue(confirmed["accept_count"])
+                self.assertEqual(confirmed["confirm_reason"], "")
+                self.assertIn("数量", confirmed["message"])
+                self.assertNotEqual(confirmed["message"], QUALITY_CONFIRM_MESSAGE)
+            finally:
+                client.close()
 
 
 if __name__ == "__main__":
