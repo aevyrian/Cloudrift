@@ -530,6 +530,15 @@ class CommentInput(BaseModel):
     action: Literal['save', 'update', 'continue'] = 'save'
 
 
+class AssistantCommentPageInput(BaseModel):
+    model_config = ConfigDict(extra='forbid')
+    page: dict
+    root_id: str = Field(default='', pattern=r'^(?:[0-9]{1,32})?$')
+    cursor: int | None = Field(default=None, ge=0, le=2**63 - 1, strict=True)
+    token: str = Field(default='', max_length=64, pattern=r'^[0-9a-f]*$')
+    action: Literal['save', 'update', 'continue'] | None = None
+
+
 def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=None):
     os.umask(0o077)
     data_dir = Path(data_dir or os.environ.get("APP_DATA", "data"))
@@ -859,6 +868,16 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
         return JSONResponse(service.comments.queue(real_id, body.action), status_code=202,
                             headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/works/{work_id}/comments/assistant', dependencies=[Depends(authorize)])
+    def assistant_comments(work_id: str, body: AssistantCommentPageInput):
+        real_id, can_save, _ = comment_target(work_id)
+        if not can_save:
+            raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
+        result = service.comments.assistant_page(
+            real_id, body.page, root_id=body.root_id, cursor=body.cursor,
+            token=body.token, action=body.action)
+        return JSONResponse(result, status_code=202, headers={'Cache-Control': 'no-store'})
 
     @app.post('/api/works/{work_id}/comments/cancel', dependencies=[Depends(authorize)])
     async def cancel_comments(work_id: str):

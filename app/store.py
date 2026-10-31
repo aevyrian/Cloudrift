@@ -524,6 +524,50 @@ class Store:
                        (work_id, token, json.dumps(checkpoint), stamp()))
             return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
 
+    def comment_assistant_start(self, work_id, action=None, token=''):
+        """创建或继续助手直传会话；直传会话由 API 驱动，不交给后台 worker。
+
+        checkpoint 中的 ``direct`` 标记用于把这类会话与 worker 拉取通道区分开。
+        带 token 时只允许延续同一活动会话；不带 token 时按 action 决定续传或重开。
+        """
+        if (not re.fullmatch(r'[0-9]{19}', work_id or '')
+                or action not in (None, 'save', 'update', 'continue')
+                or not isinstance(token, str) or len(token) > 64 or not token.isascii()):
+            raise ValueError('作品或评论操作无效')
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            checkpoint = channel_checkpoint(json.loads(row['checkpoint']) if row else None)
+            direct = bool(checkpoint.get('direct')) and checkpoint['channel'] == 'assistant'
+            if token:
+                if (not row or not direct or row['operation'] not in ('running', 'interrupted')
+                        or not hmac.compare_digest(row['token'], token)):
+                    raise ValueError('评论采集会话已失效，请重新开始')
+                if row['operation'] == 'interrupted':
+                    db.execute("UPDATE comment_jobs SET operation='running',updated_at=? WHERE work_id=?",
+                               (stamp(), work_id))
+                    row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+                return self._comment_job(row)
+            if row and row['operation'] in ('queued', 'running') and not direct:
+                raise ValueError('该作品正在使用其他评论通道采集评论')
+            complete = checkpoint['root_done'] and not checkpoint['replies']
+            resumable = (bool(row) and direct and not complete
+                         and row['operation'] in ('running', 'stopped', 'interrupted', 'failed'))
+            if resumable and action not in ('save', 'update'):
+                db.execute("UPDATE comment_jobs SET operation='running',updated_at=? WHERE work_id=?",
+                           (stamp(), work_id))
+                return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
+            checkpoint = channel_checkpoint(None, 'assistant')
+            checkpoint['direct'] = True
+            token = secrets.token_hex(16)
+            db.execute('''INSERT INTO comment_jobs(work_id,operation,integrity,reason,token,checkpoint,updated_at)
+                          VALUES (?,'running','unsaved','',?,?,?) ON CONFLICT(work_id) DO UPDATE SET
+                          operation='running',integrity='unsaved',reason='',token=excluded.token,
+                          checkpoint=excluded.checkpoint,requests=0,new_comments=0,active_seconds=0,
+                          asset_bytes=0,platform_total=NULL,updated_at=excluded.updated_at''',
+                       (work_id, token, json.dumps(checkpoint), stamp()))
+            return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
+
     def comment_cancel(self, work_id):
         with self.connect() as db:
             db.execute("UPDATE comment_jobs SET operation='stopped',reason='已停止，已保存内容保留',updated_at=? WHERE work_id=? AND operation IN ('queued','running')", (stamp(), work_id))
@@ -535,7 +579,10 @@ class Store:
     def comment_claim(self):
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
-            row = db.execute("SELECT * FROM comment_jobs WHERE operation IN ('queued','running') ORDER BY CASE operation WHEN 'running' THEN 0 ELSE 1 END,rowid LIMIT 1").fetchone()
+            rows = db.execute("SELECT * FROM comment_jobs WHERE operation IN ('queued','running') ORDER BY CASE operation WHEN 'running' THEN 0 ELSE 1 END,rowid").fetchall()
+            # 助手直传会话由鉴权 API 分页提交，后台 worker 不认领，避免抢占后误判通道不可用。
+            row = next((candidate for candidate in rows
+                        if not (json.loads(candidate['checkpoint']) or {}).get('direct')), None)
             if row:
                 db.execute("UPDATE comment_jobs SET operation='running',updated_at=? WHERE work_id=? AND operation='queued'", (stamp(), row['work_id']))
                 row = db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (row['work_id'],)).fetchone()

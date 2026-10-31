@@ -3,6 +3,7 @@ import copy
 import time
 
 from .comment_channels import (CommentChannelUnavailable, DEFAULT_CHANNEL,
+                               assistant_page as map_assistant_page,
                                channel_checkpoint, default_channels)
 from .core import CommentBlocked
 
@@ -23,6 +24,64 @@ class CommentService:
 
     def recover(self):
         self.store.comment_recover()
+
+    def assistant_page(self, work_id, page, root_id='', cursor=None, token='', action=None):
+        """接收助手采集的一页原始评论数据，映射后入库并保存分页进度。
+
+        一级评论和楼中楼共用 ``assistant_page``（内部调用 ``comment_item``），
+        评论编号去重交给 ``comment_commit_page``；重复上报只做幂等写入，不回退
+        checkpoint。返回新的会话 token 供助手后续页携带。
+        """
+        root_id = root_id or ''
+        job = self.store.comment_assistant_start(work_id, action, token)
+        checkpoint = channel_checkpoint(copy.deepcopy(job['checkpoint']))
+        replies = checkpoint['replies']
+        if root_id:
+            if not replies or replies[0]['id'] != root_id:
+                raise ValueError('回复分页与当前进度不一致')
+            expected = replies[0]['cursor']
+        else:
+            expected = checkpoint['cursor']
+        if cursor is None:
+            cursor = expected
+        elif type(cursor) is not int or not 0 <= cursor <= 2**63 - 1:
+            raise ValueError('分页游标无效')
+        mapped = map_assistant_page(page, cursor, root_id or None)
+        items, next_cursor, more = mapped['items'], mapped['next_cursor'], mapped['has_more']
+        replay = cursor < expected
+        if replay:
+            # 网络重试或重复上报：评论表按编号去重，进度保持在更靠后的位置。
+            if not items:
+                raise ValueError('评论分页为空')
+        else:
+            if cursor != expected:
+                raise ValueError('分页游标与当前进度不一致')
+            if more and (not items or next_cursor <= cursor):
+                raise ValueError('评论分页未正常推进')
+            if root_id:
+                if more:
+                    replies[0]['cursor'] = next_cursor
+                else:
+                    replies.pop(0)
+            else:
+                checkpoint['cursor'] = next_cursor
+                checkpoint['root_done'] = not more
+                known = {pending['id'] for pending in replies}
+                for item in items:
+                    if item['reply_count'] > 0 and item['id'] not in known:
+                        replies.append({'id': item['id'], 'cursor': 0})
+                        known.add(item['id'])
+        before = self.store.comment_state(work_id)['total']
+        total = mapped.get('total') if not root_id else None
+        started = time.monotonic()
+        if not self.store.comment_commit_page(work_id, job['token'], items, checkpoint, total,
+                                              time.monotonic() - started):
+            raise ValueError('评论采集会话已失效，请重新开始')
+        after = self.store.comment_state(work_id)['total']
+        if not replay and checkpoint['root_done'] and not replies:
+            self.store.comment_end(work_id, job['token'], 'finished', '', finished=True)
+        return {'accepted': True, 'token': job['token'], 'new_comments': max(0, after - before),
+                'checkpoint': checkpoint, 'status': self.store.comment_state(work_id)}
 
     async def step(self):
         now = time.time()
