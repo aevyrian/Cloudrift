@@ -3,7 +3,7 @@
 // @name:zh      抖音收藏库助手
 // @name:zh-CN   抖音收藏库助手
 // @namespace    douyin-local-library
-// @version      1.11.1
+// @version      1.12.0
 // @description  识别当前作品与博主，查看更新状态，按需下载并设置追更周期。
 // @match        https://www.douyin.com/*
 // @match        https://douyin.com/*
@@ -103,7 +103,172 @@
     }
     return null;
   }
-  if (typeof module !== 'undefined' && module.exports) { module.exports = { resolveTargets, normalizeServer, togglePanel, defaultKind, senderPosition, pageTargets, reactAuthor, subscriptionState, pageProfileCount }; return; }
+  function commentKind(value) {
+    const url = String(value || '');
+    return /\/comment\/list\/reply\//.test(url) ? 'reply' : /\/comment\/list\//.test(url) ? 'top' : null;
+  }
+  function commentRequestURL(template, patch, origin, msToken) {
+    const url = new URL(template.url, origin);
+    for (const key of ['a_bogus', 'X-Bogus', '_signature']) url.searchParams.delete(key);
+    if (msToken && url.searchParams.has('msToken')) url.searchParams.set('msToken', msToken);
+    for (const [key, value] of Object.entries(patch || {})) {
+      if (value === undefined || value === null || value === '') url.searchParams.delete(key);
+      else url.searchParams.set(key, String(value));
+    }
+    return url.pathname + url.search;
+  }
+  function commentReplyTemplate(template, origin) {
+    if (!template?.url) return null;
+    const url = new URL(template.url, origin);
+    url.pathname = '/aweme/v1/web/comment/list/reply/';
+    url.searchParams.delete('aweme_id');
+    return {url: url.pathname + url.search, headers: template.headers || {}, derived: true};
+  }
+  function commentPaceDelay(count, random = Math.random) {
+    const request = Math.max(1, Number(count) || 1);
+    const base = 2000 + random() * 2000;
+    return request % 15 === 0 ? base + 8000 + random() * 7000 : base;
+  }
+  function commentPageVerdict(text) {
+    if (text === 'TIMEOUT' || text === '') return 'blocked';
+    let value = null;
+    try { value = JSON.parse(text); } catch {}
+    if (value && value.status_code === 0 && Array.isArray(value.comments)) return 'ok';
+    const message = value && typeof value === 'object'
+      ? String(value.status_msg || value.message || value.msg || '')
+      : String(text || '').slice(0, 2000);
+    return /验证码|captcha|verify|登录|login|安全验证|访问受限|风险|频繁/i.test(message) ? 'blocked' : 'failed';
+  }
+  function hookCommentRequests(pageWindow, remember) {
+    if (!pageWindow || typeof remember !== 'function') return false;
+    let hooked = false;
+    const XHR = pageWindow.XMLHttpRequest;
+    if (typeof XHR === 'function' && XHR.prototype && !XHR.prototype.__cloudriftCommentHook) {
+      const proto = XHR.prototype, open = proto.open, send = proto.send, setHeader = proto.setRequestHeader;
+      if (typeof open === 'function' && typeof send === 'function') {
+        proto.open = function (method, url) {
+          this.__cloudriftCommentURL = String(url || '');
+          this.__cloudriftCommentHeaders = {};
+          return open.apply(this, arguments);
+        };
+        if (typeof setHeader === 'function') {
+          proto.setRequestHeader = function (name, value) {
+            if (this.__cloudriftCommentHeaders) this.__cloudriftCommentHeaders[name] = value;
+            return setHeader.apply(this, arguments);
+          };
+        }
+        proto.send = function () {
+          const kind = commentKind(this.__cloudriftCommentURL);
+          if (kind && !this.__cloudriftCommentSelf) {
+            remember(kind, this.__cloudriftCommentURL, this.__cloudriftCommentHeaders);
+          }
+          return send.apply(this, arguments);
+        };
+        proto.__cloudriftCommentHook = true;
+        hooked = true;
+      }
+    }
+    const pageFetch = pageWindow.fetch;
+    if (typeof pageFetch === 'function' && !pageFetch.__cloudriftCommentHook) {
+      const wrapped = function (input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url) || '';
+        const kind = commentKind(url);
+        if (kind) {
+          let headers = {};
+          try {
+            const source = pageWindow.Request && input instanceof pageWindow.Request ? input.headers : init && init.headers;
+            if (source && pageWindow.Headers) headers = Object.fromEntries(new pageWindow.Headers(source));
+          } catch {}
+          remember(kind, url, headers);
+        }
+        return pageFetch.apply(this, arguments);
+      };
+      wrapped.__cloudriftCommentHook = true;
+      pageWindow.fetch = wrapped;
+      hooked = true;
+    }
+    return hooked;
+  }
+  function commentXHR(pageWindow, url, headers, timeout = 20000) {
+    return Promise.race([
+      new Promise(resolve => {
+        let xhr;
+        try { xhr = new pageWindow.XMLHttpRequest(); } catch { resolve(''); return; }
+        xhr.__cloudriftCommentSelf = true;
+        try { xhr.open('GET', url); } catch { resolve(''); return; }
+        xhr.withCredentials = true;
+        for (const [name, value] of Object.entries(headers || {})) {
+          try { xhr.setRequestHeader(name, value); } catch {}
+        }
+        xhr.onload = () => resolve(String(xhr.responseText || ''));
+        xhr.onerror = () => resolve('');
+        xhr.send();
+      }),
+      new Promise(resolve => setTimeout(() => resolve('TIMEOUT'), timeout)),
+    ]);
+  }
+  async function commentCollect(options) {
+    const {templates, awemeId, request, upload, sleep, random = Math.random,
+      origin = 'https://www.douyin.com', msToken = '', state} = options;
+    if (!templates?.top?.url) return {status: 'need_template', reason: '评论区尚未加载'};
+    const top = templates.top, reply = templates.reply || commentReplyTemplate(top, origin);
+    const run = state || {requests: 0, token: '', topCursor: 0, threads: [], threadIndex: 0,
+      replyCursor: 0, topDone: false, action: 'save', cancelled: false};
+    const pace = async () => { run.requests += 1; await sleep(commentPaceDelay(run.requests, random)); };
+    const stop = (status, reason) => ({status, reason, state: run});
+    const page = async (template, patch) => {
+      let text;
+      try { text = await request(commentRequestURL(template, patch, origin, msToken), template.headers); }
+      catch (error) { return {verdict: 'failed', reason: error?.message || '评论请求失败'}; }
+      const verdict = commentPageVerdict(text);
+      if (verdict !== 'ok') return {verdict, reason: verdict === 'blocked' ? '登录或验证码需要处理' : '评论页格式异常'};
+      return {verdict, value: JSON.parse(text)};
+    };
+    const save = async (value, rootId, cursor) => {
+      try {
+        const body = {page: value, root_id: rootId, cursor, token: run.token};
+        if (run.action) body.action = run.action;
+        return {result: await upload(body)};
+      } catch (error) {
+        const reason = error?.message || '保存评论失败';
+        return {error: reason, stale: /会话已失效|重新开始/.test(String(reason))};
+      }
+    };
+    while (!run.topDone) {
+      if (run.cancelled) return stop('stopped', '已停止');
+      const cursor = run.topCursor;
+      const pageResult = await page(top, {aweme_id: awemeId, cursor, count: 20});
+      if (pageResult.verdict !== 'ok') return stop(pageResult.verdict === 'blocked' ? 'paused' : 'failed', pageResult.reason);
+      const saved = await save(pageResult.value, '', cursor);
+      if (saved.error) return stop(saved.stale ? 'stale' : 'failed', saved.error);
+      if (saved.result?.token) run.token = saved.result.token;
+      run.action = undefined;
+      const known = new Set(run.threads);
+      for (const item of pageResult.value.comments) {
+        const id = String(item.cid);
+        if (Number(item.reply_comment_total) > 0 && !known.has(id)) { run.threads.push(id); known.add(id); }
+      }
+      const more = Boolean(pageResult.value.has_more) && pageResult.value.comments.length > 0;
+      if (Number.isSafeInteger(pageResult.value.cursor) && pageResult.value.cursor >= 0) run.topCursor = pageResult.value.cursor;
+      run.topDone = !more;
+      await pace();
+    }
+    while (run.threadIndex < run.threads.length) {
+      if (run.cancelled) return stop('stopped', '已停止');
+      const commentId = run.threads[run.threadIndex], cursor = run.replyCursor;
+      const pageResult = await page(reply, {item_id: awemeId, comment_id: commentId, cursor, count: 20});
+      if (pageResult.verdict !== 'ok') return stop(pageResult.verdict === 'blocked' ? 'paused' : 'failed', pageResult.reason);
+      const saved = await save(pageResult.value, commentId, cursor);
+      if (saved.error) return stop(saved.stale ? 'stale' : 'failed', saved.error);
+      if (saved.result?.token) run.token = saved.result.token;
+      const more = Boolean(pageResult.value.has_more) && pageResult.value.comments.length > 0;
+      if (more) run.replyCursor = pageResult.value.cursor;
+      else { run.threadIndex += 1; run.replyCursor = 0; }
+      await pace();
+    }
+    return {status: 'done', state: run};
+  }
+  if (typeof module !== 'undefined' && module.exports) { module.exports = { resolveTargets, normalizeServer, togglePanel, defaultKind, senderPosition, pageTargets, reactAuthor, subscriptionState, pageProfileCount, commentKind, commentRequestURL, commentReplyTemplate, commentPaceDelay, commentPageVerdict, hookCommentRequests, commentCollect }; return; }
 
   function node(tag, className, text) {
     const value = document.createElement(tag); if (className) value.className = className;
@@ -141,6 +306,15 @@
     })();
     return;
   }
+  const commentWindow = typeof unsafeWindow === 'undefined' ? null : unsafeWindow;
+  const commentTemplates = {};
+  if (commentWindow) {
+    try {
+      hookCommentRequests(commentWindow, (kind, url, headers) => {
+        if (!commentTemplates[kind]) commentTemplates[kind] = {url: String(url), headers: {...(headers || {})}};
+      });
+    } catch {}
+  }
   const host = node('div'); host.id = 'douyin-library-sender'; host.hidden = true;
   host.style.cssText = 'position:fixed;width:44px;height:44px;z-index:2147483647';
   const shadow = host.attachShadow({mode:'closed'}), style = node('style');
@@ -170,8 +344,8 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   const times=node('div','status-times'),lastColumn=node('div'),nextColumn=node('div'),lastSuccess=node('span','last-success','暂无记录'),nextCheck=node('span','next-check','未设计划');
   lastColumn.append(node('small','','最近成功更新'),lastSuccess);nextColumn.append(node('small','','下次计划更新'),nextCheck);times.append(lastColumn,nextColumn);
   const stateNote=node('p','state-note','已有内容自动跳过。');card.append(heading,times,stateNote);
-  const detailButton=node('button','primary','下载当前作品'),authorButton=node('button','','下载全部作品'),libraryLink=node('a','archive-link','查看归档 ↗');libraryLink.target='_blank';libraryLink.rel='noopener noreferrer';
-  const actions=node('div','actions'),quick=node('div','quick-actions');quick.append(authorButton,libraryLink);actions.append(detailButton,quick);
+  const detailButton=node('button','primary','下载当前作品'),authorButton=node('button','','下载全部作品'),commentButton=node('button','','保存当前作品评论'),libraryLink=node('a','archive-link','查看归档 ↗');libraryLink.target='_blank';libraryLink.rel='noopener noreferrer';
+  const actions=node('div','actions'),quick=node('div','quick-actions');quick.append(authorButton,libraryLink);actions.append(detailButton,commentButton,quick);
   const frequency=node('select');frequency.setAttribute('aria-label','博主更新周期');
   const labels={once:'仅下载一次',three_days:'每3天更新',weekly:'每7天更新',monthly:'每月更新',quarterly:'每季度更新',yearly:'每年更新'};
   for(const [value,text] of Object.entries(labels)){const option=node('option','',text);option.value=value;frequency.append(option);}frequency.value='once';
@@ -185,9 +359,10 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   const preference=node('select');for(const [value,text] of [['detail','突出当前作品'],['author','突出博主更新']]){const option=node('option','',text);option.value=value;preference.append(option);}preference.value=defaultKind(GM_getValue('library_default_kind','author'));
   function field(text,control){const label=node('label','',text);label.append(control);form.append(label);}
   field('网站地址',serverInput);field('管理员密钥',tokenInput);field('默认下载操作',preference);const save=node('button','','保存设置');save.type='submit';form.append(save);settings.append(summary,form);
-  const footer=node('div','footer');footer.append(node('small','','助手 1.11.1'),node('span','','下载后在媒体库查看进度'));
+  const footer=node('div','footer');footer.append(node('small','','助手 1.12.0'),node('span','','下载后在媒体库查看进度'));
   panel.append(header,downloads,status,historyStatus,settings,footer);shadow.append(style,panel,toggle);document.body.append(host);
   let targets={detail:null,author:null},anchor=null,hadRail=false,authors=null,history=null,loading=null,generation=0,dataRevision=0,viewRevision=0,busy=false,frequencyDirty=false,settingsOverride=false,currentName='',stateAttempted=false;
+  let commentPhase='idle',commentRun=null,commentWorkId='',commentCancel=false,commentGeneration=0;
   const recent=new Set(),feedback=new Map(),counts=new Map();
   const server=()=>GM_getValue('library_server','');
   const configured=()=>Boolean(server()&&GM_getValue('library_token',''));
@@ -306,6 +481,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     frequency.disabled=busy||!targets.author;refresh.disabled=Boolean(loading)||busy||!targets.author;
     const preferred=defaultKind(GM_getValue('library_default_kind','author'));detailButton.classList.toggle('primary',preferred==='detail');authorButton.classList.toggle('primary',preferred==='author');
     try{libraryLink.href=normalizeServer(server())+'/#tasks';}catch{libraryLink.href='#';}
+    paintComment();
   }
   function clearState(){generation++;dataRevision++;authors=history=null;loading=null;frequencyDirty=false;stateAttempted=false;recent.clear();feedback.clear();}
   function loadState(force=false){
@@ -363,6 +539,67 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     else if(changed&&targets.author){clearTimeout(countTimer);const author=targets.author;countTimer=setTimeout(()=>{if(targets.author===author)loadCount();},500);}
   }
   function configure(){settingsOverride=true;host.hidden=false;if(panel.hidden)togglePanel(panel,toggle);settings.open=true;position();serverInput.focus();}
+  function paintComment(){
+    const currentId=targets.detail?.split('/').pop()||'';
+    if(commentPhase!=='running'&&currentId&&commentWorkId&&currentId!==commentWorkId){
+      commentPhase='idle';commentRun=null;commentWorkId='';
+    }
+    const labels={running:'停止评论采集',stopping:'正在停止…',paused:'继续采集评论',failed:commentRun?'重试评论采集':'重新采集评论',done:'重新采集评论'};
+    commentButton.textContent=labels[commentPhase]||'保存当前作品评论';
+    commentButton.disabled=commentPhase==='stopping'||commentPhase!=='running'&&(busy||!targets.detail);
+  }
+  async function startComments(){
+    if(commentPhase==='running'||commentPhase==='stopping')return;
+    if(!configured()){configure();message('请先配置网站，再保存评论。',true);return;}
+    const workId=targets.detail?.split('/').pop()||'';
+    if(!/^\d{19}$/.test(workId)){message('请打开一个作品页后再保存评论。',true);return;}
+    if(!commentWindow||typeof commentWindow.XMLHttpRequest!=='function'){message('当前页面环境不支持评论采集。',true);return;}
+    if(!commentRun||commentWorkId!==workId||commentPhase==='done'){
+      if(!commentTemplates.top){message('请先滚动到评论区，等页面加载出评论后再试。',true);return;}
+      commentRun={requests:0,token:'',topCursor:0,threads:[],threadIndex:0,replyCursor:0,topDone:false,action:'save',cancelled:false};
+      commentWorkId=workId;
+    }
+    const run=commentRun,generation=++commentGeneration;
+    commentPhase='running';commentCancel=false;message('正在读取评论…');paint();
+    const connection={server:server(),token:GM_getValue('library_token','')};
+    try{
+      let state;
+      try{state=await request('GET',`/api/works/${encodeURIComponent(workId)}/comments`,undefined,connection,10000);}
+      catch(error){
+        if(/作品不存在/.test(String(error?.message||''))){commentPhase='failed';message('该作品尚未保存到收藏库，请先下载后再采集评论。',true);return;}
+        throw error;
+      }
+      if(!state?.can_save){commentPhase='failed';message('该作品尚未保存到收藏库，请先下载后再采集评论。',true);return;}
+      let msToken='';try{msToken=commentWindow.localStorage.getItem('xmst')||'';}catch{}
+      const result=await commentCollect({templates:commentTemplates,awemeId:workId,origin:location.origin,msToken,state:run,
+        request:(url,headers)=>commentXHR(commentWindow,url,headers),
+        upload:body=>request('POST',`/api/works/${encodeURIComponent(workId)}/comments/assistant`,body,connection,30000),
+        sleep:ms=>new Promise(resolve=>setTimeout(resolve,ms))});
+      if(generation!==commentGeneration)return;
+      if(commentCancel||result.status==='stopped'){
+        commentPhase='idle';commentRun=null;commentWorkId='';message('评论采集已停止，已保存内容保留。');
+      }else if(result.status==='done'){
+        commentPhase='done';message(`评论已保存：共 ${result.state.threads.length} 个回复楼。`);
+      }else if(result.status==='paused'){
+        commentPhase='paused';message('评论采集已暂停：抖音要求登录或验证，请在页面完成验证后点“继续采集评论”。',true);
+      }else if(result.status==='stale'){
+        commentPhase='failed';commentRun=null;message('评论采集会话已失效，请点“重新采集评论”。',true);
+      }else if(result.status==='need_template'){
+        commentPhase='failed';message('请先滚动到评论区，等页面加载出评论后再试。',true);
+      }else{
+        commentPhase='failed';message('评论采集失败：'+(result.reason||'请稍后重试。'),true);
+      }
+    }catch(error){
+      if(generation===commentGeneration){commentPhase='failed';message('评论采集失败：'+(error?.message||'请检查网站连接后重试。'),true);}
+    }finally{if(generation===commentGeneration)paint();}
+  }
+  async function stopComments(){
+    if(commentPhase!=='running')return;
+    const workId=commentWorkId;
+    commentCancel=true;if(commentRun)commentRun.cancelled=true;
+    commentPhase='stopping';message('正在停止评论采集…');paint();
+    try{await request('POST',`/api/works/${encodeURIComponent(workId)}/comments/cancel`,undefined,{server:server(),token:GM_getValue('library_token','')},10000);}catch{}
+  }
   async function run(action){
     detect();const link=action==='detail'?targets.detail:targets.author;if(!link||busy)return;
     if(!configured()){configure();message('请先配置网站，再提交下载。',true);return;}
@@ -394,6 +631,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   toggle.addEventListener('click',()=>{settingsOverride=false;settings.open=false;togglePanel(panel,toggle);if(!panel.hidden){clearState();}detect();});
   close.addEventListener('click',()=>{settingsOverride=false;togglePanel(panel,toggle);toggle.focus();detect();});
   detailButton.addEventListener('click',()=>run('detail'));authorButton.addEventListener('click',()=>run('author'));submit.addEventListener('click',()=>run('plan'));
+  commentButton.addEventListener('click',()=>{if(commentPhase==='running')stopComments();else startComments();});
   frequency.addEventListener('change',()=>{frequencyDirty=true;paint();});
   refresh.addEventListener('click',()=>{recent.clear();feedback.clear();message('');loadState(true).catch(()=>{});loadCount(true);});
   libraryLink.addEventListener('click',event=>{if(!configured()){event.preventDefault();configure();}});

@@ -8,7 +8,9 @@ const require = createRequire(import.meta.url);
 const script = new URL('../userscripts/douyin-send.user.js', import.meta.url);
 const web = new URL('../app/static/app.js', import.meta.url);
 assert.ok(existsSync(script), '发送脚本尚未实现');
-const { resolveTargets, normalizeServer, togglePanel, defaultKind, senderPosition, pageTargets, subscriptionState } = require(fileURLToPath(script));
+const { resolveTargets, normalizeServer, togglePanel, defaultKind, senderPosition, pageTargets, subscriptionState,
+  commentKind, commentRequestURL, commentReplyTemplate, commentPaceDelay, commentPageVerdict, hookCommentRequests,
+  commentCollect } = require(fileURLToPath(script));
 const subscribedURL='https://www.douyin.com/user/MS4wLjABAAAA_subscriber';
 for(const [minutes,frequency] of [[4320,'three_days'],[10080,'weekly'],[43200,'monthly'],[129600,'quarterly'],[525600,'yearly']]){const found=subscriptionState([{id:'creator',url:subscribedURL,enabled:true,interval_minutes:minutes}],subscribedURL);assert.equal(found.enabled,true);assert.equal(found.frequency,frequency);}
 assert.equal(subscriptionState([{url:subscribedURL,enabled:false}],subscribedURL).enabled,false);
@@ -72,6 +74,95 @@ assert.equal(resolveTargets('https://www.douyin.com/', null, null, '764407319663
 assert.equal(normalizeServer('http://nas.example:8765/'), 'http://nas.example:8765');
 assert.throws(() => normalizeServer('https://user:password@example.com/'));
 assert.throws(() => normalizeServer('javascript:alert(1)'));
+
+// Assistant comment channel: template hook, in-page request URL, pacing and paging.
+assert.equal(commentKind('https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=1'), 'top');
+assert.equal(commentKind('/aweme/v1/web/comment/list/reply/?item_id=1&comment_id=2'), 'reply');
+assert.equal(commentKind('/aweme/v1/web/aweme/detail/?aweme_id=1'), null);
+const commentTemplate = {url:'/aweme/v1/web/comment/list/?device_platform=webapp&aweme_id=old&cursor=9&count=20&a_bogus=sign&X-Bogus=x&_signature=y&msToken=old&keep=1',headers:{'x-tt-argus':'1'}};
+assert.equal(commentRequestURL(commentTemplate,{aweme_id:'7421234567890123456',cursor:0,count:20},'https://www.douyin.com','fresh-ms'),
+  '/aweme/v1/web/comment/list/?device_platform=webapp&aweme_id=7421234567890123456&cursor=0&count=20&msToken=fresh-ms&keep=1','只替换作品、游标并让页面重新签名');
+const derivedReply=commentReplyTemplate(commentTemplate,'https://www.douyin.com');
+assert.equal(derivedReply.url,'/aweme/v1/web/comment/list/reply/?device_platform=webapp&cursor=9&count=20&a_bogus=sign&X-Bogus=x&_signature=y&msToken=old&keep=1','楼中楼模板由一级模板派生并去掉 aweme_id');
+assert.equal(derivedReply.headers,commentTemplate.headers);
+assert.equal(commentPaceDelay(1,()=>0),2000);
+assert.equal(commentPaceDelay(14,()=>1),4000);
+assert.equal(commentPaceDelay(15,()=>0),10000,'每 15 次请求在 2-4 秒基础上额外停 8-15 秒');
+assert.equal(commentPaceDelay(30,()=>1),19000);
+assert.equal(commentPageVerdict(JSON.stringify({status_code:0,comments:[],cursor:0,has_more:0})),'ok');
+assert.equal(commentPageVerdict(JSON.stringify({status_code:8,status_msg:'请先登录'})),'blocked');
+assert.equal(commentPageVerdict('<html><title>验证码中间页</title></html>'),'blocked');
+assert.equal(commentPageVerdict('TIMEOUT'),'blocked','页面请求被风控挂起时暂停');
+assert.equal(commentPageVerdict('not json'),'failed');
+assert.equal(commentPageVerdict(JSON.stringify({status_code:0,comments:null})),'failed');
+class FakeXHR { open(){} setRequestHeader(){} send(){} }
+const fakePageWindow={XMLHttpRequest:FakeXHR};
+const captured=[];
+assert.equal(hookCommentRequests(fakePageWindow,(kind,url,headers)=>captured.push({kind,url,headers})),true);
+const pageRequest=new FakeXHR();pageRequest.open('GET','/aweme/v1/web/comment/list/?aweme_id=1');pageRequest.setRequestHeader('x-tt-argus','1');pageRequest.send();
+assert.deepEqual(captured,[{kind:'top',url:'/aweme/v1/web/comment/list/?aweme_id=1',headers:{'x-tt-argus':'1'}}],'拦截页面第一次一级评论请求作为模板');
+const replyRequest=new FakeXHR();replyRequest.open('GET','/aweme/v1/web/comment/list/reply/?item_id=1&comment_id=2');replyRequest.send();
+assert.equal(captured[1].kind,'reply','拦截页面楼中楼请求作为模板');
+const ownRequest=new FakeXHR();ownRequest.__cloudriftCommentSelf=true;ownRequest.open('GET','/aweme/v1/web/comment/list/?aweme_id=2');ownRequest.send();
+assert.equal(captured.length,2,'自己重发的请求不能覆盖模板');
+
+const topPages=[
+  {comments:[{cid:'111',reply_comment_total:2},{cid:'222',reply_comment_total:0}],cursor:20,has_more:1},
+  {comments:[{cid:'333',reply_comment_total:1}],cursor:40,has_more:0},
+];
+const requestedURLs=[],uploaded=[],sleeps=[];
+let topIndex=0;
+const collected=await commentCollect({templates:{top:commentTemplate},awemeId:'7421234567890123456',origin:'https://www.douyin.com',msToken:'fresh-ms',
+  request:async url=>{
+    requestedURLs.push(url);const target=new URL(url,'https://www.douyin.com');
+    if(target.pathname.endsWith('/reply/'))return JSON.stringify({status_code:0,comments:[{cid:'999',reply_comment_total:0}],cursor:0,has_more:0});
+    return JSON.stringify({status_code:0,...topPages[topIndex++]});
+  },
+  upload:async body=>{uploaded.push(body);return {token:`tok-${uploaded.length}`};},
+  sleep:async ms=>{sleeps.push(ms);},random:()=>0});
+assert.equal(collected.status,'done');
+assert.deepEqual(collected.state.threads,['111','333'],'只对有一级回复的评论抓楼中楼');
+assert.equal(requestedURLs.length,4,'两页一级 + 两个回复楼');
+assert.equal(sleeps.length,4);assert.ok(sleeps.every(ms=>ms===2000),'请求间隔 2-4 秒');
+assert.equal(uploaded.length,4);
+assert.equal(uploaded[0].action,'save','首屏开启助手会话');
+assert.equal(uploaded[0].cursor,0);assert.equal(uploaded[0].token,'');
+assert.equal(uploaded[0].root_id,'');
+assert.equal(uploaded[1].action,undefined,'后续分页携带会话 token，不重置进度');
+assert.equal(uploaded[1].cursor,20);assert.equal(uploaded[1].token,'tok-1');
+assert.equal(uploaded[2].root_id,'111');assert.equal(uploaded[2].cursor,0);assert.equal(uploaded[2].token,'tok-2');
+assert.equal(uploaded[3].root_id,'333');assert.equal(uploaded[3].cursor,0);assert.equal(uploaded[3].token,'tok-3');
+assert.match(requestedURLs[0],/aweme_id=7421234567890123456/);assert.match(requestedURLs[0],/cursor=0/);
+assert.match(requestedURLs[1],/cursor=20/);
+assert.match(requestedURLs[2],/comment_id=111/);assert.match(requestedURLs[2],/item_id=7421234567890123456/);
+assert.match(requestedURLs[3],/comment_id=333/);
+assert.equal(requestedURLs[0].includes('a_bogus'),false,'重发前移除旧签名，交给页面 SDK 补签');
+
+const pausedUploads=[];
+const paused=await commentCollect({templates:{top:commentTemplate},awemeId:'7421234567890123456',
+  request:async()=>'<html>请完成验证码</html>',upload:async body=>{pausedUploads.push(body);return {};},sleep:async()=>{}});
+assert.equal(paused.status,'paused','登录失效或验证码时停止');
+assert.equal(pausedUploads.length,0);
+const needTemplate=await commentCollect({templates:{},awemeId:'7421234567890123456',request:async()=>'',upload:async()=>({}),sleep:async()=>{}});
+assert.equal(needTemplate.status,'need_template');
+const stale=await commentCollect({templates:{top:commentTemplate},awemeId:'7421234567890123456',
+  request:async()=>JSON.stringify({status_code:0,comments:[],cursor:0,has_more:0}),
+  upload:async()=>{throw new Error('评论采集会话已失效，请重新开始');},sleep:async()=>{}});
+assert.equal(stale.status,'stale','会话失效时提示重新开始');
+let cancelledRequests=0;
+const cancelled=await commentCollect({templates:{top:commentTemplate},awemeId:'7421234567890123456',
+  state:{requests:0,token:'',topCursor:0,threads:[],threadIndex:0,replyCursor:0,topDone:false,action:'save',cancelled:true},
+  request:async()=>{cancelledRequests++;return '';},upload:async()=>({}),sleep:async()=>{}});
+assert.equal(cancelled.status,'stopped');assert.equal(cancelledRequests,0,'停止后不再发请求');
+
+const resumeState={requests:0,token:'tok-old',topCursor:20,threads:[],threadIndex:0,replyCursor:0,topDone:false,action:undefined,cancelled:false};
+const resumeRequests=[],resumeUploads=[];
+const resumed=await commentCollect({templates:{top:commentTemplate},awemeId:'7421234567890123456',state:resumeState,
+  request:async url=>{resumeRequests.push(url);return JSON.stringify({status_code:0,comments:[],cursor:40,has_more:0});},
+  upload:async body=>{resumeUploads.push(body);return {token:'tok-new'};},sleep:async()=>{}});
+assert.equal(resumed.status,'done');
+assert.match(resumeRequests[0],/cursor=20/,'暂停后从保存的游标继续');
+assert.equal(resumeUploads[0].token,'tok-old');assert.equal(resumeUploads[0].action,undefined);
 assert.ok(existsSync(web), '网页尚未实现');
 const { mediaURL, switchView, moveGallery, isVideoFile, authorInitial, keyError, taskTitle, playVisible, applySound, releasePlayback, preloadVideos } = require(fileURLToPath(web));
 const neighbors=[null,{id:'one'},{id:'two'},{id:'far'}].map(video=>({querySelector:()=>video}));
@@ -460,6 +551,9 @@ detail.find('下载当前作品').click();
 const detailTask=request(detail,'POST','/api/tasks');
 assert.equal(body(detailTask).kind,'detail');
 assert.equal(body(detailTask).link,`https://www.douyin.com/video/${sample}`);
+detail.respond(detailTask,{id:'detail-task'});await tick();
+assert.equal(detail.find('保存当前作品评论').disabled,false,'作品页可以保存当前作品评论');
+assert.equal(home.find('保存当前作品评论').disabled,true,'博主页没有当前作品时不能保存评论');
 let liveWorkId=feedId;
 const liveNode={textContent:'直播博主',__reactFiber$test:{memoizedProps:{awemeInfo:{awemeId:feedId,authorInfo:{secUid:'MS4wLjABAAAA_live_author'}}}}};
 const liveCard={...feed,getAttribute:()=>liveWorkId,querySelector:s=>s==='[data-e2e="feed-video-nickname"]'?{textContent:'直播博主'}:null,querySelectorAll:()=>[]};
