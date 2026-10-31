@@ -15,6 +15,21 @@ class CommentBlocked(RuntimeError):
     pass
 
 
+class RateLimited(RuntimeError):
+    """抖音临时限制访问；调用方可在大量完成后暂停而不是立即重试。"""
+
+
+RATE_LIMIT_WORDS = ('访问过于频繁', '操作频繁', '请求频繁', '访问限制', '访问受限', '请求过多',
+                    '频繁', '验证码', 'captcha', 'verify', 'rate limit', 'too many requests')
+
+
+def _rate_limited(value):
+    if not isinstance(value, str):
+        return False
+    text = value.lower()
+    return any(word in text for word in RATE_LIMIT_WORDS)
+
+
 class ParsedItems(list):
     """作品解析结果，skipped 记录因类型暂不支持而跳过的数量。"""
 
@@ -337,6 +352,16 @@ class Core:
             raise RuntimeError('读取评论失败，请检查网络或稍后重试') from None
 
     async def parse(self, link, kind, earliest=None):
+        try:
+            return await self._parse(link, kind, earliest)
+        except RateLimited:
+            raise
+        except Exception as exc:
+            if _rate_limited(str(exc)):
+                raise RateLimited("抖音暂时限制访问，请稍后重试") from None
+            raise
+
+    async def _parse(self, link, kind, earliest=None):
         if not self.ready:
             raise RuntimeError("下载核心尚未就绪，请检查设置和服务日志")
         from src.models import Account, Detail
@@ -379,9 +404,19 @@ class Core:
             # 图集中断后作品级记录可能存在，清掉它才能让原下载器补齐缺失图片。
             await self.parser.downloader.recorder.delete_id(str(item["id"]))
             self.parser.downloader.last_error = ''
-            success = await self.parser.downloader.run([item.copy()], type_="detail", tiktok=False)
+            try:
+                success = await self.parser.downloader.run([item.copy()], type_="detail", tiktok=False)
+            except RateLimited:
+                raise
+            except Exception as exc:
+                if _rate_limited(str(exc)):
+                    raise RateLimited("下载受限，请稍后重试") from None
+                raise
             if success is not True:
                 reason = self.parser.downloader.last_error or '下载器未提供具体原因'
-                raise RuntimeError(f"下载未完成：{reason}。已保存作品保留，重试会重新解析地址并跳过已有作品")
+                message = f"下载未完成：{reason}。已保存作品保留，重试会重新解析地址并跳过已有作品"
+                if _rate_limited(reason):
+                    raise RateLimited(message)
+                raise RuntimeError(message)
             files = verified_files(self.media_dir, item)
         return [(self.media_dir / file).relative_to(self.media_root).as_posix() for file in files]

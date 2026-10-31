@@ -17,7 +17,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, model_validator
 
-from .core import Core, download_directory, normalize_input
+from .core import Core, RateLimited, download_directory, normalize_input
 from .store import Store, FREQUENCIES, BEIJING, AmbiguousAliasError
 from .legacy import LegacyIndex, recorded_download, recorded_downloads, identical_legacy_copies
 from .playback import PlaybackCache
@@ -52,6 +52,8 @@ def safe_error(exc, store):
 
 MEDIA_TYPES = frozenset({"视频", "图集", "实况"})
 FIRST_HISTORY_COUNT_LIMIT = 1000
+RATE_LIMIT_COMPLETED_THRESHOLD = 600
+RATE_LIMIT_PAUSE_SECONDS = 3600
 CONFIRM_REASON_COUNT = "count"
 CONFIRM_REASON_QUALITY = "quality"
 QUALITY_CONFIRM_MESSAGE = "已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本"
@@ -264,6 +266,17 @@ class JobService:
         pause = (120 if is_update else 300) + secrets.randbelow(181) if task['kind'] == 'author' else 0
         self.store.update_task(task['id'], pause_seconds=pause, **values)
 
+    def pause_rate_limited(self, task, completed, exc):
+        resume_at = time.time() + RATE_LIMIT_PAUSE_SECONDS
+        message = (f"本次已完整保存 {completed} 个作品后触发抖音访问限制，已暂停该作者任务；"
+                   f"将于 {datetime.fromtimestamp(resume_at, BEIJING):%H:%M} 自动继续，已保存作品不会重复下载")
+        self.store.update_task(task['id'], status='paused', resume_at=resume_at,
+                               completed=completed, message=message)
+        if task['author_id'] and self.store.author(task['author_id']):
+            self.store.patch_author(task['author_id'], last_checked=time.time(),
+                                    last_error=safe_error(exc, self.store))
+        return resume_at
+
     async def process_one(self):
         if self.configuration_pending:
             return False
@@ -335,6 +348,11 @@ class JobService:
                                             or not (self.media_root / file).is_file()
                                             or (self.media_root / file).stat().st_size <= 0 for file in files):
                             raise RuntimeError("文件未完整保存，任务不会标记完成，可重试")
+                    except RateLimited as exc:
+                        if task['kind'] == 'author' and completed > RATE_LIMIT_COMPLETED_THRESHOLD:
+                            self.pause_rate_limited(task, completed, exc)
+                            return True
+                        raise
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
                         continue
@@ -368,6 +386,7 @@ class JobService:
 
     def schedule(self):
         now = time.time()
+        self.store.resume_rate_limited(now)
         if (not 8 <= datetime.fromtimestamp(now, BEIJING).hour < 18
                 or self.configuration_pending or self.store.setting('queue_paused', False)
                 or now < self.store.setting('queue_resume_at', 0) or self.store.author_queue_busy()):

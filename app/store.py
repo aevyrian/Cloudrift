@@ -85,6 +85,7 @@ class Store:
                     accept_quality INTEGER NOT NULL DEFAULT 0,
                     accept_count INTEGER NOT NULL DEFAULT 0,
                     confirm_reason TEXT NOT NULL DEFAULT '',
+                    resume_at REAL NOT NULL DEFAULT 0,
                     preview TEXT NOT NULL DEFAULT '[]', author_id TEXT);
                 CREATE INDEX IF NOT EXISTS task_state ON tasks(status,created_at);
                 CREATE TABLE IF NOT EXISTS works (
@@ -131,7 +132,8 @@ class Store:
                 db.execute('ALTER TABLE browse_history ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0')
             task_columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
             for name, kind in (("accept_count", "INTEGER NOT NULL DEFAULT 0"),
-                               ("confirm_reason", "TEXT NOT NULL DEFAULT ''")):
+                               ("confirm_reason", "TEXT NOT NULL DEFAULT ''"),
+                               ("resume_at", "REAL NOT NULL DEFAULT 0")):
                 if name not in task_columns:
                     db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {kind}')
             if 'refresh_pending' not in {row[1] for row in db.execute('PRAGMA table_info(comment_assets)')}:
@@ -214,7 +216,7 @@ class Store:
 
     def update_task(self, task_id, pause_seconds=0, **values):
         allowed = {"status", "message", "completed", "total", "accept_quality", "accept_count",
-                   "confirm_reason", "preview"}
+                   "confirm_reason", "resume_at", "preview"}
         if not values or not set(values) <= allowed:
             raise ValueError("任务更新字段无效")
         if "preview" in values:
@@ -270,7 +272,7 @@ class Store:
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
             if not row or row['status'] not in ('queued', 'parsing', 'downloading', 'paused'):
                 raise ValueError('只有排队或进行中的任务可以暂停')
-            db.execute("UPDATE tasks SET status='paused',message='已暂停，已保存内容保留',updated_at=? WHERE id=?", (stamp(), task_id))
+            db.execute("UPDATE tasks SET status='paused',resume_at=0,message='已暂停，已保存内容保留',updated_at=? WHERE id=?", (stamp(), task_id))
             return self.task_dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
 
     def resume_task(self, task_id):
@@ -283,8 +285,23 @@ class Store:
             if duplicate:
                 raise ValueError('同一链接已有进行中的任务，请等待它完成')
             db.execute("INSERT INTO settings VALUES ('queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
-            db.execute("UPDATE tasks SET status='queued',message='已继续，等待队列处理',updated_at=? WHERE id=?", (stamp(), task_id))
+            db.execute("UPDATE tasks SET status='queued',resume_at=0,message='已继续，等待队列处理',updated_at=? WHERE id=?", (stamp(), task_id))
             return self.task_dict(db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone())
+
+    def resume_rate_limited(self, now=None):
+        """Re-queue author tasks whose rate-limit pause has elapsed."""
+        now = time.time() if now is None else now
+        with self.connect() as db:
+            paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
+            if paused and json.loads(paused[0]):
+                return []
+            ids = [row[0] for row in db.execute(
+                "SELECT id FROM tasks WHERE status='paused' AND resume_at>0 AND resume_at<=? ORDER BY resume_at,rowid", (now,))]
+            if ids:
+                db.execute("UPDATE tasks SET status='queued',resume_at=0,completed=0,message=?,updated_at=? "
+                           "WHERE status='paused' AND resume_at>0 AND resume_at<=?",
+                           ('限流暂停已结束，自动继续；已保存作品不会重复下载', stamp(), now))
+            return ids
 
     def pause_queue(self):
         with self.connect() as db:
@@ -299,7 +316,7 @@ class Store:
             db.execute('BEGIN IMMEDIATE')
             ids = [row[0] for row in db.execute("SELECT id FROM tasks WHERE status='paused' ORDER BY rowid")]
             db.execute("INSERT INTO settings VALUES ('queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
-            db.execute("UPDATE tasks SET status='queued',message='已继续，等待队列处理',updated_at=? WHERE status='paused'", (stamp(),))
+            db.execute("UPDATE tasks SET status='queued',resume_at=0,message='已继续，等待队列处理',updated_at=? WHERE status='paused'", (stamp(),))
             return ids
 
     def requeue_task(self, task_id, existing_task_id=None):
@@ -331,7 +348,7 @@ class Store:
                 return self.task_dict(duplicate)
             paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
             paused = bool(json.loads(paused[0])) if paused else False
-            db.execute("UPDATE tasks SET status=?,message=?,completed=0,updated_at=? WHERE id=?",
+            db.execute("UPDATE tasks SET status=?,message=?,completed=0,resume_at=0,updated_at=? WHERE id=?",
                        ('paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '已加入重试队列', stamp(), task_id))
         return self.task(task_id)
 
