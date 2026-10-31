@@ -50,6 +50,22 @@ def safe_error(exc, store):
     return message[:500]
 
 
+MEDIA_TYPES = frozenset({"视频", "图集", "实况"})
+
+
+def count_media_items(items):
+    """Count 视频 + 图集(含实况) items; 发言 and other types are not collected."""
+    return sum(1 for item in items if item.get("type") in MEDIA_TYPES)
+
+
+def task_history_flags(task, store):
+    """Return (first_history, is_update); only author tasks can be either."""
+    if task.get("kind") != "author":
+        return False, False
+    downloaded = store.author_downloaded(task["link"])
+    return not downloaded, downloaded
+
+
 class JobService:
     def __init__(self, store, core, media_root, legacy_root=None):
         self.store, self.core = store, core
@@ -237,7 +253,8 @@ class JobService:
             current = self.store.task(task['id'])
             if not current or current['status'] == 'cancelled':
                 return True
-            is_update = task['kind'] == 'author' and self.store.author_downloaded(task['link'])
+            # 首次历史采集只按作者是否已有完整下载判定；A 规则仅对 first_history 生效。
+            first_history, is_update = task_history_flags(task, self.store)
             try:
                 if not self.core.ready:
                     await self.initialize()
