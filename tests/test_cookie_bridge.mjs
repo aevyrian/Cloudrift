@@ -5,7 +5,7 @@ import {runInNewContext} from 'node:vm';
 const source=readFileSync(new URL('../userscripts/douyin-send.user.js',import.meta.url),'utf8');
 const nonce='B'.repeat(43),tick=()=>new Promise(resolve=>setImmediate(resolve));
 function browser(hash=`#library-cookie-sync=${nonce}`,withCookie=true){
-  const requests=[],reads=[],elements=[];
+  const requests=[],reads=[],elements=[],closes=[];
   function node(tag){
     const el={tag,style:{},dataset:{},classList:{toggle(){},add(){},remove(){}},children:[],hidden:false,open:false,textContent:'',value:'',disabled:false,parentElement:null,offsetHeight:300,
       append(...items){for(const item of items){item.parentElement=this;this.children.push(item)}},replaceChildren(...items){this.children=[];this.append(...items)},
@@ -18,9 +18,10 @@ function browser(hash=`#library-cookie-sync=${nonce}`,withCookie=true){
     GM_getValue:(key,fallback)=>({library_server:'http://nas.example:8090',library_token:'test-key'}[key]??fallback),GM_setValue(){},GM_registerMenuCommand(){},
     GM_xmlhttpRequest(request){requests.push(request)},ResizeObserver:class{observe(){}disconnect(){}},MutationObserver:class{observe(){}disconnect(){}},
     addEventListener(){},requestAnimationFrame(){return 1},cancelAnimationFrame(){},setTimeout(){return 1},clearTimeout(){},setInterval(){}};
+  context.window={close(){closes.push(true)}};
   if(withCookie)context.GM_cookie=(action,details,done)=>reads.push({action,details,done});
   runInNewContext(source,context);
-  return {page,requests,reads,elements,respond(req,data,status=200){req.onload({status,responseText:JSON.stringify(data)})}};
+  return {page,requests,reads,elements,closes,respond(req,data,status=200){req.onload({status,responseText:JSON.stringify(data)})}};
 }
 const body=req=>JSON.parse(req.data);
 
@@ -38,7 +39,7 @@ const body=req=>JSON.parse(req.data);
   assert.deepEqual(body(b.requests[1]),{cookie:'sid_tt=fixture-token; extra=ok'},'包含 HttpOnly 且保持返回顺序');
   assert.ok(!b.requests[1].url.includes('fixture-token'),'Cookie 不能出现在 URL');
   b.respond(b.requests[1],{status:'validating'});await tick();
-  assert.ok(b.elements.some(n=>n.textContent.includes('验证')),'提交后提示返回网站查看验证');
+  assert.equal(b.closes.length,1,'提交成功后自动关闭同步页，不再显示横幅');
 }
 for(const status of [{status:'expired'},{status:'validating'},{status:'done'}]){
   const b=browser();b.respond(b.requests[0],status);await tick();assert.equal(b.reads.length,0,'请求不在等待状态不能读取');assert.equal(b.requests.length,1,'无有效请求不能发送 Cookie');

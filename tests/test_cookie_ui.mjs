@@ -10,11 +10,13 @@ assert.match(html,/id="cookie-sync-button"/,'网站应显示一键同步按钮')
 const nonce='A'.repeat(43),tick=()=>new Promise(resolve=>setImmediate(resolve));
 
 function makeApp({blocked=false}={}){
-  const nodes=Object.fromEntries(['cookie-sync-button','cookie-sync-status','cookie-sync-message','cookie-sync-link','cookie-state'].map(id=>[id,{hidden:false,disabled:false,textContent:'',className:'',removeAttribute(name){delete this[name]},addEventListener(name,fn){this[name]=fn}}]));
+  const nodes=Object.fromEntries(['cookie-sync-button','cookie-sync-status','cookie-sync-message','cookie-sync-link','cookie-state','cookie-account','clear-cookie'].map(id=>[id,{hidden:false,disabled:false,textContent:'',className:'',removeAttribute(name){delete this[name]},addEventListener(name,fn){this[name]=fn}}]));
   const state={token:'private-test-token',cookieSyncGeneration:0},requests=[],popups=[];
   let getResponse=()=>Promise.resolve({status:'success'}),created={id:nonce,status:'waiting'};
-  const context=vm.createContext({state,$:id=>nodes[id],Date,URL,setTimeout:fn=>{queueMicrotask(fn);return 1},
-    window:{open(){if(blocked)return null;const tab={opener:{},location:{href:'about:blank'},closed:false,close(){this.closed=true}};popups.push(tab);return tab}},
+  const context=vm.createContext({state,$:id=>nodes[id],Date,URL,
+    setTimeout:fn=>{queueMicrotask(fn);return 1},clearTimeout(){},
+    loadSettings:async()=>({}),
+    window:{focus(){},open(){if(blocked)return null;const tab={opener:{},location:{href:'about:blank'},closed:false,close(){this.closed=true}};popups.push(tab);return tab},confirm:()=>false},
     api:async(path,method='GET')=>{requests.push({path,method});if(method==='POST'){assert.ok(blocked||popups.length===1,'必须在异步请求前打开窗口');return created}return getResponse()},
   });
   vm.runInContext(source.slice(start,end)+'\nglobalThis.syncBrowserCookie=syncBrowserCookie;',context);
@@ -27,7 +29,7 @@ function makeApp({blocked=false}={}){
   assert.equal(b.popups[0].opener,null,'抖音窗口不能控制收藏库页面');
   assert.equal(b.popups[0].location.href,`https://www.douyin.com/jingxuan#library-cookie-sync=${nonce}`,'目标只包含一次性标识');
   assert.equal(b.requests.filter(r=>r.method==='POST').length,1);
-  assert.equal(b.nodes['cookie-state'].textContent,'已配置','验证成功后刷新状态');
+  assert.equal(b.nodes['cookie-state'].textContent,'配置生效中','验证成功后刷新状态');
   assert.equal(b.nodes['cookie-sync-button'].disabled,false);
   assert.doesNotMatch(b.popups[0].location.href,/private-test-token/,'地址不能包含管理员密钥');
 }
@@ -45,12 +47,12 @@ function makeApp({blocked=false}={}){
   assert.equal(b.nodes['cookie-sync-link'].href,`https://www.douyin.com/jingxuan#library-cookie-sync=${nonce}`);
   resolve({status:'failed',message:'sessionid=secret-must-not-be-rendered'});await Promise.all([first,second]);
   assert.doesNotMatch(b.nodes['cookie-sync-message'].textContent,/secret-must-not-be-rendered/,'错误响应不能回显 Cookie');
-  assert.notEqual(b.nodes['cookie-state'].textContent,'已配置','验证失败不得显示已保存');
+  assert.notEqual(b.nodes['cookie-state'].textContent,'配置生效中','验证失败不得显示已保存');
 }
 {
   const b=makeApp();let resolve;const waiting=new Promise(r=>resolve=r);b.setResponse(()=>waiting);
   const job=b.context.syncBrowserCookie();await tick();b.state.token='another-token';resolve({status:'success'});await job;
-  assert.notEqual(b.nodes['cookie-state'].textContent,'已配置','切换管理员密钥后旧结果不能更新界面');
+  assert.notEqual(b.nodes['cookie-state'].textContent,'配置生效中','切换管理员密钥后旧结果不能更新界面');
 }
 {
   let resolve,disconnections=0;const pending=new Promise(r=>resolve=r),state={token:'old-test-token'};

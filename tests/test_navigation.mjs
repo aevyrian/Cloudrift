@@ -17,12 +17,12 @@ vm.runInContext(source.slice(source.indexOf('  function paintSound()'), source.i
 button.events.click(); assert.equal(videos[0].muted, true, '用户可以手动关闭声音');
 button.events.click(); assert.equal(videos[0].muted, false, '用户可以再次打开声音');
 
-const ids = Object.fromEntries(['cookie-state', 'cookie', 'clear-cookie', 'quality-policy', 'download-dir', 'download-dir-hint', 'script-server', 'script-token', 'reveal-token'].map(id => [id, {}]));
+const ids = Object.fromEntries(['cookie-state', 'cookie', 'clear-cookie', 'cookie-account', 'quality-policy', 'download-dir', 'download-dir-hint', 'script-server', 'script-token', 'reveal-token'].map(id => [id, {}]));
 let resolveStatus; let statusPainted = false; let legacyLoaded = false;
 const status = new Promise(resolve => { resolveStatus = resolve; });
 const state = { navigation: 1, view: 'settings', token: 'synthetic-test' };
-const settingsContext = vm.createContext({ state, $: id => ids[id], location: { origin: 'https://test.example' }, showStatus() { statusPainted = true; }, loadLegacy: async () => { legacyLoaded = true; }, api: path => path === '/api/status' ? status : Promise.resolve({ cookie_configured: false, quality_policy: 'upstream', download_dir: '/media', media_root: '/media' }) });
-vm.runInContext(source.slice(source.indexOf('  async function loadSettings('), source.indexOf('  async function loadLegacy(')) + '\nglobalThis.loadSettings = loadSettings;', settingsContext);
+const settingsContext = vm.createContext({ state, $: id => ids[id], location: { origin: 'https://test.example' }, showStatus() { statusPainted = true; }, loadLegacy: async () => { legacyLoaded = true; }, setTimeout: fn => { queueMicrotask(fn); return 1; }, clearTimeout() {}, api: path => path === '/api/status' ? status : Promise.resolve({ cookie_configured: false, quality_policy: 'upstream', download_dir: '/media', media_root: '/media' }) });
+vm.runInContext(source.slice(source.indexOf('  function paintCookieStatus('), source.indexOf('  async function loadLegacy(')) + '\nglobalThis.loadSettings = loadSettings;', settingsContext);
 const loading = settingsContext.loadSettings();
 await tick();
 assert.equal(ids['download-dir'].value, '/media', '设置表单无需等待慢状态统计');
