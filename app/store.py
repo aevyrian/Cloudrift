@@ -501,10 +501,11 @@ class Store:
         with self.connect() as db:
             return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
 
-    def comment_queue(self, work_id, action, channel=DEFAULT_CHANNEL):
+    def comment_queue(self, work_id, action, channel=None):
         if (not re.fullmatch(r'[0-9]{19}', work_id or '') or action not in {'save', 'update', 'continue'}
-                or channel not in COMMENT_CHANNELS):
+                or channel not in (None, *COMMENT_CHANNELS)):
             raise ValueError('作品或评论操作无效')
+        requested = channel or DEFAULT_CHANNEL
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             db.execute("INSERT INTO settings VALUES ('comment_queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
@@ -514,8 +515,11 @@ class Store:
             if action == 'continue':
                 db.execute("UPDATE comment_assets SET refresh_pending=1 WHERE work_id=? AND status='saved' AND error!='' AND source_url!=''", (work_id,))
             checkpoint = channel_checkpoint(json.loads(row['checkpoint']) if row else None)
-            if action in ('save', 'update') or (checkpoint['root_done'] and not checkpoint['replies']):
-                checkpoint = channel_checkpoint(None, channel)
+            # 新任务默认走 requested 通道；显式换通道或已完成时从头扫描。
+            # 未显式指定通道的“继续”仅在已有未完成进度时保持原通道与进度。
+            if (not row or action in ('save', 'update') or (channel and channel != checkpoint['channel'])
+                    or (checkpoint['root_done'] and not checkpoint['replies'])):
+                checkpoint = channel_checkpoint(None, requested)
             token = secrets.token_hex(16)
             db.execute('''INSERT INTO comment_jobs(work_id,operation,integrity,reason,token,checkpoint,updated_at)
                           VALUES (?,'queued','unsaved','',?,?,?) ON CONFLICT(work_id) DO UPDATE SET
@@ -614,6 +618,19 @@ class Store:
                                 WHERE work_id=? AND token=? AND operation IN ('running','stopped')""", (stamp(), work_id, token))
             if result.rowcount:
                 db.execute("INSERT INTO settings VALUES ('comment_queue_paused','true') ON CONFLICT(key) DO UPDATE SET value='true'")
+
+    def comment_fallback(self, work_id, token, reason=''):
+        """助手通道不可用/失败/超时后切换到服务器通道，已保存评论保留。"""
+        with self.connect() as db:
+            db.execute('BEGIN IMMEDIATE')
+            job = db.execute('SELECT operation,token,checkpoint FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone()
+            if not job or job['token'] != token or job['operation'] != 'running':
+                return False
+            if (json.loads(job['checkpoint']) or {}).get('channel') != 'assistant':
+                return False
+            db.execute('UPDATE comment_jobs SET checkpoint=?,reason=?,updated_at=? WHERE work_id=? AND token=?',
+                       (json.dumps(channel_checkpoint(None, 'server')), reason, stamp(), work_id, token))
+            return True
 
     def comment_commit_page(self, work_id, token, items, checkpoint, platform_total, elapsed):
         with self.connect() as db:

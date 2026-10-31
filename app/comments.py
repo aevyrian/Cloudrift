@@ -2,10 +2,12 @@ import asyncio
 import copy
 import time
 
-from .comment_channels import (CommentChannelUnavailable, DEFAULT_CHANNEL,
+from .comment_channels import (CommentChannelUnavailable,
                                assistant_page as map_assistant_page,
                                channel_checkpoint, default_channels)
 from .core import CommentBlocked
+
+FALLBACK_REASON = '助手通道暂不可用，已改用服务器通道，已保存内容保留'
 
 
 class CommentService:
@@ -14,7 +16,7 @@ class CommentService:
         self.core = core
         self.channels = default_channels(core) if channels is None else channels
 
-    def queue(self, work_id, action='save', channel=DEFAULT_CHANNEL):
+    def queue(self, work_id, action='save', channel=None):
         self.store.comment_queue(work_id, action, channel)
         return self.store.comment_state(work_id)
 
@@ -120,41 +122,57 @@ class CommentService:
         if checkpoint['root_done'] and not replies:
             self.store.comment_end(work_id, token, 'finished', '', finished=True)
             return True
-        channel = self.channels.get(checkpoint['channel'])
-        if channel is None:
-            self.store.comment_end(work_id, token, 'failed', '评论通道不可用，已保存内容保留，可稍后重试')
-            return True
-        if not self.store.comment_request_begin(work_id, token, now):
-            return False
-        root_id = replies[0]['id'] if replies else None
-        cursor = replies[0]['cursor'] if replies else checkpoint['cursor']
-        started = time.monotonic()
-        try:
-            page = await asyncio.wait_for(channel.page(work_id, cursor=cursor, root_id=root_id), timeout=15)
-            items, next_cursor, more = page['items'], page['next_cursor'], page['has_more']
-            if (not isinstance(items, list) or type(next_cursor) is not int or next_cursor < 0
-                    or type(more) is not bool or (more and (not items or next_cursor <= cursor))
-                    or any(item['root_id'] != (root_id or '') for item in items)):
-                raise ValueError('分页无效')
-            if root_id:
-                if more:
-                    replies[0]['cursor'] = next_cursor
+        channel_name = checkpoint['channel']
+        # 助手通道不可用、失败或超时，自动回退服务器通道并重试一次；登录/验证码仍走暂停。
+        for attempt in range(2):
+            channel = self.channels.get(channel_name)
+            if channel is None:
+                self.store.comment_end(work_id, token, 'failed', '评论通道不可用，已保存内容保留，可稍后重试')
+                return True
+            if not self.store.comment_request_begin(work_id, token, now, reserve=attempt == 0):
+                return False
+            root_id = replies[0]['id'] if replies else None
+            cursor = replies[0]['cursor'] if replies else checkpoint['cursor']
+            started = time.monotonic()
+            try:
+                page = await asyncio.wait_for(channel.page(work_id, cursor=cursor, root_id=root_id), timeout=15)
+                items, next_cursor, more = page['items'], page['next_cursor'], page['has_more']
+                if (not isinstance(items, list) or type(next_cursor) is not int or next_cursor < 0
+                        or type(more) is not bool or (more and (not items or next_cursor <= cursor))
+                        or any(item['root_id'] != (root_id or '') for item in items)):
+                    raise ValueError('分页无效')
+                if root_id:
+                    if more:
+                        replies[0]['cursor'] = next_cursor
+                    else:
+                        replies.pop(0)
                 else:
-                    replies.pop(0)
-            else:
-                checkpoint['cursor'] = next_cursor
-                checkpoint['root_done'] = not more
-                known = {pending['id'] for pending in replies}
-                for item in items:
-                    if item['reply_count'] > 0 and item['id'] not in known:
-                        replies.append({'id': item['id'], 'cursor': 0})
-                        known.add(item['id'])
-            total = page.get('total') if not root_id else None
-            self.store.comment_commit_page(work_id, token, items, checkpoint, total, time.monotonic() - started)
-        except CommentBlocked:
-            self.store.comment_block(work_id, token)
-        except CommentChannelUnavailable:
-            self.store.comment_end(work_id, token, 'failed', '评论通道暂不可用，已保存内容保留，可稍后重试')
-        except Exception:
-            self.store.comment_end(work_id, token, 'failed', '读取评论失败，已保存内容保留，可稍后重试')
+                    checkpoint['cursor'] = next_cursor
+                    checkpoint['root_done'] = not more
+                    known = {pending['id'] for pending in replies}
+                    for item in items:
+                        if item['reply_count'] > 0 and item['id'] not in known:
+                            replies.append({'id': item['id'], 'cursor': 0})
+                            known.add(item['id'])
+                total = page.get('total') if not root_id else None
+                self.store.comment_commit_page(work_id, token, items, checkpoint, total, time.monotonic() - started)
+                return True
+            except CommentBlocked:
+                self.store.comment_block(work_id, token)
+                return True
+            except Exception as exc:
+                if (channel_name == 'assistant' and 'server' in self.channels
+                        and self.store.comment_fallback(work_id, token, FALLBACK_REASON)):
+                    channel_name = 'server'
+                    checkpoint = channel_checkpoint(None, 'server')
+                    replies = checkpoint['replies']
+                    continue
+                if isinstance(exc, CommentChannelUnavailable):
+                    reason = '评论通道暂不可用，已保存内容保留，可稍后重试'
+                elif isinstance(exc, asyncio.TimeoutError):
+                    reason = '读取评论超时，已保存内容保留，可稍后重试'
+                else:
+                    reason = '读取评论失败，已保存内容保留，可稍后重试'
+                self.store.comment_end(work_id, token, 'failed', reason)
+                return True
         return True

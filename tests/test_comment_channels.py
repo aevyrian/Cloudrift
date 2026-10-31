@@ -1,3 +1,4 @@
+import asyncio
 import json
 import tempfile
 import unittest
@@ -80,9 +81,11 @@ class ChannelStoreTests(unittest.TestCase):
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name))
 
-    def test_queue_records_channel_and_rejects_unknown(self):
+    def test_queue_defaults_to_assistant_and_honors_explicit_channel(self):
         self.assertEqual(self.store.comment_queue(WORK, 'save')['checkpoint'],
-                         {'channel': 'server', 'cursor': 0, 'root_done': False, 'replies': []})
+                         {'channel': 'assistant', 'cursor': 0, 'root_done': False, 'replies': []})
+        self.store.comment_cancel(WORK)
+        self.assertEqual(self.store.comment_queue(WORK, 'save', 'server')['checkpoint']['channel'], 'server')
         self.store.comment_cancel(WORK)
         self.assertEqual(self.store.comment_queue(WORK, 'save', 'assistant')['checkpoint']['channel'], 'assistant')
         with self.assertRaises(ValueError):
@@ -98,6 +101,19 @@ class ChannelStoreTests(unittest.TestCase):
                        (json.dumps({'cursor': 5, 'root_done': False, 'replies': []}), WORK))
         checkpoint = self.store.comment_queue(WORK, 'continue')['checkpoint']
         self.assertEqual((checkpoint['channel'], checkpoint['cursor']), ('server', 5))
+
+    def test_continue_without_existing_job_uses_default_assistant_channel(self):
+        checkpoint = self.store.comment_queue(WORK, 'continue')['checkpoint']
+        self.assertEqual(checkpoint, {'channel': 'assistant', 'cursor': 0, 'root_done': False, 'replies': []})
+
+    def test_continue_with_explicit_other_channel_restarts_scan(self):
+        self.store.comment_queue(WORK, 'save', 'assistant')
+        self.store.comment_cancel(WORK)
+        with self.store.connect() as db:
+            db.execute("UPDATE comment_jobs SET checkpoint=? WHERE work_id=?",
+                       (json.dumps({'channel': 'assistant', 'cursor': 5, 'root_done': False, 'replies': []}), WORK))
+        checkpoint = self.store.comment_queue(WORK, 'continue', 'server')['checkpoint']
+        self.assertEqual(checkpoint, {'channel': 'server', 'cursor': 0, 'root_done': False, 'replies': []})
 
     def test_both_channels_share_comment_table_and_id_dedup(self):
         token = self.store.comment_queue(WORK, 'save')['token']
@@ -154,15 +170,60 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(await service.step())
         self.assertEqual(self.store.comment_state(WORK)['operation'], 'finished')
 
-    async def test_missing_assistant_connection_fails_safely_without_pausing_queue(self):
+    async def test_missing_assistant_connection_falls_back_to_server(self):
         service = self.service(None)
         service.queue(WORK, 'save', 'assistant')
         self.assertTrue(await service.step())
         state = self.store.comment_state(WORK)
-        self.assertEqual(state['operation'], 'failed')
         self.assertFalse(state['queue_paused'])
-        self.assertIn('通道', state['reason'])
-        self.assertEqual(self.core.calls, [])
+        self.assertEqual(self.core.calls, [(WORK, 0, None)])
+        self.assertEqual(self.store.comment_job(WORK)['checkpoint']['channel'], 'server')
+        self.assertTrue(await service.step())
+        self.assertEqual(self.store.comment_state(WORK)['operation'], 'finished')
+
+    async def test_assistant_failure_falls_back_to_server_and_keeps_reason(self):
+        async def failed(*args, **kwargs):
+            raise RuntimeError('private transport error')
+        self.core.comment_page = AsyncMock(return_value={
+            'items': [comment_item(raw('111'), '')], 'next_cursor': 20,
+            'has_more': True, 'total': 1})
+        service = self.service(failed)
+        service.queue(WORK, 'save', 'assistant')
+        self.assertTrue(await service.step())
+        job = self.store.comment_job(WORK)
+        self.assertEqual(job['checkpoint']['channel'], 'server')
+        self.assertIn('服务器通道', job['reason'])
+        self.assertNotIn('private', job['reason'])
+        self.assertEqual(self.store.comment_state(WORK)['total'], 1)
+
+    async def test_fallback_reuses_saved_comments_and_comment_id_dedup(self):
+        first = {'comments': [raw('111')], 'cursor': 20, 'has_more': 1, 'total': 1}
+        fetch = AsyncMock(side_effect=[first, RuntimeError('private transport error')])
+        self.core.comment_page = AsyncMock(return_value={
+            'items': [comment_item(raw('111', text='updated'), ''),
+                      comment_item(raw('222'), '')],
+            'next_cursor': 0, 'has_more': False, 'total': 2})
+        service = self.service(fetch)
+        service.queue(WORK, 'save', 'assistant')
+        self.assertTrue(await service.step())
+        self.assertEqual(self.store.comment_state(WORK)['total'], 1)
+        self.store.set_setting('comment_next_request_at', 0)
+        self.assertTrue(await service.step())
+        self.assertEqual(fetch.await_count, 2)
+        self.core.comment_page.assert_awaited_once_with(WORK, cursor=0, root_id=None)
+        self.assertEqual(self.store.comment_state(WORK)['total'], 2)
+        self.assertEqual(self.store.comment_page(WORK)['items'][0]['text'], 'updated')
+        self.assertTrue(await service.step())
+        self.assertEqual(self.store.comment_state(WORK)['operation'], 'finished')
+
+    async def test_assistant_timeout_falls_back_to_server(self):
+        async def timeout(*args, **kwargs):
+            raise asyncio.TimeoutError
+        service = self.service(timeout)
+        service.queue(WORK, 'save', 'assistant')
+        self.assertTrue(await service.step())
+        self.assertEqual(self.store.comment_job(WORK)['checkpoint']['channel'], 'server')
+        self.assertEqual(self.core.calls, [(WORK, 0, None)])
 
     async def test_assistant_blocked_uses_shared_pause_semantics(self):
         async def blocked(*args, **kwargs):
@@ -174,10 +235,21 @@ class ChannelServiceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(state['operation'], 'failed')
         self.assertTrue(state['queue_paused'])
         self.assertNotIn('private', state['reason'])
+        self.assertIn('登录', state['reason'])
+        self.assertEqual(self.core.calls, [])
 
-    async def test_default_server_checkpoint_still_uses_core_channel(self):
-        service = self.service(None)
+    async def test_default_queue_tries_assistant_first_then_server(self):
+        fetch = AsyncMock(return_value={'comments': [raw('111')], 'cursor': 0, 'has_more': 0, 'total': 1})
+        service = self.service(fetch)
         service.queue(WORK, 'save')
+        self.assertTrue(await service.step())
+        fetch.assert_awaited_once_with(WORK, cursor=0, root_id=None)
+        self.assertEqual(self.core.calls, [])
+        self.assertEqual(self.store.comment_job(WORK)['checkpoint']['channel'], 'assistant')
+
+    async def test_explicit_server_checkpoint_still_uses_core_channel(self):
+        service = self.service(None)
+        service.queue(WORK, 'save', 'server')
         self.assertTrue(await service.step())
         self.assertEqual(self.core.calls, [(WORK, 0, None)])
 

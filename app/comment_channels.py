@@ -6,7 +6,9 @@
 
 from .core import comment_item
 
-DEFAULT_CHANNEL = 'server'
+# 新保存/更新优先尝试助手通道；旧 checkpoint 没有 channel 时仍按 server 续传。
+DEFAULT_CHANNEL = 'assistant'
+LEGACY_CHANNEL = 'server'
 COMMENT_CHANNELS = ('server', 'assistant')
 
 
@@ -73,7 +75,7 @@ def assistant_page(payload, cursor, root_id):
 def channel_checkpoint(value=None, channel=None):
     """补齐 checkpoint 的通道字段；旧数据没有 channel 时按 server 处理。"""
     checkpoint = dict(value) if isinstance(value, dict) else {}
-    checkpoint.setdefault('channel', DEFAULT_CHANNEL)
+    checkpoint.setdefault('channel', LEGACY_CHANNEL)
     checkpoint.setdefault('cursor', 0)
     checkpoint.setdefault('root_done', False)
     checkpoint.setdefault('replies', [])

@@ -528,6 +528,7 @@ class BrowseHistoryInput(BaseModel):
 class CommentInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['save', 'update', 'continue'] = 'save'
+    channel: Literal['server', 'assistant'] | None = None
 
 
 class AssistantCommentPageInput(BaseModel):
@@ -866,7 +867,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         real_id, can_save, _ = comment_target(work_id)
         if not can_save:
             raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
-        return JSONResponse(service.comments.queue(real_id, body.action), status_code=202,
+        return JSONResponse(service.comments.queue(real_id, body.action, body.channel), status_code=202,
                             headers={'Cache-Control': 'no-store'})
 
     @app.post('/api/works/{work_id}/comments/assistant', dependencies=[Depends(authorize)])

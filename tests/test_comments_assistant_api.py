@@ -132,12 +132,25 @@ class AssistantCommentApiTests(unittest.TestCase):
         response = self.submit(page([raw('222')], 0, has_more=0), cursor=0, token=result['token'])
         self.assertEqual(response.status_code, 422)
 
-    def test_old_server_channel_queue_is_unchanged(self):
+    def test_default_queue_selects_assistant_and_explicit_server_is_unchanged(self):
         response = self.client.post(f'/api/works/{WORK}/comments', headers=self.auth, json={'action': 'save'})
         self.assertEqual(response.status_code, 202)
         checkpoint = self.store.comment_job(WORK)['checkpoint']
         self.assertEqual((checkpoint['channel'], checkpoint['direct'] if 'direct' in checkpoint else False),
+                         ('assistant', False))
+
+        self.store.comment_cancel(WORK)
+        response = self.client.post(f'/api/works/{WORK}/comments', headers=self.auth,
+                                    json={'action': 'save', 'channel': 'server'})
+        self.assertEqual(response.status_code, 202)
+        checkpoint = self.store.comment_job(WORK)['checkpoint']
+        self.assertEqual((checkpoint['channel'], checkpoint['direct'] if 'direct' in checkpoint else False),
                          ('server', False))
+
+    def test_invalid_channel_is_rejected(self):
+        response = self.client.post(f'/api/works/{WORK}/comments', headers=self.auth,
+                                    json={'action': 'save', 'channel': 'other'})
+        self.assertEqual(response.status_code, 422)
 
 
 class AssistantDirectJobClaimTests(unittest.TestCase):
