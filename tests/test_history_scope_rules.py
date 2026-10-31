@@ -3,9 +3,28 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from app.main import JobService, count_media_items, task_history_flags
+from app.main import (CONFIRM_REASON_COUNT, CONFIRM_REASON_QUALITY, FIRST_HISTORY_COUNT_LIMIT,
+                      QUALITY_CONFIRM_MESSAGE, JobService, count_media_items, task_history_flags)
 from app.store import Store
 from tests.test_backend import FakeCore
+
+
+AUTHOR_URL = "https://www.douyin.com/user/abc"
+
+
+def media_item(index, type_="视频"):
+    return {"id": str(7431234567890000000 + index), "type": type_, "desc": f"作品{index}",
+            "nickname": "测试作者", "downloads": "https://media.example/video", "width": 1080,
+            "height": 1920, "create_time": "2026-10-22", "create_timestamp": index}
+
+
+class BulkCore(FakeCore):
+    def __init__(self, media, items):
+        super().__init__(media)
+        self.items = list(items)
+
+    async def parse(self, link, kind, earliest=None):
+        return list(self.items)
 
 
 class MediaCountTests(unittest.TestCase):
@@ -61,6 +80,119 @@ class ProcessTaskHistoryTests(unittest.IsolatedAsyncioTestCase):
             flags.assert_called_once()
             # is_update=True selects the 2-5 minute update pause.
             self.assertEqual(store.setting("queue_resume_at"), 1120)
+
+
+class FirstHistoryCountRuleTests(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.root = Path(self.tmp.name)
+        self.store = Store(self.root / "data")
+
+    async def asyncTearDown(self):
+        self.tmp.cleanup()
+
+    def service(self, items):
+        core = BulkCore(self.root / "media", items)
+        return JobService(self.store, core, self.root / "media"), core
+
+    async def test_first_history_at_limit_downloads_without_count_confirmation(self):
+        service, _ = self.service([media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT)])
+        service.saved = lambda item, legacy_cache=None: True
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["confirm_reason"], "")
+        self.assertFalse(task["accept_count"])
+
+    async def test_unsupported_types_do_not_count_toward_limit(self):
+        items = [media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT)]
+        items += [media_item(5000 + i, "图文") for i in range(20)]
+        service, _ = self.service(items)
+        service.saved = lambda item, legacy_cache=None: True
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        self.assertEqual(self.store.task(job["id"])["status"], "completed")
+
+    async def test_first_history_over_limit_awaits_distinct_count_confirmation(self):
+        service, core = self.service(
+            [media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT + 1)])
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "awaiting_confirmation")
+        self.assertEqual(task["confirm_reason"], CONFIRM_REASON_COUNT)
+        self.assertIn(str(FIRST_HISTORY_COUNT_LIMIT + 1), task["message"])
+        self.assertIn("数量", task["message"])
+        self.assertNotEqual(task["message"], QUALITY_CONFIRM_MESSAGE)
+        self.assertFalse(task["accept_count"])
+        self.assertEqual(core.download_calls, 0)
+
+    async def test_count_confirmation_continues_same_task(self):
+        service, core = self.service(
+            [media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT + 1)])
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        service.confirm(job["id"])
+        confirmed = self.store.task(job["id"])
+        self.assertEqual(confirmed["status"], "queued")
+        self.assertTrue(confirmed["accept_count"])
+        self.assertEqual(confirmed["confirm_reason"], "")
+        service.saved = lambda item, legacy_cache=None: True
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual([item["id"] for item in self.store.tasks()], [job["id"]])
+        self.assertEqual(core.download_calls, 0)
+
+    async def test_update_task_over_limit_is_not_gated(self):
+        previous = self.store.create_task(AUTHOR_URL, "author")
+        self.store.update_task(previous["id"], status="completed")
+        service, _ = self.service(
+            [media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT + 1)])
+        service.saved = lambda item, legacy_cache=None: True
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["confirm_reason"], "")
+        self.assertFalse(task["accept_count"])
+
+    async def test_over_limit_with_existing_saved_items_is_treated_as_update(self):
+        service, _ = self.service([media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT + 1)])
+        service.saved = lambda item, legacy_cache=None: True
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "completed")
+        self.assertEqual(task["confirm_reason"], "")
+        self.assertFalse(task["accept_count"])
+
+    async def test_count_and_quality_confirmations_stay_distinct(self):
+        self.store.set_setting("quality_policy", "confirm")
+        service, core = self.service(
+            [media_item(i) for i in range(FIRST_HISTORY_COUNT_LIMIT + 1)])
+        job = self.store.create_task(AUTHOR_URL, "author")
+        await service.process_one()
+        self.assertEqual(self.store.task(job["id"])["confirm_reason"], CONFIRM_REASON_COUNT)
+
+        service.confirm(job["id"])
+        await service.process_one()
+        task = self.store.task(job["id"])
+        self.assertEqual(task["status"], "awaiting_confirmation")
+        self.assertEqual(task["confirm_reason"], CONFIRM_REASON_QUALITY)
+        self.assertTrue(task["accept_count"])
+        self.assertFalse(task["accept_quality"])
+        self.assertEqual(task["message"], QUALITY_CONFIRM_MESSAGE)
+
+        service.confirm(job["id"])
+        task = self.store.task(job["id"])
+        self.assertTrue(task["accept_quality"])
+        self.assertEqual(task["confirm_reason"], "")
+        service.saved = lambda item, legacy_cache=None: True
+        await service.process_one()
+        self.assertEqual(self.store.task(job["id"])["status"], "completed")
+        self.assertEqual(core.download_calls, 0)
 
 
 if __name__ == "__main__":

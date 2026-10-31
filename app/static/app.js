@@ -469,7 +469,8 @@
   function taskCard(task) {
     const card = element('article', 'record'); const content = element('div', 'record-content'); const heading = element('div', 'record-title');
     const stateClass = task.status === 'completed' ? 'good' : ['failed', 'interrupted'].includes(task.status) ? 'bad' : 'pending';
-    heading.append(element('h2', '', taskTitle(task)), element('span', `badge ${stateClass}`, statusNames[task.status] || task.status));
+    const countConfirm = task.status === 'awaiting_confirmation' && task.confirm_reason === 'count';
+    heading.append(element('h2', '', taskTitle(task)), element('span', `badge ${stateClass}`, countConfirm ? '等待数量确认' : statusNames[task.status] || task.status));
     const source=element('a','source-link',task.kind==='author'?'查看博主主页 ↗':'查看作品链接 ↗');source.href=task.link.startsWith('https://')?task.link:`https://www.douyin.com/video/${task.link}`;source.target='_blank';source.rel='noopener noreferrer';
     const needsAttention = ['failed', 'interrupted'].includes(task.status);
     const summary = needsAttention && Number(task.total) > 0
@@ -487,14 +488,14 @@
     if (task.status === 'paused') actions.append(action('继续', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, 'POST'); await loadTasks(); }));
     if (['failed', 'interrupted', 'cancelled'].includes(task.status)) actions.append(action('重试', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/retry`, 'POST'); await loadTasks(); }));
     if (task.status === 'awaiting_confirmation') {
-      content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
+      content.append(element('p', 'hint', countConfirm ? '首次历史作品数量超过 1000 个。确认后按当前列表继续下载，也可取消。' : '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
       if (Array.isArray(task.preview)) {
         for (const item of task.preview.slice(0, 5)) {
           const dimensions = item.width > 0 && item.height > 0 ? `${item.width} × ${item.height}` : '分辨率未确认';
           content.append(element('p', 'muted', `${item.nickname || '未知作者'} · ${item.desc || item.id} · ${dimensions}`));
         }
       }
-      actions.append(action('接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
+      actions.append(action(countConfirm ? '确认数量并继续' : '接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
     }
     if (!['completed','cancelled'].includes(task.status)) actions.append(action('取消', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, 'POST'); await loadTasks(); }));
     actions.append(action('删除',async()=>{await api(`/api/tasks/${encodeURIComponent(task.id)}`,'DELETE');await loadTasks();notice('任务记录已删除，媒体文件保留。');}));

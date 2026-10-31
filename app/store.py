@@ -83,6 +83,8 @@ class Store:
                     completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     accept_quality INTEGER NOT NULL DEFAULT 0,
+                    accept_count INTEGER NOT NULL DEFAULT 0,
+                    confirm_reason TEXT NOT NULL DEFAULT '',
                     preview TEXT NOT NULL DEFAULT '[]', author_id TEXT);
                 CREATE INDEX IF NOT EXISTS task_state ON tasks(status,created_at);
                 CREATE TABLE IF NOT EXISTS works (
@@ -127,6 +129,11 @@ class Store:
                     db.execute(f'ALTER TABLE authors ADD COLUMN {name} {kind}')
             if 'metadata_revision' not in {row[1] for row in db.execute('PRAGMA table_info(browse_history)')}:
                 db.execute('ALTER TABLE browse_history ADD COLUMN metadata_revision INTEGER NOT NULL DEFAULT 0')
+            task_columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+            for name, kind in (("accept_count", "INTEGER NOT NULL DEFAULT 0"),
+                               ("confirm_reason", "TEXT NOT NULL DEFAULT ''")):
+                if name not in task_columns:
+                    db.execute(f'ALTER TABLE tasks ADD COLUMN {name} {kind}')
             if 'refresh_pending' not in {row[1] for row in db.execute('PRAGMA table_info(comment_assets)')}:
                 db.execute('ALTER TABLE comment_assets ADD COLUMN refresh_pending INTEGER NOT NULL DEFAULT 0')
                 db.execute("UPDATE comment_assets SET status='saved',refresh_pending=1 WHERE status='pending' AND relative_path!='' AND sha256!=''")
@@ -174,6 +181,8 @@ class Store:
         result = dict(row)
         result["preview"] = json.loads(result["preview"])
         result["accept_quality"] = bool(result["accept_quality"])
+        result["accept_count"] = bool(result["accept_count"])
+        result["confirm_reason"] = result["confirm_reason"] or ""
         return result
 
     def create_task(self, link, kind, accept_quality=False, author_id=None):
@@ -204,7 +213,8 @@ class Store:
             """)]
 
     def update_task(self, task_id, pause_seconds=0, **values):
-        allowed = {"status", "message", "completed", "total", "accept_quality", "preview"}
+        allowed = {"status", "message", "completed", "total", "accept_quality", "accept_count",
+                   "confirm_reason", "preview"}
         if not values or not set(values) <= allowed:
             raise ValueError("任务更新字段无效")
         if "preview" in values:

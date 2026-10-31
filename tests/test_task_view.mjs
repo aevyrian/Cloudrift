@@ -154,6 +154,13 @@ for (const [status, label, suffix] of [['failed', '重试', 'retry'], ['queued',
   await card.querySelector('.record-actions').children.find(node => node.textContent === label).invoke();
   assert.deepEqual(calls.at(-1), { url: `/api/tasks/task%2Fa/${suffix}`, method: 'POST' });
 }
+const countCard = cardContext.makeCard({ id: 'count/a', status: 'awaiting_confirmation', confirm_reason: 'count', kind: 'author', link: 'https://www.douyin.com/user/abc', preview: [] });
+const countActions = countCard.querySelector('.record-actions').children;
+const countButton = countActions.find(node => node.textContent === '确认数量并继续');
+assert.ok(countButton, '数量确认须使用独立按钮文案');
+assert.equal(countActions.some(node => node.textContent === '接受此任务原项目优选'), false);
+await countButton.invoke();
+assert.deepEqual(calls.at(-1), { url: '/api/tasks/count%2Fa/confirm', method: 'POST' });
 const deleting=cardContext.makeCard({id:'remove/a',status:'downloading',kind:'detail',link:'https://www.douyin.com/video/123',preview:[]});
 await deleting.querySelector('.record-actions').children.find(n=>n.textContent==='删除').invoke();
 assert.deepEqual(calls.at(-1),{url:'/api/tasks/remove%2Fa',method:'DELETE'});

@@ -51,6 +51,10 @@ def safe_error(exc, store):
 
 
 MEDIA_TYPES = frozenset({"视频", "图集", "实况"})
+FIRST_HISTORY_COUNT_LIMIT = 1000
+CONFIRM_REASON_COUNT = "count"
+CONFIRM_REASON_QUALITY = "quality"
+QUALITY_CONFIRM_MESSAGE = "已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本"
 
 
 def count_media_items(items):
@@ -161,9 +165,14 @@ class JobService:
     def confirm(self, task_id):
         task = self.store.task(task_id)
         if not task or task["status"] != "awaiting_confirmation":
-            raise ValueError("该任务没有等待画质确认")
-        self.store.update_task(task_id, status='paused' if self.store.setting('queue_paused', False) else 'queued',
-                               accept_quality=True, message="已接受当前任务的原项目优选质量")
+            raise ValueError("该任务没有等待确认")
+        values = {"status": 'paused' if self.store.setting('queue_paused', False) else 'queued',
+                  "confirm_reason": ""}
+        if task.get("confirm_reason") == CONFIRM_REASON_COUNT:
+            values.update(accept_count=True, message="已确认首次历史采集数量，继续下载")
+        else:
+            values.update(accept_quality=True, message="已接受当前任务的原项目优选质量")
+        self.store.update_task(task_id, **values)
         return self.store.task(task_id)
 
     def complete(self, work):
@@ -264,6 +273,8 @@ class JobService:
                 items = await self.core.parse(task["link"], task["kind"])
                 skipped = getattr(items, "skipped", 0)
                 self.store.update_task(task["id"], preview=items)
+                # 首次历史采集按 视频+图集(含实况) 计数；>1000 先确认，确认后复用同一任务继续。
+                media_count = count_media_items(items)
                 pending, failures = [], []
                 legacy_cache = {'ids': [str(item['id']) for item in items]}
                 for item in items:
@@ -275,8 +286,15 @@ class JobService:
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
                 self.store.update_task(task["id"], total=len(pending) + len(failures))
+                if (first_history and not is_update and media_count > FIRST_HISTORY_COUNT_LIMIT
+                        and not task.get("accept_count")):
+                    self.store.update_task(
+                        task["id"], status="awaiting_confirmation", confirm_reason=CONFIRM_REASON_COUNT,
+                        message=f"已解析首次历史作品：视频和图集共 {media_count} 个，超过 {FIRST_HISTORY_COUNT_LIMIT} 个；请确认数量后继续下载")
+                    return True
                 if pending and not task["accept_quality"] and self.store.setting("quality_policy", "upstream") == "confirm":
-                    self.store.update_task(task["id"], status="awaiting_confirmation", message="已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本")
+                    self.store.update_task(task["id"], status="awaiting_confirmation", confirm_reason=CONFIRM_REASON_QUALITY,
+                                           message=QUALITY_CONFIRM_MESSAGE)
                     return True
                 completed = 0
                 for item in pending:
