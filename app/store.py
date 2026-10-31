@@ -11,6 +11,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 
+from .comment_channels import COMMENT_CHANNELS, DEFAULT_CHANNEL, channel_checkpoint
 from .legacy import FILENAME
 
 BEIJING = timezone(timedelta(hours=8))
@@ -500,8 +501,9 @@ class Store:
         with self.connect() as db:
             return self._comment_job(db.execute('SELECT * FROM comment_jobs WHERE work_id=?', (work_id,)).fetchone())
 
-    def comment_queue(self, work_id, action):
-        if not re.fullmatch(r'[0-9]{19}', work_id or '') or action not in {'save', 'update', 'continue'}:
+    def comment_queue(self, work_id, action, channel=DEFAULT_CHANNEL):
+        if (not re.fullmatch(r'[0-9]{19}', work_id or '') or action not in {'save', 'update', 'continue'}
+                or channel not in COMMENT_CHANNELS):
             raise ValueError('作品或评论操作无效')
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
@@ -511,9 +513,9 @@ class Store:
                 return self._comment_job(row)
             if action == 'continue':
                 db.execute("UPDATE comment_assets SET refresh_pending=1 WHERE work_id=? AND status='saved' AND error!='' AND source_url!=''", (work_id,))
-            checkpoint = json.loads(row['checkpoint']) if row else {'cursor': 0, 'root_done': False, 'replies': []}
+            checkpoint = channel_checkpoint(json.loads(row['checkpoint']) if row else None)
             if action in ('save', 'update') or (checkpoint['root_done'] and not checkpoint['replies']):
-                checkpoint = {'cursor': 0, 'root_done': False, 'replies': []}
+                checkpoint = channel_checkpoint(None, channel)
             token = secrets.token_hex(16)
             db.execute('''INSERT INTO comment_jobs(work_id,operation,integrity,reason,token,checkpoint,updated_at)
                           VALUES (?,'queued','unsaved','',?,?,?) ON CONFLICT(work_id) DO UPDATE SET

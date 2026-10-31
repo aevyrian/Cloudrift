@@ -2,16 +2,19 @@ import asyncio
 import copy
 import time
 
+from .comment_channels import (CommentChannelUnavailable, DEFAULT_CHANNEL,
+                               channel_checkpoint, default_channels)
 from .core import CommentBlocked
 
 
 class CommentService:
-    def __init__(self, store, core):
+    def __init__(self, store, core, channels=None):
         self.store = store
         self.core = core
+        self.channels = default_channels(core) if channels is None else channels
 
-    def queue(self, work_id, action='save'):
-        self.store.comment_queue(work_id, action)
+    def queue(self, work_id, action='save', channel=DEFAULT_CHANNEL):
+        self.store.comment_queue(work_id, action, channel)
         return self.store.comment_state(work_id)
 
     def cancel(self, work_id):
@@ -53,10 +56,14 @@ class CommentService:
             except Exception:
                 self.store.comment_commit_asset(work_id, token, asset['id'], {}, time.monotonic() - started, '图片保存失败，可稍后重试')
             return True
-        checkpoint = copy.deepcopy(job['checkpoint'])
+        checkpoint = channel_checkpoint(copy.deepcopy(job['checkpoint']))
         replies = checkpoint['replies']
         if checkpoint['root_done'] and not replies:
             self.store.comment_end(work_id, token, 'finished', '', finished=True)
+            return True
+        channel = self.channels.get(checkpoint['channel'])
+        if channel is None:
+            self.store.comment_end(work_id, token, 'failed', '评论通道不可用，已保存内容保留，可稍后重试')
             return True
         if not self.store.comment_request_begin(work_id, token, now):
             return False
@@ -64,7 +71,7 @@ class CommentService:
         cursor = replies[0]['cursor'] if replies else checkpoint['cursor']
         started = time.monotonic()
         try:
-            page = await asyncio.wait_for(self.core.comment_page(work_id, cursor=cursor, root_id=root_id), timeout=15)
+            page = await asyncio.wait_for(channel.page(work_id, cursor=cursor, root_id=root_id), timeout=15)
             items, next_cursor, more = page['items'], page['next_cursor'], page['has_more']
             if (not isinstance(items, list) or type(next_cursor) is not int or next_cursor < 0
                     or type(more) is not bool or (more and (not items or next_cursor <= cursor))
@@ -87,6 +94,8 @@ class CommentService:
             self.store.comment_commit_page(work_id, token, items, checkpoint, total, time.monotonic() - started)
         except CommentBlocked:
             self.store.comment_block(work_id, token)
+        except CommentChannelUnavailable:
+            self.store.comment_end(work_id, token, 'failed', '评论通道暂不可用，已保存内容保留，可稍后重试')
         except Exception:
             self.store.comment_end(work_id, token, 'failed', '读取评论失败，已保存内容保留，可稍后重试')
         return True

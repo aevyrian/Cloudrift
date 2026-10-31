@@ -55,6 +55,7 @@ def _comment_number(value):
 
 
 def _comment_item(item, root_id):
+    """把平台评论结构映射为评论表字段；服务端与助手通道共用。"""
     if not isinstance(item, dict):
         raise ValueError('评论结构无效')
     user = item.get('user')
@@ -99,6 +100,10 @@ def _comment_item(item, root_id):
             'likes': _comment_number(item.get('digg_count')),
             'reply_count': _comment_number(item.get('reply_comment_total', 0 if root_id else None)),
             'attachments': attachments}
+
+
+# 兼容已有调用，同时供第二评论通道复用。
+comment_item = _comment_item
 
 
 def download_directory(value, media_root):
