@@ -15,6 +15,14 @@ class CommentBlocked(RuntimeError):
     pass
 
 
+class ParsedItems(list):
+    """作品解析结果，skipped 记录因类型暂不支持而跳过的数量。"""
+
+    def __init__(self, items=(), skipped=0):
+        super().__init__(items)
+        self.skipped = skipped
+
+
 def _comment_id(value, empty=False):
     if empty and (value is None or value == '' or value == '0' or type(value) is int and value == 0):
         return ''
@@ -352,13 +360,15 @@ class Core:
                     raise RuntimeError("未取得作品数据，请检查 Cookie、作品是否可见和网络")
                 result.append(response.data)
         unique = {}
+        skipped = 0
         for item in result:
             if item.get("type") not in {"视频", "图集", "实况"}:
-                raise RuntimeError("该作品类型暂不支持，任务已保留，可重试")
+                skipped += 1
+                continue
             if not re.fullmatch(r"\d{19}", str(item.get("id", ""))) or not item.get("downloads"):
                 raise RuntimeError("解析结果缺少作品标识或可下载地址")
             unique[str(item["id"])] = item
-        return list(unique.values())
+        return ParsedItems(unique.values(), skipped)
 
     async def download(self, item):
         if not self.ready:

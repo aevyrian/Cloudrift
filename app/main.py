@@ -245,6 +245,7 @@ class JobService:
                     raise RuntimeError(self.core.error or "下载核心未就绪，请检查设置")
                 # 每次重试重新解析，避免使用已过期的媒体地址。
                 items = await self.core.parse(task["link"], task["kind"])
+                skipped = getattr(items, "skipped", 0)
                 self.store.update_task(task["id"], preview=items)
                 pending, failures = [], []
                 legacy_cache = {'ids': [str(item['id']) for item in items]}
@@ -277,6 +278,8 @@ class JobService:
                     completed += 1
                     self.store.update_task(task["id"], completed=completed)
                 summary = f"已完整保存 {completed} 个作品，跳过本库已有 {len(items) - completed - len(failures)} 个"
+                if skipped:
+                    summary += f"；跳过 {skipped} 个暂不支持的作品"
                 if failures:
                     summary += f"；{len(failures)} 个未完成，可重试：" + '；'.join(failures[:3])
                 self.finish(task, is_update, status="failed" if failures else "completed", completed=completed, message=summary[:1500])
