@@ -192,7 +192,7 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         await self.service.process_one()
         self.assertEqual(self.core.download_calls, 1)
         original_parse = self.core.parse
-        async def new_post(link, kind):
+        async def new_post(link, kind, earliest=None):
             items = await original_parse(link, kind)
             return items + [{**items[0], 'id': '7431234567890123457'}]
         self.core.parse = new_post

@@ -70,6 +70,30 @@ def task_history_flags(task, store):
     return not downloaded, downloaded
 
 
+UPDATE_EARLIEST_PADDING_DAYS = 2
+
+
+def update_earliest(task, store, now=None):
+    """Return a safe earliest-days window for update author tasks.
+
+    None means scan the full history: first-history tasks, non-author tasks, or
+    update tasks whose last completed check time is unknown.
+    """
+    if task.get("kind") != "author":
+        return None
+    completed = store.author_last_completed(task["link"])
+    if not completed:
+        return None
+    try:
+        checked = datetime.fromisoformat(completed)
+    except (TypeError, ValueError):
+        return None
+    if checked.tzinfo is None:
+        checked = checked.replace(tzinfo=timezone.utc)
+    elapsed = (now if now is not None else time.time()) - checked.timestamp()
+    return max(1, int(elapsed // 86400) + UPDATE_EARLIEST_PADDING_DAYS)
+
+
 class JobService:
     def __init__(self, store, core, media_root, legacy_root=None):
         self.store, self.core = store, core
@@ -270,7 +294,12 @@ class JobService:
                 if not self.core.ready:
                     raise RuntimeError(self.core.error or "下载核心未就绪，请检查设置")
                 # 每次重试重新解析，避免使用已过期的媒体地址。
-                items = await self.core.parse(task["link"], task["kind"])
+                # 增量任务在已知上次完成时间时缩小扫描窗口；首次历史仍全量扫描。
+                earliest = update_earliest(task, self.store) if is_update else None
+                if earliest is not None:
+                    items = await self.core.parse(task["link"], task["kind"], earliest=earliest)
+                else:
+                    items = await self.core.parse(task["link"], task["kind"])
                 skipped = getattr(items, "skipped", 0)
                 self.store.update_task(task["id"], preview=items)
                 # 首次历史采集按 视频+图集(含实况) 计数；>1000 先确认，确认后复用同一任务继续。

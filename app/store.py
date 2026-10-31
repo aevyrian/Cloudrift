@@ -231,6 +231,11 @@ class Store:
         with self.connect() as db:
             return db.execute("SELECT 1 FROM tasks WHERE link=? AND kind='author' AND status='completed' LIMIT 1", (link,)).fetchone() is not None
 
+    def author_last_completed(self, link):
+        with self.connect() as db:
+            row = db.execute("SELECT updated_at FROM tasks WHERE link=? AND kind='author' AND status='completed' ORDER BY updated_at DESC,rowid DESC LIMIT 1", (link,)).fetchone()
+        return row["updated_at"] if row else None
+
     def author_queue_busy(self):
         with self.connect() as db:
             return db.execute("SELECT 1 FROM tasks WHERE kind='author' AND status IN ('queued','parsing','downloading','paused') LIMIT 1").fetchone() is not None
@@ -241,7 +246,15 @@ class Store:
             values = {row['key']: json.loads(row['value']) for row in db.execute("SELECT key,value FROM settings WHERE key IN ('queue_paused','queue_resume_at')")}
             if values.get('queue_paused', False) or time.time() < values.get('queue_resume_at', 0):
                 return None
-            row = db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
+            # 增量更新任务优先于首次历史采集，其余任务保持原有 FIFO 顺序。
+            row = db.execute("""
+                SELECT * FROM tasks WHERE status='queued'
+                ORDER BY CASE WHEN kind='author' AND EXISTS (
+                    SELECT 1 FROM tasks done
+                    WHERE done.kind='author' AND done.link=tasks.link AND done.status='completed'
+                ) THEN 0 ELSE 1 END, created_at,rowid
+                LIMIT 1
+            """).fetchone()
             if not row:
                 return None
             db.execute("UPDATE tasks SET status='parsing',message='正在解析作品',updated_at=? WHERE id=?", (stamp(), row["id"]))
