@@ -12,10 +12,11 @@ RUN mkdir /runtime && \
 FROM python:3.12-slim-bookworm@sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0
 COPY --from=vaapi /runtime/ /
 WORKDIR /app
+ARG CLOUDRIFT_VERSION=1.4.10
 LABEL org.opencontainers.image.title="Cloudrift" \
     org.opencontainers.image.source="https://github.com/aevyrian/Cloudrift" \
     org.opencontainers.image.licenses="GPL-3.0" \
-    org.opencontainers.image.version="1.4.3"
+    org.opencontainers.image.version="$CLOUDRIFT_VERSION"
 ENV PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PYTHONPATH=/opt/python \
     APP_DATA=/data APP_MEDIA=/media APP_CORE=/app/vendor/TikTokDownloader
 COPY requirements.txt ./

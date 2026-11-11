@@ -36,8 +36,14 @@ class StoreTests(unittest.TestCase):
     def test_only_enabled_due_authors_are_scheduled(self):
         self.store.save_author("enabled", "https://www.douyin.com/user/abc", enabled=True, interval_minutes=5)
         self.store.save_author("disabled", "https://www.douyin.com/user/def", enabled=False, interval_minutes=5)
+        self.store.save_author("future", "https://www.douyin.com/user/ghi", enabled=True)
+        self.store.patch_author("future", next_check=time.time()+3600)
+        self.store.patch_author("enabled", starred=True)
         due = self.store.due_authors()
-        self.assertEqual([a["id"] for a in due], ["enabled"])
+        self.assertEqual(due, [self.store.author("enabled")])
+        self.assertIs(due[0]["enabled"], True)
+        self.assertIs(due[0]["starred"], True)
+        self.assertIs(due[0]["favorite"], False)
         self.store.mark_author_scheduled("enabled")
         self.assertEqual(self.store.due_authors(), [])
 

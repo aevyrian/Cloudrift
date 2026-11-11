@@ -3,6 +3,7 @@ import unittest
 from pathlib import Path
 
 from app.store import Store
+from test_comment_fixtures import setup_comment_accounts
 
 
 WORK = '7431234567890123456'
@@ -19,6 +20,7 @@ class CommentStoreTests(unittest.TestCase):
         self.tmp = tempfile.TemporaryDirectory()
         self.addCleanup(self.tmp.cleanup)
         self.store = Store(Path(self.tmp.name))
+        setup_comment_accounts(self.store)
 
     def test_unsaved_is_read_only_and_identity_only_uses_trusted_aliases(self):
         self.assertEqual(self.store.comment_state(WORK)['operation'], 'unsaved')
@@ -34,7 +36,7 @@ class CommentStoreTests(unittest.TestCase):
         self.assertIsNone(self.store.comment_work_id('legacy-one'))
 
     def test_page_checkpoint_atomic_and_local_pagination_hides_sources(self):
-        job = self.store.comment_queue(WORK, 'save')
+        job = self.store.comment_queue(WORK, 'save', account_role='primary', allow_primary=True)
         token = job['token']
         attachment = {'kind': 'image', 'source_url': 'https://example.invalid/private', 'status': 'pending', 'error': ''}
         page = [item('111', attachments=[attachment]), item('222', '111', 'missing')]
@@ -48,16 +50,16 @@ class CommentStoreTests(unittest.TestCase):
         self.assertEqual(self.store.comment_snapshot(WORK)['items'][0]['attachments'][0]['source_url'], attachment['source_url'])
 
     def test_cancel_requeue_stale_result_does_not_cross_operation(self):
-        old = self.store.comment_queue(WORK, 'save')['token']
+        old = self.store.comment_queue(WORK, 'save', account_role='primary', allow_primary=True)['token']
         self.store.comment_cancel(WORK)
-        new = self.store.comment_queue(WORK, 'continue')['token']
+        new = self.store.comment_queue(WORK, 'continue', account_role='primary', allow_primary=True)['token']
         self.assertNotEqual(old, new)
         self.assertFalse(self.store.comment_commit_page(WORK, old, [item('111')], {'cursor': 1, 'root_done': False, 'replies': []}, None, 0))
         self.assertEqual(self.store.comment_state(WORK)['total'], 0)
         self.assertEqual(self.store.comment_state(WORK)['operation'], 'queued')
 
     def test_changed_attachment_is_not_misrepresented_as_already_saved(self):
-        token = self.store.comment_queue(WORK, 'save')['token']
+        token = self.store.comment_queue(WORK, 'save', account_role='primary', allow_primary=True)['token']
         self.store.comment_claim()
         attachment = {'kind': 'image', 'source_url': 'https://example.invalid/a', 'status': 'pending', 'error': ''}
         checkpoint = {'cursor': 0, 'root_done': False, 'replies': []}
@@ -73,7 +75,7 @@ class CommentStoreTests(unittest.TestCase):
                          ('saved', 'comment-assets/a.png', 1))
 
     def test_upgrade_preserves_old_pending_reference(self):
-        token = self.store.comment_queue(WORK, 'save')['token']
+        token = self.store.comment_queue(WORK, 'save', account_role='primary', allow_primary=True)['token']
         self.store.comment_claim()
         attachment = {'kind': 'image', 'source_url': 'https://example.invalid/a', 'status': 'pending', 'error': ''}
         self.store.comment_commit_page(WORK, token, [item('111', attachments=[attachment])],

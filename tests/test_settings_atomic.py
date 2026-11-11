@@ -2,6 +2,7 @@ import asyncio
 import tempfile
 import unittest
 import sqlite3
+import threading
 from pathlib import Path
 from unittest.mock import patch
 
@@ -133,6 +134,36 @@ class SettingsAtomicTests(unittest.IsolatedAsyncioTestCase):
             with self.assertRaises(asyncio.CancelledError):
                 await request
         self.assertEqual(self.store.setting('cookie'), 'original-private-cookie')
+        self.assertTrue(self.core.ready)
+        self.assertFalse(self.app.state.service.lock.locked())
+
+    async def test_cancel_after_database_commit_keeps_core_with_committed_identity(self):
+        original = self.store.set_settings
+        committed, release = threading.Event(), threading.Event()
+        cookie = 'uid_tt=synthetic-new; sessionid=synthetic-session'
+
+        def write(values):
+            original(values)
+            committed.set()
+            if not release.wait(3):
+                raise TimeoutError('test did not release writer')
+
+        from app.main import SettingsInput
+        endpoint = next(route.endpoint for route in self.app.routes
+                        if getattr(route, 'path', '') == '/api/settings' and 'PUT' in route.methods)
+        with patch.object(self.store, 'set_settings', side_effect=write):
+            request = asyncio.create_task(endpoint(SettingsInput(cookie=cookie), current='original-admin-key'))
+            try:
+                self.assertTrue(await asyncio.to_thread(committed.wait, 2))
+                request.cancel()
+            finally:
+                release.set()
+            with self.assertRaises(asyncio.CancelledError):
+                await request
+        self.assertEqual(self.store.setting('cookie'), cookie)
+        self.assertEqual(self.core.started[-1], (cookie, ''))
+        self.assertTrue(self.store.comment_accounts.status()['primary']['bound'])
+        self.assertTrue(self.store.comment_accounts.status()['paused'])
         self.assertTrue(self.core.ready)
         self.assertFalse(self.app.state.service.lock.locked())
 

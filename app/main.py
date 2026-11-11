@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import json
 import os
 import re
 import secrets
@@ -15,18 +16,23 @@ from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
 from .core import Core, download_directory, normalize_input
+from .blocking import run_blocking
 from .store import Store, FREQUENCIES, BEIJING, AmbiguousAliasError
 from .legacy import LegacyIndex, recorded_download, recorded_downloads, identical_legacy_copies
 from .playback import PlaybackCache
 from .cookie_sync import CookieAccount, CookieSync
 from .comments import CommentService
+from .comment_browser import BrowserCommentService, BrowserError
+from .comment_accounts import AccountError
+from .comment_entry import register_comment_entry
+from .comment_batch import CommentBatchService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.3"
+VERSION = "1.4.10"
 BASE = Path(__file__).resolve().parent
 
 
@@ -57,20 +63,28 @@ class JobService:
         self.legacy_root = Path(legacy_root).resolve() if legacy_root else None
         self.media_root.mkdir(parents=True, exist_ok=True)
         self.lock = asyncio.Lock()
+        self.database_lock = asyncio.Lock()
         self.configuration_lock = asyncio.Lock()
         self.configuration_pending = False
         self.running = False
         self.worker = None
         self.queue_error = ""
         self.schedule_error = ""
+        self.comment_batch_error = ""
         self.retry_delay = 2
         self.active_task_id = None
         self.active_download = None
         self.comments = CommentService(store, core)
+        self.browser_comments = BrowserCommentService(store)
+        self.comment_batches = CommentBatchService(store, self.comments, self.browser_comments)
+
+    async def database(self, function, *args, **kwargs):
+        async with self.database_lock:
+            return await run_blocking(function, *args, **kwargs)
 
     async def initialize(self):
         try:
-            await self.core.start(self.store.setting("cookie", ""), self.store.setting("download_dir", ""))
+            await self.core.start((await self.database(self.store.setting, "cookie", "")), (await self.database(self.store.setting, "download_dir", "")))
         except Exception as exc:
             self.core.ready = False
             self.core.error = safe_error(exc, self.store)
@@ -94,12 +108,12 @@ class JobService:
                 raise RuntimeError('下载器尚未停止，请稍后重试') from None
 
     async def pause(self, task_id):
-        self.store.pause_task(task_id)
+        await self.database(self.store.pause_task, task_id)
         await self.stop_active(task_id)
-        return self.store.task(task_id)
+        return (await self.database(self.store.task, task_id))
 
     async def pause_all(self):
-        changed = self.store.pause_queue()
+        changed = (await self.database(self.store.pause_queue))
         await self.stop_active(self.active_task_id)
         return changed
 
@@ -110,37 +124,48 @@ class JobService:
             resume_id = None
             interrupted = False
             message = '正在更新抖音登录信息，更新后继续'
-            try:
+            def pause_for_configuration():
                 task = self.store.task(self.active_task_id) if self.active_task_id else None
                 if task and task['status'] in {'parsing', 'downloading'}:
-                    resume_id = task['id']
-                    self.store.pause_task(resume_id)
-                    self.store.update_task(resume_id, message=message)
+                    self.store.pause_task(task['id'])
+                    self.store.update_task(task['id'], message=message)
+                    return task['id']
+
+            def resume_after_configuration():
+                task = self.store.task(resume_id) if resume_id else None
+                if (interrupted and task and task['status'] == 'paused' and task['message'] == message
+                        and not self.store.setting('queue_paused', False)):
+                    self.store.resume_task(resume_id)
+
+            try:
+                resume_id = await self.database(pause_for_configuration)
+                if resume_id:
                     await self.stop_active(resume_id)
                     interrupted = True
                 async with self.lock:
                     yield
             finally:
                 self.configuration_pending = False
-                task = self.store.task(resume_id) if resume_id else None
-                if (interrupted and task and task['status'] == 'paused' and task['message'] == message
-                        and not self.store.setting('queue_paused', False)):
-                    self.store.resume_task(resume_id)
+                await self.database(resume_after_configuration)
 
     async def cancel(self, task_id):
-        task = self.store.task(task_id)
-        if not task:
-            raise ValueError('任务不存在')
+        def mark_cancelled():
+            task = self.store.task(task_id)
+            if not task:
+                raise ValueError('任务不存在')
+            if task['status'] not in {'completed', 'cancelled'}:
+                self.store.update_task(task_id, status='cancelled', message='已取消，已保存作品和断点文件保留')
+            return task
+        task = await self.database(mark_cancelled)
         if task['status'] in {'completed', 'cancelled'}:
             return task
-        self.store.update_task(task_id, status='cancelled', message='已取消，已保存作品和断点文件保留')
         if self.active_task_id == task_id and self.active_download:
             self.active_download.cancel()
             try:
                 await self.active_download
             except asyncio.CancelledError:
                 pass
-        return self.store.task(task_id)
+        return (await self.database(self.store.task, task_id))
 
     def confirm(self, task_id):
         task = self.store.task(task_id)
@@ -218,7 +243,7 @@ class JobService:
     async def process_one(self):
         if self.configuration_pending:
             return False
-        task = self.store.claim_task()
+        task = (await self.database(self.store.claim_task))
         if not task:
             return False
         self.active_task_id = task['id']
@@ -234,10 +259,10 @@ class JobService:
 
     async def process_task(self, task):
         async with self.lock:
-            current = self.store.task(task['id'])
-            if not current or current['status'] == 'cancelled':
+            current = (await self.database(self.store.task, task['id']))
+            if not current or current['status'] in {'cancelled', 'paused'}:
                 return True
-            is_update = task['kind'] == 'author' and self.store.author_downloaded(task['link'])
+            is_update = task['kind'] == 'author' and (await self.database(self.store.author_downloaded, task['link']))
             try:
                 if not self.core.ready:
                     await self.initialize()
@@ -245,25 +270,25 @@ class JobService:
                     raise RuntimeError(self.core.error or "下载核心未就绪，请检查设置")
                 # 每次重试重新解析，避免使用已过期的媒体地址。
                 items = await self.core.parse(task["link"], task["kind"])
-                self.store.update_task(task["id"], preview=items)
+                await self.database(self.store.update_task, task["id"], preview=items)
                 pending, failures = [], []
                 legacy_cache = {'ids': [str(item['id']) for item in items]}
                 for item in items:
                     try:
-                        if not self.saved(item, legacy_cache):
+                        if not (await self.database(self.saved, item, legacy_cache)):
                             pending.append(item)
                         else:
                             is_update = True
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
-                self.store.update_task(task["id"], total=len(pending) + len(failures))
-                if pending and not task["accept_quality"] and self.store.setting("quality_policy", "upstream") == "confirm":
-                    self.store.update_task(task["id"], status="awaiting_confirmation", message="已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本")
+                await self.database(self.store.update_task, task["id"], total=len(pending) + len(failures))
+                if pending and not task["accept_quality"] and (await self.database(self.store.setting, "quality_policy", "upstream")) == "confirm":
+                    await self.database(self.store.update_task, task["id"], status="awaiting_confirmation", message="已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本")
                     return True
                 completed = 0
                 for item in pending:
-                    self.store.update_task(task["id"], status="downloading", completed=completed,
-                                           message=f"正在下载第 {completed + 1}/{len(pending)} 个作品：{item.get('desc') or item['id']}"[:160])
+                    (await self.database(self.store.update_task, task["id"], status="downloading", completed=completed,
+                                           message=f"正在下载第 {completed + 1}/{len(pending)} 个作品：{item.get('desc') or item['id']}"[:160]))
                     try:
                         files = await self.core.download(item)
                         if not files or any(not (self.media_root / file).resolve().is_relative_to(self.media_root)
@@ -273,30 +298,30 @@ class JobService:
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
                         continue
-                    self.store.save_work(item, files)
+                    await self.database(self.store.save_work, item, files)
                     completed += 1
-                    self.store.update_task(task["id"], completed=completed)
+                    await self.database(self.store.update_task, task["id"], completed=completed)
                 summary = f"已完整保存 {completed} 个作品，跳过本库已有 {len(items) - completed - len(failures)} 个"
                 if failures:
                     summary += f"；{len(failures)} 个未完成，可重试：" + '；'.join(failures[:3])
-                self.finish(task, is_update, status="failed" if failures else "completed", completed=completed, message=summary[:1500])
-                if task["author_id"] and self.store.author(task["author_id"]):
+                await self.database(self.finish, task, is_update, status="failed" if failures else "completed", completed=completed, message=summary[:1500])
+                if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
                     name = items[0].get("nickname", "") if items else ""
                     values = {"last_checked": time.time(), "last_error": summary[:500] if failures else ""}
                     if name:
                         values["name"] = name
-                    self.store.patch_author(task["author_id"], **values)
+                    await self.database(self.store.patch_author, task["author_id"], **values)
             except asyncio.CancelledError:
-                current = self.store.task(task['id'])
+                current = (await self.database(self.store.task, task['id']))
                 if current and current['status'] != 'paused':
-                    self.finish(task, is_update, status='cancelled' if current['status'] == 'cancelled' else 'interrupted',
-                                message=current['message'] if current['status'] == 'cancelled' else '服务停止，任务已保留，可重试')
+                    (await self.database(self.finish, task, is_update, status='cancelled' if current['status'] == 'cancelled' else 'interrupted',
+                                message=current['message'] if current['status'] == 'cancelled' else '服务停止，任务已保留，可重试'))
                 raise
             except Exception as exc:
                 message = safe_error(exc, self.store)
-                self.finish(task, is_update, status="failed", message=message)
-                if task["author_id"] and self.store.author(task["author_id"]):
-                    self.store.patch_author(task["author_id"], last_checked=time.time(), last_error=message)
+                await self.database(self.finish, task, is_update, status="failed", message=message)
+                if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
+                    await self.database(self.store.patch_author, task["author_id"], last_checked=time.time(), last_error=message)
         return True
 
     def schedule(self):
@@ -317,33 +342,48 @@ class JobService:
             async with asyncio.TaskGroup() as group:
                 group.create_task(self.run_queue())
                 group.create_task(self.run_schedule())
+                group.create_task(self.run_comment_batches())
         finally:
             self.running = False
+            self.comment_batches.ready = False
 
     async def run_queue(self):
         needs_recovery = True
         while self.running:
             try:
                 if needs_recovery:
-                    self.store.recover()
-                    self.comments.recover()
+                    self.comment_batches.ready = False
+                    await self.database(self.store.recover)
+                    await self.database(self.comment_batches.recover)
                     needs_recovery = False
+                await self.database(self.browser_comments.expire)
                 processed = await self.process_one()
-                if not processed and not self.configuration_pending and not self.store.setting('queue_paused', False):
+                if not processed and not self.configuration_pending and not (await self.database(self.store.setting, 'queue_paused', False)):
                     async with self.lock:
                         processed = await self.comments.step()
                 self.queue_error = ""
-                remaining = self.store.setting('queue_resume_at', 0) - time.time()
+                remaining = (await self.database(self.store.setting, 'queue_resume_at', 0)) - time.time()
                 await asyncio.sleep(min(30, max(0.5, remaining)) if not processed else 0)
             except (sqlite3.Error, OSError) as exc:
                 self.queue_error = f"数据读写暂时失败（{type(exc).__name__}），请检查磁盘空间和数据库占用；队列将重试"
                 needs_recovery = True
+                self.comment_batches.ready = False
                 await asyncio.sleep(self.retry_delay)
+
+    async def run_comment_batches(self):
+        while self.running:
+            try:
+                if self.comment_batches.ready:
+                    await self.database(self.comment_batches.step)
+                self.comment_batch_error = ""
+            except (sqlite3.Error, OSError) as exc:
+                self.comment_batch_error = f"评论补全进度暂时无法读写（{type(exc).__name__}），稍后自动重试"
+            await asyncio.sleep(self.retry_delay if self.comment_batch_error else 1)
 
     async def run_schedule(self):
         while self.running:
             try:
-                self.schedule()
+                await self.database(self.schedule)
                 self.schedule_error = ""
             except (sqlite3.Error, OSError) as exc:
                 self.schedule_error = f"追更登记暂时失败（{type(exc).__name__}），稍后自动重试"
@@ -442,6 +482,8 @@ class BrowseHistoryInput(BaseModel):
 class CommentInput(BaseModel):
     model_config = ConfigDict(extra='forbid')
     action: Literal['save', 'update', 'continue'] = 'save'
+    account_role: Literal['primary', 'secondary']
+    allow_primary: StrictBool = False
 
 
 def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=None):
@@ -456,6 +498,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     core = core or Core(os.environ.get("APP_CORE", str(BASE.parent / "vendor" / "TikTokDownloader")), data_dir, media_dir)
     legacy = LegacyIndex(store, legacy_dir or os.environ.get("APP_LEGACY"))
     service = JobService(store, core, media_dir, legacy.root)
+    browser_comments = service.browser_comments
     playback = PlaybackCache(data_dir / 'playback-cache')
     cookie_account = CookieAccount(store, service)
     cookie_sync = CookieSync(store, service, cookie_account)
@@ -493,6 +536,13 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     app.state.playback = playback
     app.state.cookie_sync = cookie_sync
 
+    @app.middleware('http')
+    async def browser_no_store(request, call_next):
+        response = await call_next(request)
+        if '/comments/browser' in request.url.path or request.url.path.startswith(('/api/comment-accounts', '/api/comment-batches')) or request.url.path.endswith(('/comments', '/comment-batches')):
+            response.headers['Cache-Control'] = 'no-store'
+        return response
+
     def authorize(request: Request):
         supplied = request.headers.get("Authorization", "")
         supplied = supplied[7:] if supplied.startswith("Bearer ") else ""
@@ -503,9 +553,19 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             raise HTTPException(401, "管理员密钥不正确或已更改，请重新登录")
         return supplied
 
+    register_comment_entry(app, store, authorize, service.comment_batches)
+
     @app.exception_handler(ValueError)
     async def value_error(request, exc):
         return JSONResponse({"detail": safe_error(exc, store)}, status_code=422)
+
+    @app.exception_handler(BrowserError)
+    async def browser_error(request, exc):
+        return JSONResponse({'detail': str(exc)}, status_code=exc.status_code, headers={'Cache-Control': 'no-store'})
+
+    @app.exception_handler(AccountError)
+    async def account_error(request, exc):
+        return JSONResponse({'detail': str(exc)}, status_code=exc.status_code, headers={'Cache-Control': 'no-store'})
 
     @app.exception_handler(RequestValidationError)
     async def validation_error(request, exc):
@@ -514,20 +574,20 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     @app.get("/health")
     async def health():
         alive = bool(service.running and service.worker and not service.worker.done())
-        healthy = alive and core.ready and not service.queue_error and not service.schedule_error
+        healthy = alive and core.ready and not service.queue_error and not service.schedule_error and not service.comment_batch_error
         return JSONResponse({"status": "ok" if healthy else "degraded", "version": VERSION,
-                             "core_ready": core.ready, "worker_alive": alive, "queue_error": service.queue_error or service.schedule_error},
+                             "core_ready": core.ready, "worker_alive": alive, "queue_error": service.queue_error or service.schedule_error or service.comment_batch_error},
                             status_code=200 if healthy else 503)
 
     @app.get("/api/status", dependencies=[Depends(authorize)])
     def status():
         return {"version": VERSION, "core_ready": core.ready, "core_error": core.error,
                 "worker_alive": bool(service.running and service.worker and not service.worker.done()),
-                "queue_error": service.queue_error or service.schedule_error,
+                "queue_error": service.queue_error or service.schedule_error or service.comment_batch_error,
                 "cookie_configured": bool(store.setting("cookie", "")), "stats": store.stats(), "media_root": str(media_dir)}
 
     @app.get("/api/auth")
-    async def auth_status():
+    def auth_status():
         return JSONResponse({"setup_required": not store.setting("admin_key_set", False),
                              "requires_current_key": bool(store.setting("access_token"))},
                             headers={"Cache-Control": "no-store"})
@@ -545,14 +605,14 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return {"ok": True}
 
     @app.post("/api/auth/setup")
-    async def setup_admin(body: AdminKeyInput, request: Request):
+    def setup_admin(body: AdminKeyInput, request: Request):
         if store.setting("admin_key_set", False):
             raise HTTPException(409, "管理员密钥已设置，请登录后到设置页修改")
         expected = authorize(request) if store.setting("access_token") else ""
         return save_admin_key(body, expected, first=True)
 
     @app.put("/api/auth/key")
-    async def change_admin(body: AdminKeyInput, current=Depends(authorize)):
+    def change_admin(body: AdminKeyInput, current=Depends(authorize)):
         return save_admin_key(body, current)
 
     def settings_response(current_key, probe=False):
@@ -631,14 +691,16 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                     if not core.ready:
                         raise RuntimeError('核心未就绪')
                 still_authorized()
-                store.set_settings(values)
                 if body.cookie is not None:
                     cookie_account.invalidate()
+                await run_blocking(store.set_settings, values)
             except (Exception, asyncio.CancelledError) as exc:
                 restored = True
                 if restart:
                     try:
-                        await core.start(old_cookie, old_directory)
+                        retained_cookie = store.setting('cookie', '')
+                        retained_directory = store.setting('download_dir', '')
+                        await core.start(retained_cookie, retained_directory)
                         restored = bool(core.ready)
                     except (Exception, asyncio.CancelledError):
                         restored = False
@@ -659,8 +721,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return task
 
     @app.get("/api/tasks", dependencies=[Depends(authorize)])
-    async def tasks():
-        result = [public_task(task) for task in store.tasks()]
+    def tasks(summary: bool = False):
+        result = [public_task(task) for task in store.tasks(summary=summary)]
         resume_at = store.setting('queue_resume_at', 0)
         if resume_at > time.time():
             for task in result:
@@ -668,13 +730,21 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                     task.update(queue_resume_at=resume_at, message=f"队列休息中，预计 {datetime.fromtimestamp(resume_at, BEIJING):%H:%M:%S} 按顺序继续")
         return result
 
+    @app.get("/api/tasks/{task_id}", dependencies=[Depends(authorize)])
+    def task_detail(task_id: str):
+        task = public_task(store.task(task_id))
+        resume_at = store.setting('queue_resume_at', 0)
+        if task['status'] == 'queued' and resume_at > time.time():
+            task.update(queue_resume_at=resume_at, message=f"队列休息中，预计 {datetime.fromtimestamp(resume_at, BEIJING):%H:%M:%S} 按顺序继续")
+        return task
+
     @app.post("/api/tasks", dependencies=[Depends(authorize)])
-    async def add_task(body: TaskInput):
+    def add_task(body: TaskInput):
         kind, link = normalize_input(body.link, body.kind)
         return public_task(store.create_task(link, kind, body.accept_quality))
 
     @app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(authorize)])
-    async def retry(task_id: str, existing_task_id: str | None = Query(default=None, pattern=r'^[0-9a-f]{16}$')):
+    def retry(task_id: str, existing_task_id: str | None = Query(default=None, pattern=r'^[0-9a-f]{16}$')):
         return public_task(service.retry(task_id, existing_task_id))
 
     @app.post('/api/tasks/{task_id}/pause', dependencies=[Depends(authorize)])
@@ -682,7 +752,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return public_task(await service.pause(task_id))
 
     @app.post('/api/tasks/{task_id}/resume', dependencies=[Depends(authorize)])
-    async def resume_task(task_id: str):
+    def resume_task(task_id: str):
         return public_task(store.resume_task(task_id))
 
     @app.post('/api/queue/pause', dependencies=[Depends(authorize)])
@@ -690,11 +760,11 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return {'changed': await service.pause_all(), 'skipped': []}
 
     @app.post('/api/queue/resume', dependencies=[Depends(authorize)])
-    async def resume_queue():
+    def resume_queue():
         return {'changed': store.resume_queue(), 'skipped': []}
 
     @app.post("/api/tasks/{task_id}/confirm", dependencies=[Depends(authorize)])
-    async def confirm(task_id: str):
+    def confirm(task_id: str):
         return public_task(service.confirm(task_id))
 
     @app.post("/api/tasks/{task_id}/cancel", dependencies=[Depends(authorize)])
@@ -704,7 +774,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     @app.delete('/api/tasks/{task_id}', dependencies=[Depends(authorize)])
     async def delete_task(task_id: str):
         await service.cancel(task_id)
-        store.delete_task(task_id)
+        await service.database(store.delete_task, task_id)
         return {'deleted': task_id}
 
     @app.post('/api/tasks/batch', dependencies=[Depends(authorize)])
@@ -713,19 +783,19 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         for task_id in dict.fromkeys(body.ids):
             try:
                 if body.action == 'retry':
-                    service.retry(task_id)
+                    await service.database(service.retry, task_id)
                 elif body.action == 'pause':
                     await service.pause(task_id)
                 elif body.action == 'resume':
-                    store.resume_task(task_id)
+                    await service.database(store.resume_task, task_id)
                 elif body.action == 'cancel':
-                    task = store.task(task_id)
+                    task = await service.database(store.task, task_id)
                     if not task or task['status'] in {'completed', 'cancelled'}:
                         raise ValueError('任务已结束或不存在')
                     await service.cancel(task_id)
                 else:
                     await service.cancel(task_id)
-                    store.delete_task(task_id)
+                    await service.database(store.delete_task, task_id)
                 changed.append(task_id)
             except ValueError as exc:
                 skipped.append({'id': task_id, 'reason': str(exc)})
@@ -739,15 +809,62 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return result
 
     @app.put("/api/favorites/{work_id}", dependencies=[Depends(authorize)])
-    async def favorite_work(work_id: str, body: FavoriteInput):
+    def favorite_work(work_id: str, body: FavoriteInput):
         if not store.work(work_id):
             raise HTTPException(404,"作品不存在")
         store.set_favorite(work_id,body.favorite)
         return {"favorite":body.favorite}
 
+    @app.get('/api/comment-accounts', dependencies=[Depends(authorize)])
+    def comment_accounts():
+        return store.comment_accounts.status()
+
+    @app.post('/api/comment-accounts/secondary-cookie', dependencies=[Depends(authorize)])
+    def comment_account_secondary_cookie(body: dict):
+        if set(body) != {'cookie'}:
+            raise HTTPException(422, '请提交小号 Cookie')
+        browser_comments.expire()
+        return store.comment_accounts.bind_cookie(body['cookie'])
+
+    @app.post('/api/comment-accounts/bind', dependencies=[Depends(authorize)])
+    def comment_account_bind_start(body: dict):
+        if set(body) != {'role'}:
+            raise HTTPException(422, '账号角色无效')
+        return store.comment_accounts.bind_start(body['role'])
+
+    @app.get('/api/comment-accounts/bind/{nonce}', dependencies=[Depends(authorize)])
+    def comment_account_bind_view(nonce: str):
+        return store.comment_accounts.bind_view(nonce)
+
+    @app.post('/api/comment-accounts/bind/{nonce}', dependencies=[Depends(authorize)])
+    def comment_account_bind(nonce: str, body: dict):
+        if set(body) != {'fingerprint'}:
+            raise HTTPException(422, '账号身份无效')
+        browser_comments.expire()
+        return store.comment_accounts.bind(nonce, body['fingerprint'])
+
+    @app.post('/api/comment-accounts/pause', dependencies=[Depends(authorize)])
+    def comment_account_pause(body: dict):
+        if body:
+            raise HTTPException(422, '输入无效')
+        return store.comment_accounts.pause()
+
+    @app.post('/api/comment-accounts/resume', dependencies=[Depends(authorize)])
+    def comment_account_resume(body: dict):
+        if set(body) != {'acknowledge'}:
+            raise HTTPException(422, '请确认已处理验证')
+        return store.comment_accounts.resume(body['acknowledge'])
+
+    @app.post('/api/comment-accounts/blocked', dependencies=[Depends(authorize)])
+    def comment_account_blocked(body: dict):
+        if set(body) != {'fingerprint'}:
+            raise HTTPException(422, '账号身份无效')
+        return store.comment_accounts.blocked(body['fingerprint'])
+
     def comment_target(work_id):
         if not re.fullmatch(r'[A-Za-z0-9_-]{1,160}', work_id):
             raise HTTPException(404, '作品不存在')
+        browser_comments.expire()
         real_id = store.comment_work_id(work_id)
         try:
             work = store.work(work_id)
@@ -767,17 +884,70 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                             headers={'Cache-Control': 'no-store'})
 
     @app.post('/api/works/{work_id}/comments', dependencies=[Depends(authorize)])
-    async def save_comments(work_id: str, body: CommentInput):
+    def save_comments(work_id: str, body: CommentInput):
         real_id, can_save, _ = comment_target(work_id)
         if not can_save:
             raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
-        return JSONResponse(service.comments.queue(real_id, body.action), status_code=202,
+        try:
+            state = service.comments.queue(real_id, body.action, body.account_role, body.allow_primary)
+        except RuntimeError as exc:
+            raise HTTPException(409, str(exc)) from None
+        return JSONResponse(state, status_code=202,
                             headers={'Cache-Control': 'no-store'})
 
+    @app.post('/api/works/{work_id}/comments/browser', dependencies=[Depends(authorize)])
+    def start_browser_comments(work_id: str, body: CommentInput):
+        real_id, can_save, _ = comment_target(work_id)
+        if not can_save:
+            raise HTTPException(409, '暂时无法识别原作品，不能保存评论')
+        return JSONResponse(browser_comments.start(real_id, body.action, body.account_role, body.allow_primary), headers={'Cache-Control': 'no-store'})
+
+    def browser_identity(request):
+        return request.headers.get('X-Cloudrift-Comment-Client', ''), request.headers.get('X-Cloudrift-Comment-Identity', '')
+
+    @app.post('/api/works/{work_id}/comments/browser/{token}/claim', dependencies=[Depends(authorize)])
+    def claim_browser_comments(work_id: str, token: str, body: dict):
+        if set(body) != {'fingerprint', 'client_id'} or not all(isinstance(v, str) for v in body.values()):
+            raise HTTPException(422, '浏览器身份无效')
+        return browser_comments.claim(work_id, token, body['fingerprint'], body['client_id'])
+
+    @app.get('/api/works/{work_id}/comments/browser/{token}', dependencies=[Depends(authorize)])
+    def browser_comment_session(work_id: str, token: str, request: Request):
+        return JSONResponse(browser_comments.get(work_id, token, *browser_identity(request)), headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/works/{work_id}/comments/browser/{token}/permit', dependencies=[Depends(authorize)])
+    def browser_comment_permit(work_id: str, token: str, body: dict, request: Request):
+        if set(body) != {'root_id', 'cursor'}:
+            raise HTTPException(422, '评论分页无效')
+        return browser_comments.permit(work_id, token, *browser_identity(request), body['root_id'], body['cursor'])
+
+    @app.post('/api/works/{work_id}/comments/browser/{token}/page', dependencies=[Depends(authorize)])
+    async def browser_comment_page(work_id: str, token: str, request: Request):
+        parts, size = [], 0
+        async for part in request.stream():
+            size += len(part)
+            if size > 2 * 1024 * 1024:
+                raise HTTPException(413, '评论页面过大')
+            parts.append(part)
+        try:
+            body = json.loads(b''.join(parts))
+        except (ValueError, UnicodeError):
+            raise HTTPException(422, '评论页面格式无效') from None
+        if not isinstance(body, dict) or set(body) != {'root_id', 'cursor', 'payload', 'permit'}:
+            raise HTTPException(422, '评论页面格式无效')
+        return JSONResponse(await run_blocking(browser_comments.page, work_id, token, *browser_identity(request), body['root_id'], body['cursor'], body['payload'], body['permit']),
+                            headers={'Cache-Control': 'no-store'})
+
+    @app.post('/api/works/{work_id}/comments/browser/{token}/finish', dependencies=[Depends(authorize)])
+    def finish_browser_comments(work_id: str, token: str, body: dict, request: Request):
+        if set(body) != {'status'} or not isinstance(body['status'], str):
+            raise HTTPException(422, '结束状态无效')
+        return JSONResponse(browser_comments.finish(work_id, token, *browser_identity(request), body['status']), headers={'Cache-Control': 'no-store'})
+
     @app.post('/api/works/{work_id}/comments/cancel', dependencies=[Depends(authorize)])
-    async def cancel_comments(work_id: str):
+    def cancel_comments(work_id: str):
         real_id, _, state = comment_target(work_id)
-        return JSONResponse(service.comments.cancel(real_id) if real_id else state,
+        return JSONResponse(browser_comments.cancel(real_id) if real_id else state,
                             headers={'Cache-Control': 'no-store'})
 
     @app.get('/api/works/{work_id}/comments/export', dependencies=[Depends(authorize)])
@@ -807,11 +977,11 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
                                           'Content-Security-Policy': "default-src 'none'; sandbox"})
 
     @app.post('/api/browse-history', dependencies=[Depends(authorize)])
-    async def record_browse_history(body: BrowseHistoryInput):
+    def record_browse_history(body: BrowseHistoryInput):
         return {'accepted': store.record_browse_history([item.model_dump() for item in body.items])}
 
     @app.get('/api/browse-history', dependencies=[Depends(authorize)])
-    async def browse_history(limit: int = Query(default=50, ge=1, le=100), before: str | None = Query(default=None, max_length=61)):
+    def browse_history(limit: int = Query(default=50, ge=1, le=100), before: str | None = Query(default=None, max_length=61)):
         if before is not None:
             parts = before.split('|')
             if len(parts) != 2 or not re.fullmatch(r'[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}', parts[1]):
@@ -823,11 +993,11 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return JSONResponse(store.browse_history(limit, before), headers={'Cache-Control': 'no-store'})
 
     @app.get("/api/authors/history", dependencies=[Depends(authorize)])
-    async def author_history():
+    def author_history():
         return store.author_history()
 
     @app.get("/api/legacy", dependencies=[Depends(authorize)])
-    async def legacy_status():
+    def legacy_status():
         return legacy.status()
 
     @app.post("/api/legacy/scan", dependencies=[Depends(authorize)])
@@ -835,7 +1005,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return legacy.start()
 
     @app.get("/api/authors", dependencies=[Depends(authorize)])
-    async def authors():
+    def authors():
         return store.authors()
 
     @app.get('/api/author-count', dependencies=[Depends(authorize)])
@@ -871,7 +1041,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return JSONResponse({'sec_uid': sec_uid, 'count': count}, headers=headers)
 
     @app.post("/api/authors", dependencies=[Depends(authorize)])
-    async def add_author(body: AuthorInput):
+    def add_author(body: AuthorInput):
         kind, url = normalize_input(body.url, "author")
         if "\n" in url:
             raise ValueError("每次添加一个博主")
@@ -891,7 +1061,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return store.author(author["id"])
 
     @app.patch("/api/authors/{author_id}", dependencies=[Depends(authorize)])
-    async def patch_author(author_id: str, body: AuthorPatch):
+    def patch_author(author_id: str, body: AuthorPatch):
         if not store.author(author_id):
             raise HTTPException(404, "博主不存在")
         values = body.model_dump(exclude_none=True)
@@ -906,7 +1076,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return store.author(author_id)
 
     @app.post("/api/authors/{author_id}/check", dependencies=[Depends(authorize)])
-    async def check_author(author_id: str):
+    def check_author(author_id: str):
         author = store.author(author_id)
         if not author:
             raise HTTPException(404, "博主不存在")
@@ -928,7 +1098,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     @app.get('/api/media/{work_id}/{index}/playback', dependencies=[Depends(authorize)])
     async def prepare_playback(work_id: str, index: int, force: bool = False, retry: bool = False, warm: bool = False):
         try:
-            result = await playback.prepare(media_path(work_id,index),force=force,retry=retry,warm=warm)
+            result = await playback.prepare(await run_blocking(media_path, work_id, index),force=force,retry=retry,warm=warm)
         except RuntimeError as exc:
             result = {'status':'failed','message':str(exc)}
         if result['status']=='ready':
@@ -937,7 +1107,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
 
     @app.get("/api/media/{work_id}/{index}", dependencies=[Depends(authorize)])
     async def media(work_id: str, index: int, compatible: bool = False):
-        path=media_path(work_id,index)
+        path=await run_blocking(media_path, work_id, index)
         if compatible:
             ready=playback.ready(path)
             if ready is None and playback.streaming(path):

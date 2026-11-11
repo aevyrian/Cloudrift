@@ -8,8 +8,10 @@
   <link rel="icon" type="image/svg+xml" href="favicon.svg?v=20261028-name1">
   <link rel="stylesheet" href="style.css?v=20261031-cookie2">
   <link rel="stylesheet" href="/static/task-view.css?v=20261031-cookie2">
-  <script src="/static/task-view.js?v=20261031-cookie2" defer></script>
-  <script src="app.js?v=20261031-cookie2" defer></script>
+  <script src="/static/task-view.js?v=1.4.9" defer></script>
+  <link rel="stylesheet" href="/static/comment-entry.css?v=20261031-entry1">
+  <script src="/static/comment-entry.js?v=20261031-background1" defer></script>
+  <script src="app.js?v=1.4.9" defer></script>
 </head>
 <body>
   <section id="connection" class="connection" aria-label="抖音收藏库 管理员入口">
@@ -88,6 +90,7 @@
         </div>
       </section>
       <section id="view-authors" class="view" hidden>
+        <section id="comment-batch-panel" class="panel comment-batch-panel" aria-label="订阅评论补全进度" hidden><div class="settings-panel-title"><h2>补全评论</h2><div><button id="comment-batch-resume" class="secondary" type="button" hidden>继续补全</button> <button id="comment-batch-stop" class="secondary" type="button">停止补全</button></div></div><p id="comment-batch-status" role="status" aria-live="polite"></p><a id="comment-batch-link" class="secondary link-button" target="_blank" rel="noopener noreferrer" hidden>打开抖音继续补全 ↗</a><p class="hint">任务和进度保存在服务器，关闭收藏库网页后仍保留。软件自带通道可完全后台运行；浏览器补全需要助手 1.13.1，保持抖音助手页，可能需要打开评论区或展开回复。中断后请检查原因，再点“继续补全”。</p></section>
         <div class="panel"><h2>添加博主</h2><p class="muted">默认下载一次，不订阅。需要追更时选择3天／7天／每月／季度／每年，下载过的博主会保留在下方历史中。</p><form id="author-form" class="form-row"><label class="sr-only" for="author-url">博主页地址</label><input id="author-url" type="url" required placeholder="https://www.douyin.com/user/…"><label class="sr-only" for="author-name">备注名</label><input id="author-name" placeholder="备注名（可选）"><label class="followup-label" for="author-frequency">后续更新<select id="author-frequency"><option value="once">仅下载一次（默认）</option><option value="three_days">每3天更新</option><option value="weekly">每7天更新</option><option value="monthly">每月更新</option><option value="quarterly">每季度更新</option><option value="yearly">每年更新</option></select></label><button class="primary" type="submit">开始下载</button></form></div>
         <div class="collection-toolbar"><label for="author-sort">排序</label><select id="author-sort"><option value="star">星标优先</option><option value="last">最近检查</option><option value="next">下次更新时间</option><option value="name">博主名字</option></select><span class="hint">北京时间08:00–18:00分散更新，每次只登记一位博主</span></div><div id="author-list" class="card-list"></div>
       </section>
@@ -101,9 +104,21 @@
       <section id="view-settings" class="view settings-grid" hidden>
         <form id="settings-form" class="panel settings-panel"><div class="settings-panel-title"><h2>下载设置</h2><button id="cookie-sync-button" class="secondary" type="button">更新 Cookie</button></div><div id="cookie-sync-status" class="notice" role="status" aria-live="polite" hidden><span id="cookie-sync-message"></span> <a id="cookie-sync-link" href="#" target="_blank" rel="noopener noreferrer" hidden>打开抖音继续同步 ↗</a></div><label for="cookie">抖音 Cookie <span id="cookie-state" class="badge"></span><span id="cookie-account" class="cookie-account" aria-live="polite"></span></label><textarea id="cookie" rows="4" autocomplete="off" spellcheck="false" placeholder="粘贴新的 Cookie；留空保留现有配置"></textarea><p class="hint">也可点击上方“更新 Cookie”；请先在当前浏览器安装助手并登录抖音，首次可能需要允许读取。Cookie 仅写入服务端，不会回显。</p><button id="clear-cookie" class="secondary clear-cookie-button" type="button">清除已保存的 Cookie</button><label for="download-dir">下载目录（容器内路径）</label><input id="download-dir" required placeholder="/media 或 /media/收藏"><p id="download-dir-hint" class="hint">文件保存在媒体挂载目录内；更换 NAS 磁盘请修改 Compose 挂载。修改后已有作品仍可观看。</p><label for="quality-policy">下载方式</label><select id="quality-policy"><option value="upstream">自动采用核心优选画质（默认）</option><option value="confirm">每次先让我确认画质</option></select><p class="hint">默认提交就下载，不保证最高画质或无水印；需要逐次确认时可自行切换。博主追更只在博主页按需选择。</p><button type="submit" class="primary">保存设置</button></form>
         <div class="settings-side">
+          <form id="comment-channel-form" class="panel settings-panel"><h2>评论下载通道</h2><p class="hint">作品里的“加载更新”和订阅里的“补全评论”都使用这里保存的通道。</p><fieldset class="comment-channel-options"><legend class="sr-only">选择评论下载通道</legend><label class="comment-channel-option"><input type="radio" name="comment-channel" value="core"><span><strong>软件自带</strong><small>由服务器下载评论，使用后台已配置的大号；每次开始时确认。</small></span></label><label class="comment-channel-option"><input type="radio" name="comment-channel" value="browser" checked><span><strong>浏览器补全</strong><small>使用后加的助手通道，默认绑定的小号浏览器；需保持抖音页面打开。</small></span></label></fieldset><div class="comment-channel-footer"><button type="submit" class="primary">保存通道</button><span id="comment-channel-message" class="hint" role="status" aria-live="polite"></span></div><p class="hint">账号未绑定或评论已暂停时，请在下方完成账号设置。选择通道不会自动开始采集。</p></form>
+          <section class="panel settings-panel"><h2>评论账号分流</h2>
+            <p class="hint">大号自动使用左侧视频下载账号。小号直接粘贴 Cookie，提交后会在这里显示结果。</p>
+            <p id="comment-account-primary"></p><p id="comment-account-secondary"></p><p id="comment-account-state" role="status" aria-live="polite"></p>
+            <button id="comment-bind-primary" class="secondary" type="button">刷新账号状态</button>
+            <label for="comment-secondary-cookie">小号 Cookie</label>
+            <input id="comment-secondary-cookie" type="password" maxlength="30000" autocomplete="off" spellcheck="false" placeholder="粘贴已登录小号的完整 Cookie">
+            <p class="hint">Cookie 仅用于本次识别绑定身份，提交后清空。浏览器补抓仍需在装有助手的浏览器中登录这个小号；绑定不会开始抓取。</p>
+            <button id="comment-bind-secondary" class="primary" type="button">识别并绑定小号</button>
+            <p id="comment-account-message" class="hint" role="status" aria-live="polite"></p>
+            <p><button id="comment-pause" class="secondary" type="button">暂停评论</button> <button id="comment-resume" class="secondary" type="button">我已处理验证，解除评论暂停</button></p>
+          </section>
           <section id="legacy-panel" class="panel" hidden><p class="eyebrow">EXISTING COLLECTION</p><h2>原有作品</h2><p class="muted">只读浏览原有文件，图片按作品合并。不会搬迁、改名或自动追更；新下载直接使用同一 Volume，已有作品核对后跳过。</p><p id="legacy-state" role="status" aria-live="polite"></p><button id="scan-legacy" class="secondary" type="button">重新扫描文件</button><p class="hint">旧下载工具又添加了文件时，点这里更新目录。扫描时先暂停无法核对的新下载，任务保留可重试。</p></section>
           <form id="admin-key-form" class="panel settings-panel"><p class="eyebrow">ADMINISTRATOR</p><h2>管理员密钥</h2><p class="muted">这是你设置的网站管理密码，可管理下载、Cookie 和追更。</p><label for="new-admin-key">新管理员密钥</label><input id="new-admin-key" type="password" required minlength="8" maxlength="128" autocomplete="new-password" placeholder="8–128 位英文、数字或符号"><label for="repeat-admin-key">确认新密钥</label><input id="repeat-admin-key" type="password" required minlength="8" maxlength="128" autocomplete="new-password" placeholder="再次输入新密钥"><p class="hint">保存后旧密钥立即失效，其他浏览器需重新登录，抖音收藏库助手 也需重新填写密钥。</p><button class="primary" type="submit">保存新密钥</button><p id="admin-key-message" class="hint" role="status" aria-live="polite"></p></form>
-          <section class="panel"><h2>抖音收藏库助手</h2><p class="muted">在抖音推荐视频、作品或博主页点圆角方形下载按钮，可下载当前作品、立即更新博主，或设置更新周期。网站地址和密钥在助手的连接设置中填写。</p><a href="/douyin-send.user.js" class="secondary link-button">安装发送脚本 ↗</a><label for="script-server">网站地址</label><input id="script-server" readonly><label for="script-token">管理员密钥（供脚本连接）</label><div class="secret-row"><input id="script-token" type="password" readonly autocomplete="off"><button id="reveal-token" class="secondary" type="button">显示</button></div><p class="hint">脚本目前使用同一个管理员密钥，请只配置到自己的浏览器。仅点击同步时读取 Cookie，下载提交不附带 Cookie。</p></section><section class="panel"><h2>运行状态</h2><dl id="system-status"></dl></section>
+          <section class="panel"><h2>抖音收藏库助手</h2><p class="muted">在抖音推荐视频、作品或博主页点圆角方形下载按钮，可下载当前作品、立即更新博主，或设置更新周期。网站地址和密钥在助手的连接设置中填写。</p><a href="/douyin-send.user.js" class="secondary link-button">安装发送脚本 ↗</a><label for="script-server">网站地址</label><input id="script-server" readonly><label for="script-token">管理员密钥（供脚本连接）</label><div class="secret-row"><input id="script-token" type="password" readonly autocomplete="off"><button id="reveal-token" class="secondary" type="button">显示</button></div><p class="hint">脚本目前使用同一个管理员密钥，请只配置到自己的浏览器。浏览器补抓会核对当前登录身份；“更新 Cookie”会保存下载 Cookie，小号绑定会临时提交 Cookie 以识别身份，不保存原文。下载提交不附带 Cookie。</p></section><section class="panel"><h2>运行状态</h2><dl id="system-status"></dl></section>
         </div>
       </section>
     </main>

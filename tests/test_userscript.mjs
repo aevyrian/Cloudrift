@@ -119,7 +119,7 @@ assert.equal(moveGallery(1, 1, 3), 2);
 assert.equal(moveGallery(2, 1, 3), 2);
 assert.equal(moveGallery(0, 1, 0), 0);
 // Execute the Sender in a small browser stub, exercising the actual request and UI flow.
-function browser(url = subscribedURL, {feed = null, preview = null, pageDocument = null, profileFetch = () => Promise.reject(new Error('profile unavailable'))} = {}) {
+function browser(url = subscribedURL, {feed = null, preview = null, pageDocument = null, profileFetch = () => Promise.reject(new Error('profile unavailable')), pageContext = null, captcha = null, onCommentClaim = null} = {}) {
   const elements = [], requests = [], profileRequests = [], callbacks = {}, frame = [];
   const fetchProfile=(url,options)=>{profileRequests.push({url,options});return profileFetch(url,options)};
   function element(tag) {
@@ -140,27 +140,36 @@ function browser(url = subscribedURL, {feed = null, preview = null, pageDocument
     };
     elements.push(el);return el;
   }
-  const page = new URL(url), storage={library_server:'http://nas.example:8090',library_token:'test-token'};
+  const page = new URL(url), storage={library_server:'http://nas.example:8090',library_token:'test-token'};let commentFixture=null;
   const doc={body:element('body'),createElement:element,
     querySelector(selector){return selector==='h1'?{textContent:page.pathname.includes('someone_else')?'乙博主':'甲博主'}:null},
-    querySelectorAll(selector){if(selector==='[data-e2e="feed-active-video"]')return feed?[feed]:[];if(selector==='[data-e2e="video-detail"], [data-e2e="note-detail"]')return preview?[preview]:[];return []},addEventListener(name,fn){callbacks['document:'+name]=fn}};
+    querySelectorAll(selector){if(selector==='#captcha_container, [class*=captcha_verify_container]')return captcha?.visible?[captcha]:[];if(selector==='[data-e2e="feed-active-video"]')return feed?[feed]:[];if(selector==='[data-e2e="video-detail"], [data-e2e="note-detail"]')return preview?[preview]:[];return []},addEventListener(name,fn){callbacks['document:'+name]=fn}};
   const observer=class {constructor(fn){callbacks.mutation=fn}observe(){}disconnect(){}};
-  runInNewContext(readFileSync(script,'utf8'),{URL,document:doc,unsafeWindow:pageDocument?{document:pageDocument,fetch:fetchProfile}:undefined,fetch:fetchProfile,AbortSignal,location:page,innerWidth:1200,innerHeight:800,crypto:webcrypto,TextEncoder,
+  if(pageContext)pageContext.document=doc;
+  runInNewContext(readFileSync(script,'utf8'),{URL,document:doc,unsafeWindow:pageContext|| (pageDocument?{document:pageDocument,fetch:fetchProfile}:undefined),fetch:fetchProfile,AbortSignal,location:page,innerWidth:1200,innerHeight:800,crypto:webcrypto,TextEncoder,
     GM_getValue(key,fallback){return storage[key]??fallback}, GM_setValue(key,value){storage[key]=value},
     GM_listValues(){return Object.keys(storage)}, GM_deleteValue(key){delete storage[key]},
-    GM_registerMenuCommand(){},GM_xmlhttpRequest(request){requests.push(request)},
+    GM_registerMenuCommand(){},GM_cookie(_method,_options,callback){callback([{name:'uid_tt',value:'test-uid',domain:'.douyin.com'},{name:'sessionid',value:'test-session',domain:'.douyin.com'}]);},
+    GM_xmlhttpRequest(request){requests.push(request);const path=new URL(request.url).pathname;
+      let value;if(path==='/api/comment-accounts'&&request.method==='GET')value={identity_salt:'ab'.repeat(32),paused:false,default_role:'secondary',primary:{bound:true},secondary:{bound:true}};
+      else if(path.endsWith('/claim')&&commentFixture){onCommentClaim?.();value=commentFixture;}
+      else if(/\/comments\/browser\/[a-f0-9]{32}$/.test(path)&&request.method==='GET'&&commentFixture)value=commentFixture;
+      else if(path.endsWith('/permit')&&commentFixture)value={ready:true,permit:'c'.repeat(32)};
+      else if(path==='/api/comment-accounts/blocked')value={paused:true};
+      if(value)queueMicrotask(()=>request.onload({status:200,responseText:JSON.stringify(value)}));},
     DOMParser:class{parseFromString(text){return {title:text.startsWith('<title>验证码中间页</title>')?'验证码中间页':'',scripts:[{textContent:text}]}}},ResizeObserver:class{observe(){}disconnect(){}},MutationObserver:observer,
     addEventListener(name,fn){callbacks[name]=fn},
     requestAnimationFrame(fn){frame.push(fn);return frame.length},cancelAnimationFrame(){},
-    setInterval(fn){callbacks.detect=fn},setTimeout(fn){frame.push(fn);return frame.length},clearTimeout(){}});
+    setInterval(fn,delay){if(delay===250){callbacks.watchCaptcha=fn;return 250;}if(delay===1000){callbacks.watchIdentity=fn;return 1000;}callbacks.detect=fn;return 1500},clearInterval(id){if(id===250)delete callbacks.watchCaptcha;if(id===1000)delete callbacks.watchIdentity},setTimeout(fn,delay){if(onCommentClaim)return setTimeout(fn,delay);frame.push(fn);return frame.length},clearTimeout(id){if(onCommentClaim)clearTimeout(id)}});
   const find=(value,prop='textContent')=>elements.find(el=>el[prop]===value);
   const byClass=value=>elements.find(el=>el.className?.split(/\s+/).includes(value));
   function go(next){page.href=next;callbacks.detect();while(frame.length)frame.shift()()}
-  function respond(request,data,status=200){assert.ok(request,'预期请求不存在');request.onload({status,responseText:JSON.stringify(data)})}
+  function respond(request,data,status=200){assert.ok(request,'预期请求不存在');if(data?.work_id&&data?.token)commentFixture=data;request.onload({status,responseText:JSON.stringify(data)})}
   return {elements,requests,profileRequests,callbacks,frame,storage,page,find,byClass,go,respond,
     host:elements.find(el=>el.id==='douyin-library-sender')};
 }
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
+const until=async(fn)=>{for(let i=0;i<1500&&!fn();i++)await new Promise(resolve=>setTimeout(resolve,2));assert.ok(fn(),'模拟操作未完成');};
 const authorB='https://www.douyin.com/user/MS4wLjABAAAA_someone_else';
 const authorA={id:'a',url:subscribedURL,name:'甲博主',enabled:true,interval_minutes:129600,next_check:1793448000};
 const knownB={id:'b',url:authorB,name:'乙博主',enabled:true,interval_minutes:10080,next_check:1793534400};
@@ -535,4 +544,47 @@ for(const bad of [{sec_uid:authorB.split('/').pop(),count:7},{sec_uid:subscribed
  assert.equal(invalidCount.byClass('work-count').textContent,'· 数量暂不可用','拒绝错误作者或无效数量');
  invalidCount.callbacks.detect();assert.equal(invalidCount.requests.filter(r=>new URL(r.url).pathname==='/api/author-count').length,1,'失败不自动循环请求');
 }
+const commentsError=browser(`https://www.douyin.com/video/${sample}`);activate(commentsError);
+const scriptVersion=readFileSync(script,'utf8').match(/^\/\/ @version\s+(\S+)/m)?.[1];
+assert.ok(scriptVersion&&commentsError.find(`助手 ${scriptVersion}`),'面板显示当前助手版本');
+commentsError.find('保存评论').click();
+await until(()=>request(commentsError,'POST',`/api/works/${sample}/comments/browser`));
+commentsError.respond(request(commentsError,'POST',`/api/works/${sample}/comments/browser`),{detail:'评论分页已过期，请重新开始'},409);await tick();
+assert.ok(commentsError.find('评论分页已过期，请重新开始'),'评论冲突显示服务端具体原因');
+function commentPage() {
+  const sent=[];
+  class XHR {
+    constructor(){this.events={};sent.push(this);}
+    open(method,url){this.method=method;this.url=url;}
+    setRequestHeader(){}
+    addEventListener(name,fn){(this.events[name]??=[]).push(fn);}
+    send(){this.sent=true;}
+    abort(){this.aborted=true;this.onabort?.();}
+  }
+  return {sent,window:{XMLHttpRequest:XHR,Headers,fetch:async()=>({url:''}),localStorage:{getItem:()=>''},getComputedStyle:()=>({display:'block',visibility:'visible'})}};
+}
+const commentToken='a'.repeat(32),commentPath=`/api/works/${sample}/comments/browser`,commentTemplateURL=`https://www.douyin.com/aweme/v1/web/comment/list/?aweme_id=${sample}`;
+const captcha={visible:false,getBoundingClientRect:()=>({width:100,height:100})};
+const rootOnly=commentPage(),rootOnlyBrowser=browser(`https://www.douyin.com/video/${sample}`,{pageContext:rootOnly.window,captcha,onCommentClaim(){const naturalRoot=new rootOnly.window.XMLHttpRequest();naturalRoot.open('GET',commentTemplateURL);naturalRoot.send();}});
+rootOnlyBrowser.find('保存评论').click();await until(()=>request(rootOnlyBrowser,'POST',commentPath));
+rootOnlyBrowser.respond(request(rootOnlyBrowser,'POST',commentPath),{work_id:sample,token:commentToken,account_role:'secondary',status:{operation:'browser'},next:{root_id:'123',cursor:0}});
+await until(()=>rootOnlyBrowser.find('请在当前作品手动展开一组回复后继续，借用当前登录浏览器保存。'));
+assert.equal(rootOnly.sent.length,1,'只有一级模板时不能自行发出回复请求');
+rootOnlyBrowser.find('停止补抓').click();
+const protectedPage=commentPage(),protectedBrowser=browser(`https://www.douyin.com/video/${sample}`,{pageContext:protectedPage.window,captcha,onCommentClaim(){const observed=new protectedPage.window.XMLHttpRequest();observed.open('GET',commentTemplateURL);observed.send();}});
+protectedBrowser.find('保存评论').click();await until(()=>request(protectedBrowser,'POST',commentPath));
+const rootSession={work_id:sample,token:commentToken,account_role:'secondary',status:{operation:'browser'},next:{root_id:'',cursor:0}};
+protectedBrowser.respond(request(protectedBrowser,'POST',commentPath),rootSession);
+await until(()=>protectedPage.sent.length>=2&&protectedPage.sent.at(-1).sent);
+const pendingXHR=protectedPage.sent.at(-1);
+captcha.visible=true;protectedBrowser.callbacks.watchCaptcha();await until(()=>pendingXHR.aborted);
+await until(()=>request(protectedBrowser,'POST',commentPath+'/'+commentToken+'/finish'));const blockedFinish=request(protectedBrowser,'POST',commentPath+'/'+commentToken+'/finish');
+assert.equal(body(blockedFinish).status,'blocked');
+protectedBrowser.respond(blockedFinish,{});await tick();captcha.visible=false;protectedBrowser.callbacks.detect();await tick();
+assert.equal(protectedPage.sent.length,2,'验证消失后不自动恢复请求');
+const blockedBeforeStart=commentPage();captcha.visible=true;
+const blockedBrowser=browser(`https://www.douyin.com/video/${sample}`,{pageContext:blockedBeforeStart.window,captcha});
+blockedBrowser.find('保存评论').click();await tick();
+assert.equal(request(blockedBrowser,'POST',commentPath),undefined,'已有验证时不创建新补抓任务');
+assert.equal(blockedBeforeStart.sent.length,0,'已有验证时不发抖音请求');captcha.visible=false;
 console.log('PASS: 作品/作者识别、直播博主下载与订阅、作品总数与切换隔离、订阅与提交反馈、媒体凭据边界、视图暂停、图集边界');

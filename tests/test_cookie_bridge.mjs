@@ -30,6 +30,7 @@ const body=req=>JSON.parse(req.data);
   assert.equal(b.requests.length,1,'同步入口先查询服务端等待状态');
   assert.equal(b.requests[0].method,'GET');
   assert.equal(new URL(b.requests[0].url).pathname,`/api/cookie-sync/${nonce}`);
+  assert.equal(b.requests[0].headers.Authorization,'Bearer test-key');
   assert.equal(b.reads.length,0,'尚未确认一次性请求时不能读取 Cookie');
   assert.equal(b.page.hash,'','同步标识读取后立即从地址栏移除');
   b.respond(b.requests[0],{status:'waiting'});await tick();
@@ -37,12 +38,15 @@ const body=req=>JSON.parse(req.data);
   b.reads[0].done([{name:'sid_tt',value:'fixture-token',domain:'.douyin.com',path:'/',httpOnly:true},{name:'extra',value:'ok',domain:'www.douyin.com',path:'/',httpOnly:false}],undefined);await tick();
   assert.equal(b.requests.length,2);assert.equal(b.requests[1].method,'POST');
   assert.deepEqual(body(b.requests[1]),{cookie:'sid_tt=fixture-token; extra=ok'},'包含 HttpOnly 且保持返回顺序');
+  assert.equal(b.requests[1].headers.Authorization,'Bearer test-key');
   assert.ok(!b.requests[1].url.includes('fixture-token'),'Cookie 不能出现在 URL');
+  assert.equal(b.closes.length,0,'网站未确认收到前不能关闭临时页');
   b.respond(b.requests[1],{status:'validating'});await tick();
   assert.equal(b.closes.length,1,'提交成功后自动关闭同步页，不再显示横幅');
+  assert.ok(!b.elements.some(n=>n.textContent.includes('fixture-token')),'页面不得显示 Cookie');
 }
 for(const status of [{status:'expired'},{status:'validating'},{status:'done'}]){
-  const b=browser();b.respond(b.requests[0],status);await tick();assert.equal(b.reads.length,0,'请求不在等待状态不能读取');assert.equal(b.requests.length,1,'无有效请求不能发送 Cookie');
+  const b=browser();b.respond(b.requests[0],status);await tick();assert.equal(b.reads.length,0,'请求不在等待状态不能读取');assert.equal(b.requests.length,1,'无有效请求不能发送 Cookie');assert.equal(b.closes.length,1,'无效或已使用的同步入口应关闭');
 }
 {
   const b=browser();b.respond(b.requests[0],{detail:'not allowed'},401);await tick();assert.equal(b.reads.length,0,'未授权不能读取');assert.equal(b.requests.length,1);

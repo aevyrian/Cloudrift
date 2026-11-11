@@ -8,6 +8,7 @@ from unittest.mock import AsyncMock, patch
 from fastapi.testclient import TestClient
 
 from app.main import make_app
+from test_comment_fixtures import setup_comment_accounts
 
 
 WORK = '7431234567890123456'
@@ -31,6 +32,8 @@ class CommentApiTests(unittest.TestCase):
         self.auth = {'Authorization': 'Bearer test-comments-key'}
         self.store = self.app.state.store
         self.store.save_work({'id': WORK, 'desc': 'local work', 'type': '视频'}, ['video.mp4'])
+        setup_comment_accounts(self.store)
+        self.core_body = {'action': 'save', 'account_role': 'primary', 'allow_primary': True}
         self.url = f'/api/works/{WORK}/comments'
 
     def test_all_comment_routes_require_header_auth_not_query_key(self):
@@ -52,7 +55,7 @@ class CommentApiTests(unittest.TestCase):
             self.assertEqual(data['status']['operation'], 'unsaved')
             self.assertEqual(data['items'], [])
             self.assertIn('no-store', response.headers['cache-control'])
-            saved = self.client.post(self.url, headers=self.auth, json={'action': 'save'})
+            saved = self.client.post(self.url, headers=self.auth, json=self.core_body)
             self.assertEqual(saved.status_code, 202)
             self.assertEqual(saved.json()['operation'], 'queued')
             self.assertEqual(self.store.tasks(), [])
@@ -64,7 +67,7 @@ class CommentApiTests(unittest.TestCase):
         response = self.client.get(url, headers=self.auth)
         self.assertEqual(response.status_code, 200)
         self.assertFalse(response.json()['can_save'])
-        self.assertEqual(self.client.post(url, headers=self.auth, json={'action': 'save'}).status_code, 409)
+        self.assertEqual(self.client.post(url, headers=self.auth, json=self.core_body).status_code, 409)
         self.assertEqual(self.client.get('/api/works/missing/comments', headers=self.auth).status_code, 404)
 
     def test_inputs_and_missing_local_assets_fail_closed(self):

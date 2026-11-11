@@ -21,8 +21,8 @@
     if (key.length < 8 || key.length > 128 || /[^\x21-\x7e]/.test(key)) return '请用 8–128 位英文字母、数字或符号，不含空格。';
     return key === repeat ? '' : '两次输入的密钥不一致，请再检查一下。';
   }
-  function createCommentsPanel({ document, element, api, binary, objectURL, formatDate }) {
-    let active = null, generation = 0, timer = 0, urls = [];
+  function createCommentsPanel({ document, element, api, binary, objectURL, formatDate, commentEntry = null, openSettings = null, openWindow = typeof globalThis.open === 'function' ? globalThis.open.bind(globalThis) : null }) {
+    let active = null, generation = 0, timer = 0, urls = []; const browserJobs = new Map();
     function releaseImages() { for (const url of urls) objectURL.revokeObjectURL(url); urls = []; }
     const path = id => `/api/works/${encodeURIComponent(id)}/comments`;
     const button = (text, fn) => { const node = element('button', 'secondary', text); node.type = 'button'; node.addEventListener('click', fn); return node; };
@@ -39,20 +39,62 @@
       const dismiss = button('×', () => close(true)); dismiss.setAttribute('aria-label', '关闭评论'); header.append(title, dismiss);
       const summary = element('p', 'comments-summary'), explanation = element('p', 'hint', '评论为本地累计保存，可能需要分次保存；打开面板不会自动采集。');
       const statusMessage = element('p', 'hint'); statusMessage.setAttribute('role', 'status'); statusMessage.setAttribute('aria-live', 'polite');
+      const accountHint = element('p', 'hint');
+      const channelBar = element('div', 'comment-channel-bar'), channelName = element('span', 'hint', '正在读取评论通道…');
+      if (commentEntry) channelBar.append(channelName, button('通道设置', () => openSettings?.()));
+      const source = element('select'); source.setAttribute('aria-label', '评论保存来源');
+      for (const [value, label] of [['secondary', '小号浏览器'], ['primary-browser', '大号浏览器（仅本次）'], ['primary-core', '后台大号（仅本次）']]) { const option = element('option', '', label); option.value = value; source.append(option); }
+      source.value = 'secondary';
       const controls = element('div', 'comments-actions'), exports = element('div', 'comments-actions'), list = element('div', 'comments-list');
       const more = button('加载更多评论', () => loadPage(active.retryReset)); more.hidden = true;
-      panel.append(header, summary, explanation, statusMessage, controls, exports, list, more);
+      panel.append(header, summary, explanation, channelBar, controls, statusMessage, accountHint, exports, list, more);
       panel.addEventListener('keydown', event => { if (event.key === 'Escape') { event.preventDefault(); close(true); } event.stopPropagation(); });
-      active = { serial, card, trigger, panel, offset: 0, canSave: false, busy: false, state: null, pageSerial: 0, renderedSerial: 0, pageLoading: false, retryReset: false, revision: 0 };
+      active = { serial, card, trigger, panel, offset: 0, canSave: false, busy: false, state: null, accounts: null, pageSerial: 0, renderedSerial: 0, pageLoading: false, retryReset: false, revision: 0 };
       card.append(panel); trigger.setAttribute('aria-expanded', 'true'); panel.focus();
       const localPath = path(work.id); let exporting = false;
       function report(error) { if (current()) statusMessage.textContent = error?.message || '操作失败，请重试。'; }
+      const allowed = () => Boolean(active.accounts && !active.accounts.paused && active.accounts.primary?.bound && active.accounts.secondary?.bound);
+      const selection = (action, chosen) => ({ action, account_role: chosen === 'secondary' ? 'secondary' : 'primary', allow_primary: chosen !== 'secondary' });
+      async function startSelected(action) {
+        if (!current() || active.busy) return;
+        if (commentEntry) {
+          active.busy = true;
+          try {
+            const chosen = await commentEntry.selection('当前作品');
+            if (!current()) return;
+            active.busy = false;
+            if (!chosen) return;
+            source.value = chosen;
+            channelName.textContent = chosen === 'primary-core' ? '当前通道：软件自带' : '当前通道：浏览器补全';
+          } catch (error) { if (current()) active.busy = false; report(error); return; }
+        }
+        return source.value === 'primary-core' ? operation(action) : browserOperation(action);
+      }
       async function operation(action) {
-        if (!current() || active.busy || !active.canSave) return;
+        if (!current() || active.busy || !active.canSave || !allowed() || source.value !== 'primary-core') return;
+        const chosen = source.value; source.value = 'secondary';
         active.busy = true; active.revision++; active.pageSerial++; active.pageLoading = false;
-        try { await api(localPath, 'POST', { action }); if (current()) await loadPage(true); }
+        try { await api(localPath, 'POST', selection(action, chosen)); if (current()) await loadPage(true); }
         catch (error) { if (current() && active.state) paintStatus(active.state, active.canSave); report(error); }
         finally { if (current()) { active.busy = false; if (!active.pageLoading) more.disabled = false; } }
+      }
+      async function browserOperation(action) {
+        if (!current() || active.busy || !active.canSave || !allowed() || source.value === 'primary-core' || ['queued', 'running', 'browser'].includes(active.state?.operation)) return;
+        const chosen = source.value; source.value = 'secondary';
+        let tab = null;
+        try { tab = openWindow?.('about:blank', '_blank') || null; if (tab) tab.opener = null; } catch { tab = null; }
+        active.busy = true; active.revision++; active.pageSerial++; active.pageLoading = false;
+        try {
+          const result = await api(`${localPath}/browser`, 'POST', selection(action, chosen));
+          if (!/^\d{19}$/.test(result.work_id || '') || !/^[a-f0-9]{32}$/.test(result.token || '')) throw new Error('补抓任务返回异常，请停止保存后重试。');
+          const job = { url: `https://www.douyin.com/video/${result.work_id}#library-comments=${result.token}`, tab, blocked: !tab };
+          browserJobs.set(work.id, job);
+          if (tab) { try { if (tab.closed) job.blocked = true; else tab.location.href = job.url; } catch { job.blocked = true; } }
+          if (current()) await loadPage(true);
+        } catch (error) {
+          try { tab?.close(); } catch {}
+          if (current()) { if (active.state) paintStatus(active.state, active.canSave); report(error); }
+        } finally { if (current()) { active.busy = false; if (!active.pageLoading) more.disabled = false; } }
       }
       async function cancel() {
         if (!current() || active.busy) return;
@@ -78,27 +120,48 @@
         const total = Number(status.total) || 0, replies = Number(status.replies) || 0;
         const integrity = status.integrity === 'finished-visible' ? '本次可见内容已遍历' : status.integrity === 'partial' ? '部分保存' : '尚未保存';
         summary.textContent = `已保存 ${total} 条评论 · 其中回复 ${replies} 条 · ${integrity}${status.saved_at ? ` · 保存于 ${formatDate(status.saved_at)}` : ''}${status.platform_total != null ? ` · 平台报告数量 ${status.platform_total}` : ''}`;
-        const operations = { queued: '等待保存', running: '正在保存', stopped: '已停止', failed: '保存失败', interrupted: '保存中断', finished: '本次保存结束', unsaved: '尚未保存评论' };
-        statusMessage.textContent = `${operations[status.operation] || '状态未知'}${status.reason ? ` · ${status.reason}` : ''}${status.queue_paused ? ' · 评论队列已暂停' : ''}${!canSave ? ' · 暂时无法识别原作品，不能保存评论' : ''}`;
+        const operations = { queued: '等待保存', running: '正在保存', browser: '正在浏览器补抓，请在抖音页打开评论区，验证码需手动处理；需助手 1.13.0', stopped: '已停止', failed: '保存失败', interrupted: '保存中断', finished: '本次保存结束', unsaved: '尚未保存评论' };
+        const role = status.account_role === 'primary' ? '大号' : status.account_role === 'secondary' ? '小号' : '';
+        statusMessage.textContent = `${operations[status.operation] || '状态未知'}${role ? ` · ${role}` : ''}${status.reason ? ` · ${status.reason}` : ''}${status.queue_paused ? ' · 评论队列已暂停' : ''}${!canSave ? ' · 暂时无法识别原作品，不能保存评论' : ''}`;
+        accountHint.textContent = !active.accounts ? '正在读取评论账号设置…' : active.accounts.paused ? `评论已暂停，请到设置处理${active.accounts.reason ? `：${active.accounts.reason}` : ''}` : !active.accounts.primary?.bound || !active.accounts.secondary?.bound ? '请先到设置绑定大号和小号。' : '';
         controls.replaceChildren(); exports.replaceChildren();
-        if (['queued', 'running'].includes(status.operation)) controls.append(button('停止保存', cancel));
+        if (['queued', 'running', 'browser'].includes(status.operation)) {
+          controls.append(button('停止保存', cancel));
+          if (status.operation === 'browser') {
+            const job = browserJobs.get(work.id);
+            if (job) {
+              const link = element('a', 'secondary', '打开抖音继续补抓 ↗'); link.href = job.url; link.target = '_blank'; link.rel = 'noopener noreferrer'; controls.append(link);
+              if (job.blocked || job.tab?.closed) statusMessage.textContent += ' · 浏览器阻止或关闭了页面，请点击链接继续；请确认助手已安装并连接本网站。';
+              else statusMessage.textContent += ' · 若没有进度，请确认助手已安装并连接本网站，或点击链接重新打开。';
+            } else statusMessage.textContent += ' · 请回到已打开的抖音页；如无法继续，请停止保存后重新开始。';
+          }
+        }
         else if (canSave) {
+          browserJobs.delete(work.id);
           const action = status.integrity === 'partial' || ['failed','interrupted','stopped'].includes(status.operation) ? 'continue' : status.integrity === 'unsaved' ? 'save' : 'update';
           const label = status.operation === 'failed' ? '重试' : action === 'save' ? '保存评论' : action === 'continue' ? '继续保存' : '更新评论';
-          controls.append(button(label, () => operation(action)));
-          if (status.operation === 'failed') { const rescan = button('从头重新扫描', () => operation('update')); rescan.title = '从头读取并保留已有评论'; controls.append(rescan); }
+          if (!commentEntry) controls.append(source);
+          const roleLabel = source.value === 'secondary' ? '小号浏览器' : source.value === 'primary-browser' ? '大号浏览器' : '后台大号';
+          const start = button(commentEntry ? '加载更新' : `${roleLabel}：${label}`, () => startSelected(commentEntry ? 'update' : action)); start.disabled = !allowed(); start.className = commentEntry ? 'primary' : 'secondary'; controls.append(start);
+          if (commentEntry && action === 'continue') { const resume = button('继续补全', () => startSelected('continue')); resume.disabled = !allowed(); controls.append(resume); }
+          if (commentEntry) {
+            const advanced = element('details', 'comment-account-override'); advanced.append(element('summary', 'hint', '其他账号（仅本次）'));
+            const primaryBrowser = button('本次用大号浏览器', () => { source.value = 'primary-browser'; return browserOperation('update'); }); primaryBrowser.disabled = !allowed(); advanced.append(primaryBrowser); controls.append(advanced);
+          }
+          if (!commentEntry && status.operation === 'failed') { const rescan = button(`从头重新扫描（${roleLabel}）`, () => startSelected('update')); rescan.disabled = !allowed(); rescan.title = '从头读取并保留已有评论'; controls.append(rescan); }
         }
+        else if (commentEntry) { const unavailable = button('加载更新', () => {}); unavailable.disabled = true; controls.append(unavailable); }
         if (status.integrity !== 'unsaved' || total) for (const format of ['json', 'csv', 'zip']) { const exportButton = button(format === 'zip' ? '导出含图片 ZIP' : `导出 ${format.toUpperCase()}`, () => exportData(format)); exportButton.disabled = exporting; exports.append(exportButton); }
         clearTimeout(timer);
-        if (['queued', 'running'].includes(status.operation)) timer = setTimeout(poll, 5000);
+        if (['queued', 'running', 'browser'].includes(status.operation)) timer = setTimeout(poll, 5000);
       }
       async function poll() {
         const revision = active.revision;
         try {
           const result = await api(`${localPath}?offset=0&limit=50&root_id=`); if (!current() || revision !== active.revision) return;
-          const wasActive = ['queued', 'running'].includes(active.state?.operation);
+          const wasActive = ['queued', 'running', 'browser'].includes(active.state?.operation);
           paintStatus(result.status, result.can_save);
-          if (wasActive && !['queued', 'running'].includes(result.status.operation)) await loadPage(true);
+          if (wasActive && !['queued', 'running', 'browser'].includes(result.status.operation)) await loadPage(true);
         } catch (error) { report(error); if (current()) timer = setTimeout(poll, 10000); }
       }
       function renderComment(item, parent, isReply = false) {
@@ -146,11 +209,58 @@
         } catch (error) { if (current() && pageSerial === active.pageSerial && revision === active.revision) { report(error); active.retryReset = reset; more.textContent = '重试读取评论'; more.hidden = false; } }
         finally { if (current() && pageSerial === active.pageSerial && revision === active.revision) { active.pageLoading = false; more.disabled = false; } }
       }
+      source.addEventListener('change', () => { if (current() && active.state) paintStatus(active.state, active.canSave); });
       loadPage(true);
+      if (commentEntry) commentEntry.readChannel().then(value => { if (current()) channelName.textContent = value.channel === 'core' ? '当前通道：软件自带' : '当前通道：浏览器补全'; }).catch(error => { if (current()) channelName.textContent = error.message; });
+      api('/api/comment-accounts').then(accounts => { if (current()) { active.accounts = accounts; if (active.state) paintStatus(active.state, active.canSave); } }).catch(() => { if (current()) accountHint.textContent = '无法读取评论账号设置，请到设置重试。'; });
     }
     return { open, close, isOpenFor };
   }
-  if (typeof module !== 'undefined' && module.exports) { module.exports = { mediaURL, switchView, moveGallery, isVideoFile, authorInitial, keyError, taskTitle, playVisible, applySound, releasePlayback, preloadVideos, createCommentsPanel }; return; }
+  function createCommentAccountSettings({ nodes, api }) {
+    let generation = 0, accounts = null, busy = false;
+    function paint() {
+      nodes.primary.textContent = accounts?.primary?.bound ? '大号：已使用视频下载账号' : `大号：${accounts?.primary?.reason || '正在读取视频下载账号…'}`;
+      nodes.secondary.textContent = `小号：${accounts?.secondary?.bound ? '已绑定' : '未绑定'}`;
+      nodes.state.textContent = !accounts ? '正在读取评论账号设置…' : accounts.paused ? `评论已暂停${accounts.reason ? `：${accounts.reason}` : ''}` : '评论未暂停';
+      nodes.bindPrimary.disabled = busy || !accounts;
+      nodes.cookie.disabled = busy;
+      nodes.bindSecondary.disabled = busy || !accounts?.can_bind_secondary || !nodes.cookie.value.trim();
+      nodes.resume.disabled = busy || !accounts?.paused || !accounts?.primary?.bound || !accounts?.secondary?.bound;
+      nodes.pause.disabled = busy || !accounts || accounts.paused;
+    }
+    async function refresh() { const run = generation, value = await api('/api/comment-accounts'); if (run === generation) { accounts = value; paint(); } }
+    function reset() { generation++; accounts = null; busy = false; nodes.cookie.value = ''; nodes.message.textContent = ''; paint(); }
+    async function bind() {
+      if (busy || !accounts?.can_bind_secondary) return;
+      let cookie = nodes.cookie.value.trim();
+      nodes.cookie.value = '';
+      if (!cookie || cookie.length > 30000) { nodes.message.textContent = '请粘贴完整的小号 Cookie（最多 30000 字符）。'; paint(); return; }
+      const run = ++generation; busy = true; paint(); nodes.message.textContent = '正在识别并绑定小号…';
+      try {
+        const result = await api('/api/comment-accounts/secondary-cookie', 'POST', { cookie });
+        if (run !== generation) return;
+        if (result?.secondary?.bound !== true) throw new Error('网站未确认小号绑定，请刷新账号状态查看。');
+        accounts = result;
+        nodes.message.textContent = '小号绑定成功。评论仍保持暂停，确认后可手动解除；浏览器补抓请登录这个小号。';
+      } catch (error) { if (run === generation) nodes.message.textContent = error.message || '小号绑定失败，请重新粘贴 Cookie。'; }
+      finally { cookie = ''; if (run === generation) { busy = false; paint(); } }
+    }
+    async function changePause(resume) {
+      if (busy || !accounts || (resume && (!accounts.paused || !accounts.primary?.bound || !accounts.secondary?.bound))) return;
+      const run = generation; busy = true; paint();
+      try { await api(`/api/comment-accounts/${resume ? 'resume' : 'pause'}`, 'POST', resume ? { acknowledge: true } : {}); if (run === generation) { nodes.message.textContent = resume ? '已解除暂停，不会自动开始采集。' : '评论已暂停。'; await refresh(); } }
+      catch (error) { if (run === generation) nodes.message.textContent = error.message || '操作失败，请重试。'; }
+      finally { if (run === generation) { busy = false; paint(); } }
+    }
+    nodes.bindPrimary.addEventListener('click', async () => { if (busy) return; try { await refresh(); nodes.message.textContent = accounts.primary?.bound ? '大号已使用当前视频下载账号。' : accounts.primary?.reason || '请先更新下载设置中的 Cookie。'; } catch (error) { nodes.message.textContent = error.message || '读取账号状态失败，请重试。'; } });
+    nodes.bindSecondary.addEventListener('click', bind);
+    nodes.cookie.addEventListener('input', paint);
+    nodes.cookie.addEventListener('keydown', event => { if (event.key === 'Enter') { event.preventDefault(); bind(); } });
+    nodes.resume.addEventListener('click', () => changePause(true));
+    nodes.pause.addEventListener('click', () => changePause(false));
+    paint(); return { refresh, reset };
+  }
+  if (typeof module !== 'undefined' && module.exports) { module.exports = { mediaURL, switchView, moveGallery, isVideoFile, authorInitial, keyError, taskTitle, playVisible, applySound, releasePlayback, preloadVideos, createCommentsPanel, createCommentAccountSettings }; return; }
   const $ = id => document.getElementById(id);
   if (location.protocol === 'file:') { $('connect-form').hidden = true; $('local-preview').hidden = false; return; }
   const state = { token: localStorage.getItem('library_access_key') || '', muted:false, favoriteKind:'works', auth: null, view: 'library', items: [], total: 0, generation: 0, authorsGeneration: 0, navigation: 0, busy: false, cookieSyncGeneration:0 };
@@ -180,6 +290,12 @@
   function empty(container, title, description) {
     const block = element('div', 'empty'); block.append(element('span', 'empty-symbol', '▧'), element('strong', '', title), element('p', '', description)); container.append(block);
   }
+  state.commentAccounts = $('comment-account-primary') ? createCommentAccountSettings({ api, nodes: {
+    primary: $('comment-account-primary'), secondary: $('comment-account-secondary'), state: $('comment-account-state'),
+    bindPrimary: $('comment-bind-primary'), bindSecondary: $('comment-bind-secondary'), pause: $('comment-pause'), resume: $('comment-resume'),
+    message: $('comment-account-message'), cookie: $('comment-secondary-cookie')
+  } }) : null;
+  state.commentEntry = globalThis.CloudriftCommentEntry.create({ api, document, element, notice });
   function action(text, operation, primary = false) {
     const button = element('button', primary ? 'primary' : 'secondary', text); button.type = 'button';
     button.addEventListener('click', async () => { button.disabled = true; try { await operation(); } catch (error) { notice(error.message, true); } finally { button.disabled = false; } }); return button;
@@ -187,6 +303,8 @@
   function disconnect() {
     state.authEpoch = (state.authEpoch || 0) + 1;
     state.comments?.close();
+    state.commentAccounts?.reset();
+    state.commentEntry?.reset();
     state.cookieSyncGeneration=(state.cookieSyncGeneration||0)+1;
     const syncButton=$('cookie-sync-button'),syncLink=$('cookie-sync-link'),syncStatus=$('cookie-sync-status');if(syncButton)syncButton.disabled=false;if(syncLink)syncLink.hidden=true;if(syncStatus)syncStatus.hidden=true;
     switchView('library', document.querySelectorAll('video'));
@@ -255,6 +373,7 @@
   }
   async function navigate(view) {
     state.comments?.close();
+    state.commentEntry?.leave();
     const navigation = ++state.navigation;
     if(view==='favorites'&&state.view!==view){$('search-query').value='';$('search-author').value='';}
     state.view = switchView(view, document.querySelectorAll('video'));
@@ -275,7 +394,7 @@
       else await loadSettings();
     } catch (error) { if (navigation === state.navigation) notice(error.message, true); }
   }
-  let playbackFrame=0,warmTimer=0,activeCard=null,fullscreenCard=null,restoringFullscreen=false,fullscreenRevision=0;
+  let playbackFrame=0,warmTimer=0,activeCard=null,fullscreenCard=null,restoringFullscreen=false,fullscreenRevision=0,playbackCards=new Set();
   async function fetchCommentBlob(path) {
     const token = state.token; let response;
     try { response = await fetch(path, { headers: { Authorization: `Bearer ${token}` }, cache: 'no-store', signal: AbortSignal.timeout(60000) }); }
@@ -283,25 +402,30 @@
     if (!response.ok) { if ((response.status === 401 || response.status === 403) && token === state.token) disconnect(); throw new Error('无法读取本地评论文件，请重试。'); }
     return response.blob();
   }
-  state.comments = createCommentsPanel({ document, element, api, binary: fetchCommentBlob, objectURL: globalThis.URL, formatDate });
+  state.comments = createCommentsPanel({ document, element, api, binary: fetchCommentBlob, objectURL: globalThis.URL, formatDate, commentEntry: state.commentEntry, openSettings: () => navigate('settings') });
   function syncPlayback(){
-    playbackFrame=0;if(restoringFullscreen)return;const feed=$('feed'),cards=[...feed.querySelectorAll('.work')];
+    playbackFrame=0;if(restoringFullscreen)return;const feed=$('feed'),cards=feed.children;
     const index=Math.max(0,Math.min(cards.length-1,Math.round(feed.scrollTop/feed.clientHeight)));
     const enabled=!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view);
-    const card=!feed.hidden&&['library','favorites'].includes(state.view)?(document.fullscreenElement?.closest('.work')||cards[index]):null;
-    const selected=card?cards.indexOf(card):-1;
+    const visible=cards[index]?.dataset?.work!==undefined?cards[index]:null;
+    let card=!feed.hidden&&['library','favorites'].includes(state.view)?(document.fullscreenElement?.closest('.work')||visible):null;
+    const selected=card?(card===visible?index:Array.prototype.indexOf.call(cards,card)):-1;
+    if(selected<0)card=null;
     if(document.fullscreenElement===feed&&card)fullscreenCard=card;
     if(card!==activeCard){if(activeCard)state.comments?.close();clearTimeout(warmTimer);activeCard=card;}
-    cards.forEach((item,i)=>{const v=item.querySelector('video');if(!v)return;
-      if(i!==selected)v.autoAdvancePending=false;
-      if(!enabled){v.playbackWarm=false;v.cancelPreparation?.();playVisible(v,false);}
-      else if(i<selected-1||i>selected+2)releasePlayback(v);
-      else {v.playbackWarm=v.playbackWarm&&i>selected;if(i!==selected||!v.playbackActive||!v.playbackReady)playVisible(v,i===selected);if(i===selected&&v.autoAdvancePending)v.advancePlayback?.();}
-    });
+    const nearby=new Set();
+    if(selected>=0)for(let i=Math.max(0,selected-1);i<=Math.min(cards.length-1,selected+2);i++)nearby.add(cards[i]);
+    for(const item of new Set([...playbackCards,...nearby])){const v=item.querySelector('video');if(!v)continue;
+      if(item!==card)v.autoAdvancePending=false;
+      if(!enabled){v.playbackWarm=false;v.cancelPreparation?.();playVisible(v,false);if(selected>=0&&!nearby.has(item))releasePlayback(v);}
+      else if(!nearby.has(item))releasePlayback(v);
+      else {v.playbackWarm=v.playbackWarm&&item!==card&&item!==cards[selected-1];if(item!==card||!v.playbackActive||!v.playbackReady)playVisible(v,item===card);if(item===card&&v.autoAdvancePending)v.advancePlayback?.();}
+    }
+    if(enabled||selected>=0)playbackCards=nearby;
     clearTimeout(warmTimer);
-    if(card&&(!card.querySelector('video')||card.querySelector('video').playbackReady))warmTimer=setTimeout(()=>{
-      if(activeCard!==card||document.hidden)return;
-      for(const next of preloadVideos(cards,selected))if(!next.playbackReady){next.playbackWarm=true;next.preparePlayback?.();}
+    if(enabled&&card&&(!card.querySelector('video')||card.querySelector('video').playbackReady))warmTimer=setTimeout(()=>{
+      if(activeCard!==card||cards[selected]!==card||document.hidden||feed.hidden||!['library','favorites'].includes(state.view))return;
+      for(const next of preloadVideos([card,cards[selected+1],cards[selected+2]].filter(Boolean),0))if(!next.playbackReady){next.playbackWarm=true;next.preparePlayback?.();}
     },200);
   }
   function schedulePlayback(){if(!playbackFrame)playbackFrame=requestAnimationFrame(syncPlayback);}
@@ -327,7 +451,7 @@
     const gallery = !['视频', 'video'].includes(work.type) && (files.length > 1 || !isVideoFile(files[0]));
     let media,advancing=false;
     function currentVideo(video){
-      const feed=$('feed'),cards=[...feed.querySelectorAll('.work')];
+      const feed=$('feed'),cards=feed.children;
       const visible=document.fullscreenElement?.closest('.work')||cards[Math.round(feed.scrollTop/feed.clientHeight)];
       return card.isConnected&&media===video&&activeCard===card&&visible===card&&!document.hidden&&!feed.hidden&&['library','favorites'].includes(state.view)&&video.playbackActive&&!video.userPaused&&video.ended&&!state.comments?.isOpenFor(card);
     }
@@ -500,7 +624,7 @@
     actions.append(action('删除',async()=>{await api(`/api/tasks/${encodeURIComponent(task.id)}`,'DELETE');await loadTasks();notice('任务记录已删除，媒体文件保留。');}));
     card.append(content, actions); return card;
   }
-  const taskView = window.CloudriftTaskView.create({ application: $('application'), makeTaskCard: taskCard, title: taskTitle, onBatch:async(action,ids)=>{
+  const taskView = window.CloudriftTaskView.create({ application: $('application'), makeTaskCard: taskCard, title: taskTitle, loadDetail:id=>api(`/api/tasks/${encodeURIComponent(id)}`), isActive:()=>state.view==='tasks', onBatch:async(action,ids)=>{
     if (['pause','resume'].includes(action)) { try { await api(`/api/queue/${action}`,'POST');await loadTasks();notice(action==='pause'?'全部任务已暂停，已保存内容保留。':'已继续，队列将按原顺序处理。'); } catch(error) { notice(error.message,true); } return; }
     try{let changed=0,skipped=0;for(let i=0;i<ids.length;i+=1000){const result=await api('/api/tasks/batch','POST',{action,ids:ids.slice(i,i+1000)});changed+=result.changed.length;skipped+=result.skipped.length;}await loadTasks();notice(`已处理 ${changed} 个任务${skipped?`，${skipped} 个因状态变化或同链接正在处理而跳过`:''}。媒体文件保留。`);}catch(error){notice(error.message,true);}
   } });
@@ -538,13 +662,14 @@
     } finally { if (serial === state.historySerial) state.historyBusy = false; }
   }
   async function loadTasks() {
-    const navigation = state.navigation, tasks = await api('/api/tasks');
-    if (navigation === state.navigation && state.view === 'tasks') taskView.update(tasks);
+    const navigation = state.navigation, serial = state.taskGeneration = (state.taskGeneration || 0) + 1, tasks = await api('/api/tasks?summary=true');
+    if (navigation === state.navigation && serial === state.taskGeneration && state.view === 'tasks') taskView.update(tasks);
   }
   async function loadAuthors(favoritesOnly=false) {
     const generation = ++state.authorsGeneration, navigation = state.navigation, authors = await api('/api/authors/history');
     if (generation !== state.authorsGeneration || navigation !== state.navigation || state.view !== (favoritesOnly?'favorites':'authors')) return;
     const container=$(favoritesOnly?'favorite-author-list':'author-list');container.replaceChildren();
+    if (!favoritesOnly) state.commentEntry.refreshBatch();
     const order=$('author-sort').value,visible=authors.filter(a=>!favoritesOnly||a.favorite);
     visible.sort((a,b)=>Number(Boolean(b.starred))-Number(Boolean(a.starred))||(order==='name'?(a.name||'').localeCompare(b.name||'','zh-CN'):order==='next'?(a.enabled?a.next_check:Infinity)-(b.enabled?b.next_check:Infinity):order==='last'?new Date(typeof b.last_checked==='number'?b.last_checked*1000:b.last_checked||0)-new Date(typeof a.last_checked==='number'?a.last_checked*1000:a.last_checked||0):Number(b.enabled)-Number(a.enabled)));
     container.append(element('h2','creator-heading',favoritesOnly?'收藏博主':`订阅中 · ${authors.filter(a=>a.enabled).length}　历史博主 · ${authors.filter(a=>!a.enabled).length}`));
@@ -565,6 +690,7 @@
       for (const [value, label] of Object.entries(names)) if (value !== 'legacy' || current === 'legacy') frequency.append(new Option(label, value));
       frequency.value = current;
       actions.append(frequency, action('保存方式', async () => { if (frequency.value === 'legacy') return; if(author.registered)await api(`/api/authors/${encodeURIComponent(author.id)}`, 'PATCH', {frequency:frequency.value});else await api('/api/authors','POST',{url:author.url,name:author.name,frequency:frequency.value}); await loadAuthors(favoritesOnly); notice('后续更新方式已保存。'); }), action('现在补齐作品', async () => { if(author.registered)await api(`/api/authors/${encodeURIComponent(author.id)}/check`, 'POST');else await api('/api/tasks','POST',{link:author.url,kind:'author'}); await navigate('tasks'); notice('博主下载已提交，已有作品自动跳过。'); }));
+      if (!favoritesOnly) actions.append(action('补全评论', () => state.commentEntry.batch(author)));
       card.append(content, actions); container.append(card);
     }
     if(!visible.length)empty(container,favoritesOnly?'还没有收藏博主':'还没有历史博主','在订阅页点“收藏博主”，或添加博主页。收藏不会自动开启下载。');
@@ -599,6 +725,8 @@
         $('script-server').value = location.origin; $('script-token').value = settings.script_token || state.token; $('script-token').type = 'password'; $('reveal-token').textContent = '显示';
       }),
       api('/api/status').then(status => { if (navigation === state.navigation && state.view === 'settings') showStatus(status); }),
+      state.commentAccounts?.refresh().catch(() => { $('comment-account-state').textContent = '无法读取评论账号设置，请刷新重试。'; }),
+      state.commentEntry.refreshSettings(),
       loadLegacy()
     ]);
   }
@@ -730,7 +858,7 @@
     if (!['ArrowUp', 'ArrowDown'].includes(event.key) || event.target.closest?.('button,input,select,textarea,a,video,[contenteditable="true"],.comments-panel')) return;
     event.preventDefault(); $('feed').scrollBy({ top: $('feed').clientHeight * (event.key === 'ArrowUp' ? -1 : 1), behavior: 'smooth' });
   });
-  $('feed').addEventListener('scroll',()=>{schedulePlayback();const f=$('feed');if(!restoringFullscreen&&document.fullscreenElement===f)fullscreenCard=[...f.querySelectorAll('.work')][Math.round(f.scrollTop/f.clientHeight)]||fullscreenCard;if(state.hasMore&&!state.loadingLibrary&&f.scrollHeight-f.scrollTop-f.clientHeight<f.clientHeight*2)loadLibrary().catch(error=>notice(error.message,true));},{passive:true});
+  $('feed').addEventListener('scroll',()=>{schedulePlayback();const f=$('feed');if(!restoringFullscreen&&document.fullscreenElement===f)fullscreenCard=f.children[Math.round(f.scrollTop/f.clientHeight)]||fullscreenCard;if(state.hasMore&&!state.loadingLibrary&&f.scrollHeight-f.scrollTop-f.clientHeight<f.clientHeight*2)loadLibrary().catch(error=>notice(error.message,true));},{passive:true});
   document.addEventListener('visibilitychange',syncPlayback);
   setInterval(() => {
     if (!state.token || document.hidden || state.busy) return;

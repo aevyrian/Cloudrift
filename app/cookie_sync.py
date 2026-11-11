@@ -216,20 +216,18 @@ class CookieSync:
                             raise RuntimeError('core not ready')
                         if not self._owner_ok(item['owner']) or not hmac.compare_digest(_digest(self.store.setting('cookie', '') or ''), item['original']):
                             raise _ConfigurationChanged
-                        write_attempted = True
-                        self.store.set_setting('cookie', cookie)
-                        self.store.set_setting('cookie_account_cache', None)
                         if self.account:
                             self.account.invalidate()
+                        write_attempted = True
+                        self.store.set_settings({'cookie': cookie, 'cookie_account_cache': None})
                     except BaseException as error:
                         self.recovering = True
                         try:
                             current = self.store.setting('cookie', '') or ''
                             if write_attempted and current == cookie and current != old:
-                                self.store.set_setting('cookie', old)
-                                self.store.set_setting('cookie_account_cache', old_account)
                                 if self.account:
                                     self.account.invalidate()
+                                self.store.set_settings({'cookie': old, 'cookie_account_cache': old_account})
                                 current = old
                             await self.service.core.start(current, self.store.setting('download_dir', '') or '')
                             if not self.service.core.ready:

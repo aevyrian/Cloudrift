@@ -20,7 +20,7 @@ button.events.click(); assert.equal(videos[0].muted, false, '用户可以再次�
 const ids = Object.fromEntries(['cookie-state', 'cookie', 'clear-cookie', 'cookie-account', 'quality-policy', 'download-dir', 'download-dir-hint', 'script-server', 'script-token', 'reveal-token'].map(id => [id, {}]));
 let resolveStatus; let statusPainted = false; let legacyLoaded = false;
 const status = new Promise(resolve => { resolveStatus = resolve; });
-const state = { navigation: 1, view: 'settings', token: 'synthetic-test' };
+const state = { navigation: 1, view: 'settings', token: 'synthetic-test', commentEntry: { refreshSettings: async () => {} } };
 const settingsContext = vm.createContext({ state, $: id => ids[id], location: { origin: 'https://test.example' }, showStatus() { statusPainted = true; }, loadLegacy: async () => { legacyLoaded = true; }, setTimeout: fn => { queueMicrotask(fn); return 1; }, clearTimeout() {}, api: path => path === '/api/status' ? status : Promise.resolve({ cookie_configured: false, quality_policy: 'upstream', download_dir: '/media', media_root: '/media' }) });
 vm.runInContext(source.slice(source.indexOf('  function paintCookieStatus('), source.indexOf('  async function loadLegacy(')) + '\nglobalThis.loadSettings = loadSettings;', settingsContext);
 const loading = settingsContext.loadSettings();
@@ -40,6 +40,14 @@ const first = tasksContext.loadTasks();
 tasksContext.state.navigation++; tasksContext.state.view = 'settings';
 resolveTasks([]); await first;
 assert.equal(rendered, 0, '离开下载后不得渲染迟到的任务响应');
+const waitingTasks = [];
+const renderedTasks = [];
+const racingTasks = vm.createContext({ state: { navigation: 4, view: 'tasks' }, api: () => new Promise(resolve => waitingTasks.push(resolve)), taskView: { update(data) { renderedTasks.push(data); } } });
+vm.runInContext(source.slice(source.indexOf('  async function loadTasks('), source.indexOf('  async function loadAuthors(')) + '\nglobalThis.loadTasks = loadTasks;', racingTasks);
+const olderTasks = racingTasks.loadTasks(), newerTasks = racingTasks.loadTasks();
+waitingTasks[1]([{id:'new'}]); await newerTasks;
+waitingTasks[0]([{id:'old'}]); await olderTasks;
+assert.deepEqual(renderedTasks, [[{id:'new'}]], '旧任务轮询迟到不能覆盖较新的任务状态');
 
 class AuthorNode {
   constructor(tag, className = '', text = '') { this.tagName = tag; this.className = className; this.textContent = text; this.children = []; this.classList = { toggle() {} }; }
@@ -48,7 +56,7 @@ class AuthorNode {
   setAttribute() {}
 }
 const authorList = new AuthorNode('div');
-const authorState = { navigation: 1, authorsGeneration: 0, view: 'favorites' };
+const authorState = { navigation: 1, authorsGeneration: 0, view: 'favorites', commentEntry: { refreshBatch() {} } };
 let interval = 4320;
 const authorContext = vm.createContext({
   state: authorState, $: id => ['favorite-author-list', 'author-list'].includes(id) ? authorList : { value: '' },

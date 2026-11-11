@@ -1,7 +1,10 @@
 services:
   douyin-library:
-    image: cloudrift:1.4.3
-    build: .
+    image: cloudrift:${CLOUDRIFT_VERSION:-1.4.10}
+    build:
+      context: .
+      args:
+        CLOUDRIFT_VERSION: "${CLOUDRIFT_VERSION:-1.4.10}"
     restart: unless-stopped
     ports:
       - "${APP_PORT:-8090}:8090"

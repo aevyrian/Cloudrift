@@ -17,23 +17,25 @@ class Node {
   click(){return this.events.click?.();}
 }
 const flatten=n=>[n,...n.children.flatMap(flatten)];
+const accountApi=(queue)=>(path)=>path==='/api/comment-accounts'?Promise.resolve({paused:false,primary:{bound:true},secondary:{bound:true}}):new Promise(resolve=>queue.push(resolve));
+const chooseCore=card=>{const source=flatten(card).find(n=>n.tagName==='SELECT');source.value='primary-core';source.events.change();};
 const pending=[],made=[],revoked=[];
-const panel=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:()=>new Promise(resolve=>pending.push(resolve)),binary:async()=>({size:20*1024*1024}),objectURL:{createObjectURL(){const id='blob:'+made.length;made.push(id);return id;},revokeObjectURL:u=>revoked.push(u)},formatDate:()=>''});
+const panel=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:accountApi(pending),binary:async()=>({size:20*1024*1024}),objectURL:{createObjectURL(){const id='blob:'+made.length;made.push(id);return id;},revokeObjectURL:u=>revoked.push(u)},formatDate:()=>''});
 const card=new Node('article'),trigger=new Node('button');
 const result={can_save:true,status:{integrity:'finished-visible',operation:'finished',total:1,replies:0},items:[{id:'1',text:'image comment',attachments:[{id:'a',kind:'image',status:'saved'}]}],next_offset:null};
 panel.open({id:'1234567890123456789'},card,trigger);pending.shift()(result);await tick();
-for(let i=0;i<3;i++){const op=flatten(card).find(n=>n.textContent==='更新评论').click();pending.shift()({});await tick();pending.shift()(result);await op;await tick();}
+for(let i=0;i<3;i++){chooseCore(card);const op=flatten(card).find(n=>n.textContent==='后台大号：更新评论').click();pending.shift()({});await tick();pending.shift()(result);await op;await tick();}
 assert.equal(flatten(card).filter(n=>n.tagName==='IMG').length,1);
 assert.equal(made.length,4);assert.equal(revoked.length,3,'每次重载应释放旧图片');
 
 panel.close();assert.equal(revoked.length,4);
 
 {
-  const replies=[], images=[], made2=[], panel2=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:()=>new Promise(resolve=>replies.push(resolve)),binary:()=>new Promise(resolve=>images.push(resolve)),objectURL:{createObjectURL(){made2.push('blob:late');return 'blob:late';},revokeObjectURL(){}},formatDate:()=>''});
+  const replies=[], images=[], made2=[], panel2=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:accountApi(replies),binary:()=>new Promise(resolve=>images.push(resolve)),objectURL:{createObjectURL(){made2.push('blob:late');return 'blob:late';},revokeObjectURL(){}},formatDate:()=>''});
   const second=new Node('article');panel2.open({id:'1234567890123456789'},second,trigger);
   replies.shift()({...result,items:[{id:'1',text:'old',reply_count:1,attachments:[{id:'a',kind:'image',status:'saved'}]}]});await tick();
   flatten(second).find(n=>n.textContent==='查看 1 条回复').click();const oldReply=replies.shift();
-  flatten(second).find(n=>n.textContent==='更新评论').click();replies.shift()({});await tick();
+  chooseCore(second);flatten(second).find(n=>n.textContent==='后台大号：更新评论').click();replies.shift()({});await tick();
   replies.shift()({...result,items:[{id:'1',text:'new',attachments:[]}]});await tick();
   oldReply({items:[{id:'2',text:'old reply',attachments:[]}],next_offset:null});images.shift()({});await tick();
   assert.equal(made2.length,0,'旧页迟到图片不得生成新 URL');
@@ -42,7 +44,7 @@ panel.close();assert.equal(revoked.length,4);
 {
   const requests=[], binaryRequests=[], revokedExport=[], scheduled=[], oldSetTimeout=globalThis.setTimeout;
   globalThis.setTimeout=fn=>{scheduled.push(fn);return 1;};
-  const panel3=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:()=>new Promise(resolve=>requests.push(resolve)),binary:()=>new Promise(resolve=>binaryRequests.push(resolve)),objectURL:{createObjectURL:()=> 'blob:export',revokeObjectURL:url=>revokedExport.push(url)},formatDate:()=>''});
+  const panel3=createCommentsPanel({document:{body:new Node('body')},element:(...a)=>new Node(...a),api:accountApi(requests),binary:()=>new Promise(resolve=>binaryRequests.push(resolve)),objectURL:{createObjectURL:()=> 'blob:export',revokeObjectURL:url=>revokedExport.push(url)},formatDate:()=>''});
   const third=new Node('article');panel3.open({id:'1234567890123456789'},third,trigger);requests.shift()({...result,items:[]});await tick();
   const exportButton=flatten(third).find(n=>n.textContent==='导出含图片 ZIP');exportButton.click();exportButton.click();
   assert.equal(binaryRequests.length,1,'导出未完成时不能重复发请求');binaryRequests.shift()({});await tick();panel3.close();

@@ -1,7 +1,7 @@
 import asyncio
 import tempfile
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app.cookie_sync import CookieSync, verify_cookie
 from app.store import Store
@@ -197,12 +197,12 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(self.service.lock.locked())
 
     async def test_failed_database_write_restores_old_core(self):
-        original = self.store.set_setting
-        def write(key, value):
-            if key == 'cookie' and value == NEW:
+        original = self.store.set_settings
+        def write(values):
+            if values.get('cookie') == NEW:
                 raise OSError('private candidate: ' + NEW)
-            original(key, value)
-        with patch('app.cookie_sync.verify_cookie', return_value=True), patch.object(self.store, 'set_setting', side_effect=write):
+            original(values)
+        with patch('app.cookie_sync.verify_cookie', return_value=True), patch.object(self.store, 'set_settings', side_effect=write):
             request = await self.sync.create(OWNER)
             self.sync.submit(request['id'], OWNER, NEW)
             result = await self.wait_status(request['id'], {'success', 'failed'})
@@ -210,6 +210,47 @@ class SyncTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.setting('cookie'), OLD)
         self.assertEqual(self.service.core.calls, [NEW, OLD])
         self.assertNotIn(NEW, str(result))
+
+    async def test_candidate_account_conflict_preserves_bindings_when_invalidation_fails(self):
+        old = 'uid_tt=old-synthetic; sessionid=old-synthetic'
+        candidate = 'uid_tt=small-synthetic; sessionid=small-synthetic'
+        self.store.set_setting('cookie', old)
+        self.store.comment_accounts.bind_cookie(candidate)
+        self.store.comment_accounts.resume(True)
+        primary = self.store.setting('comment_account_primary')
+        secondary = self.store.setting('comment_account_secondary')
+        self.sync.account = Mock()
+        self.sync.account.invalidate.side_effect = RuntimeError('synthetic failure')
+        with patch('app.cookie_sync.verify_cookie', return_value=True):
+            request = await self.sync.create(OWNER)
+            self.sync.submit(request['id'], OWNER, candidate)
+            result = await self.wait_status(request['id'], {'success', 'failed'})
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(self.store.setting('cookie'), old)
+        self.assertEqual(self.store.setting('comment_account_primary'), primary)
+        self.assertEqual(self.store.setting('comment_account_secondary'), secondary)
+        self.assertFalse(self.store.comment_accounts.status()['paused'])
+        self.assertNotIn(candidate, str(result))
+
+    async def test_candidate_account_conflict_rolls_back_database_transaction(self):
+        old = 'uid_tt=old-synthetic; sessionid=old-synthetic'
+        candidate = 'uid_tt=small-synthetic; sessionid=small-synthetic'
+        self.store.set_setting('cookie', old)
+        self.store.comment_accounts.bind_cookie(candidate)
+        self.store.comment_accounts.resume(True)
+        primary = self.store.setting('comment_account_primary')
+        secondary = self.store.setting('comment_account_secondary')
+        with patch('app.cookie_sync.verify_cookie', return_value=True), patch.object(
+                self.store.comment_accounts, 'reconcile_primary', side_effect=OSError('synthetic failure')):
+            request = await self.sync.create(OWNER)
+            self.sync.submit(request['id'], OWNER, candidate)
+            result = await self.wait_status(request['id'], {'success', 'failed'})
+        self.assertEqual(result['status'], 'failed')
+        self.assertEqual(self.store.setting('cookie'), old)
+        self.assertEqual(self.store.setting('comment_account_primary'), primary)
+        self.assertEqual(self.store.setting('comment_account_secondary'), secondary)
+        self.assertFalse(self.store.comment_accounts.status()['paused'])
+        self.assertNotIn(candidate, str(result))
 
     async def test_cookie_changed_during_core_start_is_not_overwritten(self):
         self.service.core.resume = asyncio.Event()

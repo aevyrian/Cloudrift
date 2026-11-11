@@ -78,6 +78,28 @@ def _comment_item(item, root_id):
             'attachments': attachments}
 
 
+def parse_comment_page(payload, cursor, root_id=''):
+    if not isinstance(payload, dict):
+        raise ValueError('评论结构无效')
+    status = payload.get('status_code')
+    if type(status) is not int or status != 0:
+        message = payload.get('status_msg', '')
+        if isinstance(message, str) and any(word in message.lower() for word in ('验证', '登录', '频繁', 'captcha', 'verify', 'login', 'rate limit')):
+            raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试')
+        raise ValueError('评论接口返回失败')
+    comments, more = payload.get('comments'), payload.get('has_more')
+    next_cursor = _comment_number(payload.get('cursor'))
+    if not isinstance(comments, list) or type(more) not in (int, bool) or more not in (0, 1):
+        raise ValueError('评论分页结构无效')
+    if more and (not comments or next_cursor <= cursor):
+        raise ValueError('评论分页未正常推进')
+    total = payload.get('total')
+    if total is not None:
+        total = _comment_number(total)
+    return {'items': [_comment_item(item, root_id) for item in comments],
+            'next_cursor': next_cursor, 'has_more': bool(more), 'total': total}
+
+
 def download_directory(value, media_root):
     root = Path(media_root).resolve()
     path = Path(value.strip()) if value and value.strip() else root
@@ -304,25 +326,7 @@ class Core:
                 if any(word in response.text.lower() for word in ('验证码', '验证', '登录', '频繁', 'captcha', 'verify', 'login', 'rate limit')):
                     raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试') from None
                 raise ValueError('评论接口响应无效') from None
-            if not isinstance(payload, dict):
-                raise ValueError('评论结构无效')
-            status = payload.get('status_code')
-            if type(status) is not int or status != 0:
-                message = payload.get('status_msg', '')
-                if isinstance(message, str) and any(word in message.lower() for word in ('验证', '登录', '频繁', 'captcha', 'verify', 'login', 'rate limit')):
-                    raise CommentBlocked('评论访问需要登录、验证或暂时受限，请处理后重试')
-                raise ValueError('评论接口返回失败')
-            comments, more = payload.get('comments'), payload.get('has_more')
-            next_cursor = _comment_number(payload.get('cursor'))
-            if not isinstance(comments, list) or type(more) not in (int, bool) or more not in (0, 1):
-                raise ValueError('评论分页结构无效')
-            if more and (not comments or next_cursor <= cursor):
-                raise ValueError('评论分页未正常推进')
-            total = payload.get('total')
-            if total is not None:
-                total = _comment_number(total)
-            return {'items': [_comment_item(item, root_id) for item in comments],
-                    'next_cursor': next_cursor, 'has_more': bool(more), 'total': total}
+            return parse_comment_page(payload, cursor, root_id)
         except CommentBlocked:
             raise
         except Exception:

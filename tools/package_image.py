@@ -19,7 +19,6 @@ else:
 
 ROOT = Path(__file__).resolve().parents[1]
 BASE = "python:3.12-slim-bookworm@sha256:57d96f71de145a98e7ceca18ee4ade77bba4103a33a72dfaea026b23625c6bf0"
-TAG = "cloudrift:1.4.3"
 HEALTH = ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8090/health', timeout=5)"]
 ENV = {"PYTHONUNBUFFERED": "1", "PYTHONDONTWRITEBYTECODE": "1", "PYTHONPATH": "/opt/python", "APP_DATA": "/data", "APP_MEDIA": "/media", "APP_CORE": "/app/vendor/TikTokDownloader"}
 EXCLUDED = {".git", ".venv", ".comet", "__pycache__", "Volume", "data", "media", "node_modules"}
@@ -34,7 +33,7 @@ PUBLIC_SOURCE_DIRS = {
 PUBLIC_SOURCE_FILES = (
     "Dockerfile", "docker-compose.yml", "docker-compose.legacy.yml", "docker-compose.vaapi.yml",
     ".dockerignore", ".gitignore", ".gitattributes", ".env.example", "requirements.txt", "requirements-dev.txt",
-    "README.md", "AGENTS.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
+    "README.md", "LICENSE", "THIRD_PARTY_NOTICES.md", "CHANGELOG.md", "tools/README.md",
     ".github/workflows/ci.yml", ".github/workflows/publish-image.yml", "docs/architecture.md", "docs/migration.md",
     "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
     "docs/superpowers/plans/2026-10-30-history-comments-integration.md",
@@ -156,13 +155,18 @@ def source_zip(output):
             archive.write(path, path.relative_to(ROOT).as_posix())
 
 
-def package_source():
+def application_version():
     tree = ast.parse((ROOT / "app/main.py").read_text(encoding="utf-8"))
     version = next((ast.literal_eval(node.value) for node in tree.body
                     if isinstance(node, ast.Assign)
                     and any(isinstance(target, ast.Name) and target.id == "VERSION" for target in node.targets)), None)
     if not isinstance(version, str) or not re.fullmatch(r"[0-9]+(?:\.[0-9]+)*", version):
         raise ValueError("Expected a numeric application VERSION")
+    return version
+
+
+def package_source():
+    version = application_version()
     required = (".github/workflows/ci.yml", "docs/architecture.md", "docs/migration.md", "vendor/TikTokDownloader/PATCHES.md",
                 "docs/superpowers/specs/2026-10-30-offline-comments-design.md",
                 "docs/superpowers/plans/2026-10-30-history-comments-integration.md")
@@ -188,10 +192,14 @@ def package_source():
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     mode = parser.add_mutually_exclusive_group()
+    mode.add_argument("--version", action="store_true", help="Print the application version")
     mode.add_argument("--prepare-only", action="store_true", help="Download Linux dependencies without packaging app")
     mode.add_argument("--source-only", action="store_true", help="Package sources and Sender without downloads or crane")
     parser.add_argument("--crane", type=Path, default=ROOT / ".comet/tools/crane/crane.exe")
     args = parser.parse_args()
+    if args.version:
+        print(application_version())
+        return
     if args.source_only:
         package_source()
         return
@@ -219,15 +227,17 @@ def main():
     output = ROOT / "dist"
     output.mkdir(exist_ok=True)
     raw = stage / "image-raw.tar"
+    version = application_version()
+    tag = f"cloudrift:{version}"
     command = [crane, "mutate", BASE, "--platform", "linux/amd64", "--append", stage / "dependencies.tar",
                "--append", stage / "ffmpeg.tar", "--append", vaapi,
                "--append", stage / "application.tar", "--cmd", "python,-m,app", "--workdir", "/app",
                "--exposed-ports", "8090/tcp", "--label", "org.opencontainers.image.title=Cloudrift",
                "--label", "org.opencontainers.image.source=https://github.com/aevyrian/Cloudrift",
                "--label", "org.opencontainers.image.licenses=GPL-3.0",
-               "--label", "org.opencontainers.image.version=1.4.3",
+               "--label", f"org.opencontainers.image.version={version}",
                "--label", "org.opencontainers.image.vendor-core=473c90ff70c663cfb69310fff2b8d5192f200661",
-               "--tag", TAG, "--output", raw]
+               "--tag", tag, "--output", raw]
     for key, value in ENV.items():
         command.extend(["--env", f"{key}={value}"])
     run(*command)
@@ -238,7 +248,7 @@ def main():
     with tarfile.open(image) as archive:
         manifest = json.load(archive.extractfile("manifest.json"))[0]
         config = json.load(archive.extractfile(manifest["Config"]))
-    info = {"base": BASE, "tag": TAG, "manifest_digest": digest, "image_id": "sha256:" + manifest["Config"].removesuffix(".json"),
+    info = {"base": BASE, "tag": tag, "manifest_digest": digest, "image_id": "sha256:" + manifest["Config"].removesuffix(".json"),
             "architecture": config["architecture"], "os": config["os"], "layers": len(manifest["Layers"]),
             "core_commit": "473c90ff70c663cfb69310fff2b8d5192f200661",
             "crane_version": subprocess.check_output([str(crane), "version"], text=True).strip(),

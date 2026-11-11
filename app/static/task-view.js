@@ -8,7 +8,7 @@
   }
   function filterTasks(tasks, filter, query, title) {
     const search = query.trim().toLocaleLowerCase();
-    return tasks.filter(task => groupMatches(task, filter) && [title(task), task.id, ...(task.preview || []).map(item => item.nickname || '')].join(' ').toLocaleLowerCase().includes(search));
+    return tasks.filter(task => groupMatches(task, filter) && [title(task), task.id, ...(task.preview_nicknames || (task.preview || []).map(item => item.nickname || ''))].join(' ').toLocaleLowerCase().includes(search));
   }
   function selectedTask(tasks, id) {
     return tasks.find(task => String(task.id) === String(id)) || tasks.find(task => ATTENTION.includes(task.status)) || tasks[0];
@@ -17,13 +17,14 @@
   function bulkEligible(task, action) {
     return action === 'pause' ? ACTIVE.includes(task.status) : action === 'resume' ? task.status === 'paused' : action === 'retry' ? ['failed','interrupted','cancelled'].includes(task.status) : action === 'cancel' ? !['completed','cancelled'].includes(task.status) : true;
   }
-  function create({ application, makeTaskCard, title, onBatch = async () => {} }) {
+  function create({ application, makeTaskCard, title, onBatch = async () => {}, loadDetail, isActive = () => true }) {
     const byId = id => document.getElementById(id);
     const node = (tag, className, text) => { const result = document.createElement(tag); if (className) result.className = className; if (text !== undefined) result.textContent = String(text); return result; };
     const list = byId('task-list'), detail = byId('task-detail'), dialog = byId('task-detail-dialog'), dialogBody = byId('task-dialog-body');
     const query = byId('task-query'), filters = byId('task-filters'), summary = byId('task-summary');
     const filterButtons = new Map(), summaryButtons = new Map();
-    let tasks = [], filter = 'all', selected = null, lastData = null, batching = false;
+    const cards = new Map();
+    let tasks = [], filter = 'all', selected = null, lastData = null, batching = false, detailSerial = 0, detailSignature = null;
     const bulkButtons = new Map();
     if (byId('task-bulk-actions')) for (const [value,label] of [['pause','全部暂停'],['resume','全部继续'],['retry','全部重试'],['cancel','全部取消'],['delete','全部删除']]) {
       const button=node('button','secondary',label);button.type='button';
@@ -55,12 +56,23 @@
       const mark = node('span', 'task-letter', title(task).slice(0, 1)); mark.setAttribute('aria-hidden', 'true'); card.prepend(mark); return card;
     }
     function showDetail(task, openDialog) {
-      if (!task) { detail.replaceChildren(); detail.hidden = true; if (dialog.open) dialog.close(); return; }
+      if (!task) { detailSerial++; detailSignature = null; detail.replaceChildren(); detail.hidden = true; if (dialog.open) dialog.close(); return; }
+      const signature = JSON.stringify(task);
+      if (!openDialog && String(selected) === String(task.id) && detailSignature === signature) return;
+      detailSignature = signature;
       selected = task.id; detail.hidden = true;
       detail.replaceChildren(node('p', 'task-detail-label', '任务详情'), detailedCard(task));
       if (openDialog || dialog.open) {
         dialogBody.replaceChildren(detailedCard(task));
         if (!dialog.open) dialog.showModal();
+        if (loadDetail) {
+          const serial = ++detailSerial, current = () => serial === detailSerial && dialog.open && isActive() && String(selected) === String(task.id);
+          Promise.resolve().then(() => loadDetail(task.id)).then(full => {
+            if (current()) dialogBody.replaceChildren(detailedCard(full));
+          }).catch(error => {
+            if (current()) dialogBody.append(node('p', 'error', error.message || '读取详情失败，请稍后重试。'));
+          });
+        }
       }
     }
     function render() {
@@ -69,18 +81,32 @@
       for (const [value, button] of filterButtons) { button.setAttribute('aria-pressed', String(filter === value)); button.lastElementChild.textContent = counts[value]; }
       for (const [value, button] of summaryButtons) button.querySelector('strong').textContent = String(counts[value]).padStart(2, '0');
       byId('task-result-count').textContent = `${visible.length} 个任务`;
-      list.replaceChildren();
       const chosen = selectedTask(visible, selected);
       if (!visible.length) {
+        cards.clear(); list.replaceChildren();
         const empty = node('div', 'empty task-empty'), filtered = Boolean(query.value.trim() || filter !== 'all');
         empty.append(node('span', 'empty-symbol', '↓'), node('strong', '', filtered ? '没有匹配的任务' : '还没有下载任务'), node('p', '', filtered ? '换个关键词，或查看全部任务。' : '添加作品链接，或在抖音网页点击抖音收藏库助手发送。'));
         const button = node('button', 'secondary', filtered ? '查看全部任务' : '添加下载'); button.type = 'button';
         button.addEventListener('click', () => { if (filtered) { filter = 'all'; query.value = ''; render(); } else byId('open-submit').click(); });
         empty.append(button); list.append(empty);
       }
+      const desired = [];
       for (const task of visible) {
-        const card = detailedCard(task), button = node('button', 'secondary task-open-detail', '查看详情 →'); button.type = 'button';
-        button.addEventListener('click', () => showDetail(task, true)); card.querySelector('.record-actions').append(button); list.append(card);
+        const key = String(task.id), signature = JSON.stringify(task); let entry = cards.get(key);
+        if (!entry || entry.signature !== signature) {
+          const card = detailedCard(task), button = node('button', 'secondary task-open-detail', '查看详情 →'); button.type = 'button';
+          button.addEventListener('click', () => showDetail(task, true)); card.querySelector('.record-actions').append(button);
+          if (entry?.card.parentNode === list) entry.card.replaceWith(card);
+          entry = { card, signature }; cards.set(key, entry);
+        }
+        desired.push(entry.card);
+      }
+      if (visible.length) {
+        const keep = new Set(desired);
+        for (const child of [...list.children]) if (!keep.has(child)) child.remove();
+        for (const [index, card] of desired.entries()) if (list.children[index] !== card) list.insertBefore(card, list.children[index] || null);
+        const keys = new Set(visible.map(task => String(task.id)));
+        for (const key of cards.keys()) if (!keys.has(key)) cards.delete(key);
       }
       if (dialog.open) showDetail(chosen, false);
       detail.hidden = true;

@@ -59,13 +59,16 @@ class PackageTests(unittest.TestCase):
                 "docs/superpowers/plans/2026-10-30-history-comments-integration.md": "plan\n",
                 "vendor/TikTokDownloader/PATCHES.md": "patches\n",
                 ".env": "must not be included\n",
+                "AGENTS.md": "local instructions",
             }
             for name, content in files.items():
                 target = root / name
                 target.parent.mkdir(parents=True, exist_ok=True)
                 target.write_text(content, encoding="utf-8")
-            result = subprocess.run([sys.executable, "-S", str(root / "tools/package_image.py"), "--source-only"],
-                                    cwd=root, capture_output=True, text=True)
+            cli = [sys.executable, "-S", str(root / "tools/package_image.py")]
+            version = subprocess.check_output([*cli, "--version"], cwd=root, text=True)
+            self.assertEqual(version.strip(), "9.8.7")
+            result = subprocess.run([*cli, "--source-only"], cwd=root, capture_output=True, text=True)
             self.assertEqual(result.returncode, 0, result.stderr)
             dist = root / "dist"
             archive_path = dist / "cloudrift-v9.8.7-source.zip"
@@ -79,8 +82,9 @@ class PackageTests(unittest.TestCase):
                 self.assertEqual(set(entries), set(archive.namelist()))
                 for name, digest in entries.items():
                     self.assertEqual(hashlib.sha256(archive.read(name)).hexdigest(), digest)
-                self.assertTrue(set(files) - {".env"} <= set(entries))
+                self.assertTrue(set(files) - {".env", "AGENTS.md"} <= set(entries))
                 self.assertNotIn(".env", entries)
+                self.assertNotIn("AGENTS.md", entries)
                 self.assertEqual(sender_path.read_bytes(), archive.read("userscripts/douyin-send.user.js"))
             sums = dict(line.split("  ", 1)[::-1] for line in sums_path.read_text(encoding="utf-8").splitlines())
             self.assertEqual(set(sums), {archive_path.name, manifest_path.name, sender_path.name})

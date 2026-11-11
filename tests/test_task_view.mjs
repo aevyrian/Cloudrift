@@ -20,12 +20,17 @@ assert.deepEqual(view.filterTasks(tasks, 'active', '稍后', taskTitle).map(t =>
 assert.deepEqual(view.filterTasks(tasks, 'paused', '稍后', taskTitle).map(t => t.id), ['paused']);
 assert.equal(view.selectedTask(view.filterTasks(tasks, 'all', '山野', taskTitle), 'failed').id, 'running');
 assert.equal(view.selectedTask([], 'failed'), undefined);
+assert.deepEqual(view.filterTasks([{ ...tasks[0], preview_nicknames: ['山野慢镜头', '旧作者名'] }], 'all', '旧作者名', taskTitle).map(t => t.id), ['running'], '摘要仍可搜索所有预览昵称');
 
 class Element {
   constructor(tag = 'div', text = '') { this.tagName = tag; this.textContent = text; this.className = ''; this.children = []; this.dataset = {}; this.style = {}; this.attributes = {}; this.events = {}; this.value = ''; this.hidden = false; this.open = false; this.classList = { add: name => { this.className += ` ${name}`; } }; }
-  append(...items) { this.children.push(...items); }
+  append(...items) { for (const item of items) { item.parentNode?.removeChild(item); item.parentNode = this; this.children.push(item); } }
   prepend(...items) { this.children.unshift(...items); }
-  replaceChildren(...items) { this.children = [...items]; }
+  replaceChildren(...items) { for (const child of this.children) child.parentNode = null; this.children = []; this.append(...items); }
+  removeChild(item) { this.children.splice(this.children.indexOf(item), 1); item.parentNode = null; }
+  remove() { this.parentNode?.removeChild(this); }
+  insertBefore(item, other) { item.parentNode?.removeChild(item); item.parentNode = this; const index = other ? this.children.indexOf(other) : this.children.length; this.children.splice(index, 0, item); }
+  replaceWith(item) { const parent = this.parentNode; parent.insertBefore(item, this); parent.removeChild(this); }
   setAttribute(name, value) { this.attributes[name] = value; }
   addEventListener(name, callback) { this.events[name] = callback; }
   get lastElementChild() { return this.children.at(-1); }
@@ -35,7 +40,7 @@ class Element {
   close() { this.open = false; }
 }
 
-function fixture({ saved = null, readError = false, writeError = false, onBatch } = {}) {
+function fixture({ saved = null, readError = false, writeError = false, onBatch, loadDetail, onTaskAction } = {}) {
   const ids = Object.fromEntries(['task-list', 'task-detail', 'task-detail-dialog', 'task-dialog-body', 'task-query', 'task-filters', 'task-summary', 'task-layout-note', 'task-dialog-close', 'task-result-count', 'task-table-heading', 'open-submit'].map(id => [id, new Element()]));
   const choices = ['a', 'b'].map(value => { const button = new Element('button'); button.dataset.taskLayoutChoice = value; return button; });
   const writes = [];
@@ -46,9 +51,10 @@ function fixture({ saved = null, readError = false, writeError = false, onBatch 
   let requests = 0;
   globalThis.fetch = () => { requests++; throw Error('A layout change must not call the network'); };
   const application = new Element();
-  const makeTaskCard = task => { const card = new Element('article'); card.task = task; const actions = new Element('div'); actions.className = 'record-actions'; card.append(actions); return card; };
-  const controller = view.create({ root: { querySelectorAll: () => choices }, application, makeTaskCard, title: taskTitle, statusNames: {}, formatDate: () => '刚刚', onBatch });
-  return { ids, choices, application, controller, writes, requests: () => requests };
+  let builtCards = 0;
+  const makeTaskCard = task => { builtCards++; const card = new Element('article'); card.task = task; const actions = new Element('div'); actions.className = 'record-actions'; if (onTaskAction) { const button = new Element('button', '操作'); button.addEventListener('click', () => onTaskAction(task)); actions.append(button); } card.append(actions); return card; };
+  const controller = view.create({ root: { querySelectorAll: () => choices }, application, makeTaskCard, title: taskTitle, statusNames: {}, formatDate: () => '刚刚', onBatch, loadDetail });
+  return { ids, choices, application, controller, writes, requests: () => requests, builtCards: () => builtCards };
 }
 
 try {
@@ -87,6 +93,64 @@ try {
   const row = normal.ids['task-list'].children[0];
   normal.controller.update(structuredClone(tasks));
   assert.equal(normal.ids['task-list'].children[0], row, '重复轮询保留当前渲染与选择');
+  const incremental = fixture(); incremental.controller.update(tasks);
+  const first = incremental.ids['task-list'].children[0], second = incremental.ids['task-list'].children[1];
+  incremental.controller.update(tasks.map(task => task.id === 'failed' ? { ...task, completed: 3 } : task));
+  assert.equal(incremental.ids['task-list'].children[0], first, '另一任务变化时不得重建未变化的卡片');
+  assert.notEqual(incremental.ids['task-list'].children[1], second, '任务本身变化时卡片应更新');
+  const afterChange = [...incremental.ids['task-list'].children];
+  incremental.controller.update([tasks[4], tasks[0], tasks[2]]);
+  assert.deepEqual(incremental.ids['task-list'].children, [afterChange[4], afterChange[0], afterChange[2]], '删除及顺序变化应保留未变化的卡片');
+  const large = fixture(), many = Array.from({length: 2000}, (_, i) => ({id: String(i), kind:'detail', status:'queued', preview:[]}));
+  large.controller.update(many);
+  const beforeChange = large.builtCards();
+  large.controller.update(many.map(task => task.id === '1000' ? {...task, status:'paused'} : task));
+  assert.equal(large.builtCards() - beforeChange, 1, '2000条记录中一条变化时只构建一张卡片');
+  let completeDetail;
+  const detailFixture = fixture({loadDetail: () => new Promise(resolve => { completeDetail = resolve; })});
+  detailFixture.controller.update(tasks);
+  detailFixture.ids['task-list'].children[0].querySelector('.record-actions').children.at(-1).click();
+  await Promise.resolve();
+  assert.equal(typeof completeDetail, 'function', '打开详情必须按需获取完整记录');
+  detailFixture.ids['task-dialog-close'].click();
+  completeDetail({...tasks[0], preview: [{nickname: '不应显示的迟到详情'}]});
+  await Promise.resolve(); await Promise.resolve();
+  assert.equal(detailFixture.ids['task-detail-dialog'].open, false, '关闭后迟到的详情不能重新显示');
+  const pendingDetails = [];
+  const selectedFixture = fixture({loadDetail: id => new Promise(resolve => pendingDetails.push({id, resolve}))});
+  selectedFixture.controller.update(tasks);
+  assert.equal(pendingDetails.length, 0, '只浏览任务列表时不请求详情');
+  selectedFixture.ids['task-list'].children[0].querySelector('.record-actions').children.at(-1).click();
+  await Promise.resolve();
+  selectedFixture.ids['task-list'].children[1].querySelector('.record-actions').children.at(-1).click();
+  await Promise.resolve();
+  pendingDetails[0].resolve({...tasks[0], message:'旧详情'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(selectedFixture.ids['task-dialog-body'].children[0].task.id, 'failed', '前一任务的迟到详情不能覆盖当前选择');
+  pendingDetails[1].resolve({...tasks[1], message:'完整详情'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(selectedFixture.ids['task-dialog-body'].children[0].task.message, '完整详情', '当前任务详情应显示完整数据');
+  const pendingChanges = [];
+  const clickedChanges = [];
+  const changing = fixture({loadDetail: id => new Promise((resolve, reject) => pendingChanges.push({id, resolve, reject})), onTaskAction: task => clickedChanges.push(task.status)});
+  changing.controller.update(tasks);
+  changing.ids['task-list'].children[0].querySelector('.record-actions').children.at(-1).click();
+  await Promise.resolve();
+  changing.controller.update(tasks.map(task => task.id === 'running' ? {...task, status:'paused'} : task));
+  await Promise.resolve();
+  pendingChanges[0].resolve({...tasks[0], status:'downloading'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(changing.ids['task-dialog-body'].children[0].task.status, 'paused', '状态变化后旧详情不能恢复已过期的按钮');
+  pendingChanges[1].reject(new Error('网络中断'));
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(changing.ids['task-dialog-body'].children[0].task.status, 'paused', '请求失败后保留当前状态的按钮');
+  assert.equal(changing.ids['task-dialog-body'].children.at(-1).textContent, '网络中断', '详情失败应提示用户');
+  changing.ids['task-dialog-body'].children[0].querySelector('.record-actions').children[0].click();
+  assert.deepEqual(clickedChanges, ['paused'], '断线后按钮闭包必须使用最新状态');
+  changing.ids['task-list'].children[0].querySelector('.record-actions').children.at(-1).click();
+  await Promise.resolve(); pendingChanges[2].resolve({...tasks[0], status:'paused', message:'已重新读取'});
+  await new Promise(resolve => setImmediate(resolve));
+  assert.equal(changing.ids['task-dialog-body'].children[0].task.message, '已重新读取', '网络恢复后重新打开可加载详情');
   normal.ids['task-query'].value = '不存在'; normal.ids['task-query'].events.input();
   assert.equal(normal.ids['task-detail'].hidden, true);
   assert.equal(fixture({ saved: 'b' }).application.dataset.taskLayout, 'a', '旧B偏好必须回到A');
@@ -116,6 +180,7 @@ try {
     const stored = new Map([['library_access_key', state.token]]);
     const context = vm.createContext({
       $: id => session.ids[id], state, switchView, taskView: session.controller, AbortSignal,
+      CloudriftCommentEntry: { create: () => ({reset() {}}) }, element: () => new Element(), notice() {},
       document: { querySelectorAll: selector => selector === 'dialog[open]' ? [session.ids['task-detail-dialog'], session.ids['submit-dialog']].filter(dialog => dialog.open) : [] },
       localStorage: { getItem: key => stored.get(key), removeItem: key => stored.delete(key) },
       fetch: async () => ({ ok: false, status, json: async () => ({ detail: '请重新登录' }) })
@@ -149,6 +214,10 @@ const cardContext = vm.createContext({
 const cardFunction = webSource.slice(webSource.indexOf('  function taskCard(task)'), webSource.indexOf('  const taskView ='));
 assert.ok(cardFunction.startsWith('  function taskCard(task)'));
 vm.runInContext(`${cardFunction}\nglobalThis.makeCard = taskCard;`, cardContext);
+const quality = cardContext.makeCard({ id: 'quality', status: 'awaiting_confirmation', kind: 'detail', link: 'https://example.test', preview: Array.from({length: 6}, (_, i) => ({id: `${i}`, nickname: `用户${i}`, desc: `作品${i}`, width: 1080, height: 1920})) });
+const qualityContent = quality.children[0].children.map(child => child.textContent);
+assert.ok(qualityContent.includes('用户4 · 作品4 · 1080 × 1920'), '画质确认列表显示前五条预览');
+assert.ok(!qualityContent.includes('用户5 · 作品5 · 1080 × 1920'), '画质确认预览限制仍为五条');
 for (const [status, label, suffix] of [['failed', '重试', 'retry'], ['queued', '取消', 'cancel'], ['awaiting_confirmation', '接受此任务原项目优选', 'confirm'], ['awaiting_confirmation', '取消', 'cancel']]) {
   const card = cardContext.makeCard({ id: 'task/a', status, kind: 'detail', link: 'https://www.douyin.com/video/123', preview: [] });
   await card.querySelector('.record-actions').children.find(node => node.textContent === label).invoke();

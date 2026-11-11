@@ -9,6 +9,8 @@ import shutil
 import time
 from pathlib import Path
 
+from .blocking import run_blocking
+
 
 def needs_compatibility(path, info):
     video=next((s for s in info.get('streams',[]) if s.get('codec_type')=='video'),None)
@@ -31,6 +33,7 @@ class PlaybackCache:
     def __init__(self, root, limit=20*1024**3):
         self.root=Path(root);self.root.mkdir(parents=True,exist_ok=True,mode=0o700);self.root.chmod(0o700)
         self.limit=limit;self.records={};self.jobs={};self.encode_lock=asyncio.Lock();self.probe_lock=asyncio.Lock()
+        self.probes={};self.probe_condition=asyncio.Condition();self.active_probes=0;self.active_warm_probes=0
         self.ffmpeg=os.environ.get('FFMPEG_PATH','ffmpeg');self.ffprobe=os.environ.get('FFPROBE_PATH','ffprobe')
         self.hardware=Path('/dev/dri/renderD128').is_char_device()
         for p in self.root.glob('*.part.mp4'):
@@ -83,28 +86,83 @@ class PlaybackCache:
             if proc and proc.returncode is None:
                 proc.kill();await proc.wait()
 
+    async def probe_record(self, path, key, entry):
+        started=False
+        try:
+            async with self.probe_condition:
+                await self.probe_condition.wait_for(lambda: self.active_probes<2 and (
+                    not entry['warm'] or (not self.active_warm_probes and not any(
+                        not item['warm'] and not item['started'] for item in self.probes.values()))))
+                entry['started']=True;started=True;was_warm=entry['warm']
+                self.active_probes+=1;self.active_warm_probes+=int(was_warm)
+                self.probe_condition.notify_all()
+            info=await self.probe(path)
+            record={'compatible':needs_compatibility(path,info),'duration':duration(info),'progress':0}
+            record=self.records.setdefault(key,record)
+            self.trim_records(key)
+            return record
+        finally:
+            async with self.probe_condition:
+                if started:self.active_probes-=1;self.active_warm_probes-=int(was_warm)
+                if self.probes.get(key) is entry:self.probes.pop(key)
+                self.probe_condition.notify_all()
+
     async def prepare(self, path, force=False, retry=False, warm=False):
         output=self.target(path);key=output.stem
+        if not warm:
+            for old,job in list(self.jobs.items()):
+                if old!=key and self.records[old].get('warm') and not self.records[old].get('clients'):
+                    if not job.cancelling():job.cancel()
+        if self.ready(path):
+            os.utime(output,None)
+            return {'status':'ready','mode':'compatible'}
+        record=self.records.get(key)
+        while record is None:
+            async with self.probe_condition:
+                record=self.records.get(key)
+                entry=self.probes.get(key) if record is None else None
+                stale=entry['task'] if entry is not None and entry['task'].cancelling() else None
+                if record is None and entry is None:
+                    if len(self.probes)>=16 or (warm and sum(item['warm'] for item in self.probes.values())>=8):
+                        return {'status':'waiting','progress':None}
+                    entry={'warm':warm,'started':False,'waiters':0}
+                    self.probes[key]=entry
+                    entry['task']=asyncio.create_task(self.probe_record(path,key,entry))
+                    entry['task'].add_done_callback(lambda task: None if task.cancelled() else task.exception())
+                elif entry is not None and stale is None and not warm:
+                    entry['warm']=False
+                    self.probe_condition.notify_all()
+                task=entry['task'] if entry is not None and stale is None else None
+                if task is not None:entry['waiters']+=1
+            if stale is not None:
+                try:await asyncio.shield(stale)
+                except asyncio.CancelledError:
+                    if asyncio.current_task().cancelling():raise
+                except Exception:pass
+                continue
+            if task is not None:
+                try:record=await asyncio.shield(task)
+                finally:
+                    async with self.probe_condition:
+                        entry['waiters']-=1
+                        if not entry['waiters'] and not task.done():
+                            task.cancel()
+                            if not entry['started'] and self.probes.get(key) is entry:
+                                self.probes.pop(key);self.probe_condition.notify_all()
         async with self.probe_lock:
             if not warm:
                 cancelled=[(old,job) for old,job in self.jobs.items() if old!=key
                            and self.records[old].get('warm') and not self.records[old].get('clients')]
-                for _,job in cancelled:job.cancel()
+                for _,job in cancelled:
+                    if not job.cancelling():job.cancel()
                 await asyncio.gather(*(job for _,job in cancelled),return_exceptions=True)
                 for old,job in cancelled:
                     if self.jobs.get(old) is job:self.jobs.pop(old)
             if self.ready(path):
                 os.utime(output,None)
                 return {'status':'ready','mode':'compatible'}
-            if key not in self.records:
-                info=await self.probe(path)
-                self.records[key]={'compatible':needs_compatibility(path,info),'duration':duration(info),'progress':0}
-                # shortcut: Keep only recent probes; scan the library only on explicit user request.
-                if len(self.records)>512:
-                    for old in list(self.records):
-                        if old!=key and old not in self.jobs:
-                            del self.records[old];break
-            record=self.records[key]
+            record=self.records.setdefault(key,record)
+            self.trim_records(key)
             record['requested']=time.monotonic()
             if key not in self.jobs or not warm:record['warm']=warm
             if not force and not record['compatible']:return {'status':'ready','mode':'original'}
@@ -116,6 +174,13 @@ class PlaybackCache:
                 record['progress']=0;self.jobs[key]=asyncio.create_task(self.convert(path,output,record))
             return {'status':'preparing','progress':record['progress']}
 
+    def trim_records(self, key):
+        # shortcut: Keep only recent probes; scan the library only on explicit user request.
+        if len(self.records)>512:
+            for old in list(self.records):
+                if old!=key and old not in self.jobs:
+                    del self.records[old];break
+
     async def convert(self, path, output, record):
         temporary=output.with_suffix('.part.mp4')
         try:
@@ -126,9 +191,7 @@ class PlaybackCache:
                 await self.encode(path,temporary,record)
                 if self.target(path)!=output:raise RuntimeError('原文件在准备期间发生变化，请重新打开作品')
                 if not temporary.is_file() or not temporary.stat().st_size:raise RuntimeError('播放副本未完整生成，请重试')
-                temporary.chmod(0o600)
-                with temporary.open('rb+') as stream:os.fsync(stream.fileno())
-                os.replace(temporary,output);self.prune(output)
+                await run_blocking(self.publish,temporary,output)
         except asyncio.CancelledError:
             raise
         except Exception as exc:
@@ -185,7 +248,19 @@ class PlaybackCache:
             if p!=keep:
                 size-=p.stat().st_size;p.unlink()
 
+    def publish(self, temporary, output):
+        temporary.chmod(0o600)
+        with temporary.open('rb+') as stream:os.fsync(stream.fileno())
+        os.replace(temporary,output);self.prune(output)
+
     async def close(self):
+        entries=list(self.probes.items());probes=[entry['task'] for _,entry in entries]
+        for probe in probes:
+            if not probe.cancelling():probe.cancel()
+        await asyncio.gather(*probes,return_exceptions=True)
+        for key,entry in entries:
+            if self.probes.get(key) is entry:self.probes.pop(key)
         jobs=list(self.jobs.values())
-        for job in jobs:job.cancel()
+        for job in jobs:
+            if not job.cancelling():job.cancel()
         await asyncio.gather(*jobs,return_exceptions=True)

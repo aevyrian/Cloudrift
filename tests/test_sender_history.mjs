@@ -7,14 +7,15 @@ const A='7421234567890123456',B='7421234567890123457';
 let sequence=0;
 const tick=()=>new Promise(resolve=>setImmediate(resolve));
 function fixture(storage={library_server:'http://nas.example:8090',library_token:'secret-one'}){
-  let now=Date.parse('2026-10-30T12:00:00Z'), active=A, shown=true, preview=false, failStorage=false, failScan=false, scans=0, author='MS4wLjABAAAA_first', caption='第一条';
+  let now=Date.parse('2026-10-30T12:00:00Z'), active=A, shown=true, preview=false, failStorage=false, failScan=false, scans=0, layoutReads=0, taskReads=0, author='MS4wLjABAAAA_first', caption='第一条';
   const requests=[],timers=[],frames=[],callbacks={},elements=[], page=new URL('https://www.douyin.com/?recommend=1');
   class Clock extends Date {constructor(...args){super(...(args.length?args:[now]));}static now(){return now;}}
+  class CountedURL extends URL {constructor(...args){super(...args);if(String(args[0]).includes('_bulk_'))taskReads++;}}
   function element(tag){
     const listeners={},attrs={};
     const node={tag,style:{},dataset:{},classList:{toggle(){},add(){},remove(){}},children:[],hidden:false,open:false,textContent:'',value:'',disabled:false,offsetHeight:300,
       append(...items){this.children.push(...items)},setAttribute(k,v){attrs[k]=String(v)},getAttribute(k){return attrs[k]??null},
-      addEventListener(k,fn){(listeners[k]??=[]).push(fn)},contains(){return false},matches(){return false},closest(){return null},
+      addEventListener(k,fn){(listeners[k]??=[]).push(fn)},click(){for(const fn of listeners.click||[])fn({target:this})},contains(){return false},matches(){return false},closest(){return null},
       querySelector(){return null},querySelectorAll(){return []},getBoundingClientRect(){return {width:0,height:0,top:0,bottom:0,left:0}},
       attachShadow(){return element('shadow')},focus(){}};
     elements.push(node);return node;
@@ -22,13 +23,13 @@ function fixture(storage={library_server:'http://nas.example:8090',library_token
   const feed={matches:s=>s==='[data-e2e-vid], [data-e2e-aweme-id]',getAttribute:name=>name==='data-e2e-vid'?active:null,
     querySelector:s=>s==='a[data-e2e="video-author-name"], a[data-e2e="video-avatar"]'?{href:`https://www.douyin.com/user/${author}`,textContent:author}:
       s==='[data-e2e="feed-video-nickname"]'?{textContent:author}:s==='[data-e2e="video-desc"], [data-e2e="feed-video-desc"]'?{textContent:caption}:null,
-    querySelectorAll:()=>[],contains:()=>false,getBoundingClientRect:()=>shown?{width:1000,height:700,top:0,bottom:700,left:0}:{width:0,height:0,top:0,bottom:0,left:0}};
+    querySelectorAll:()=>[],contains:()=>false,getBoundingClientRect:()=>{layoutReads++;return shown?{width:1000,height:700,top:0,bottom:700,left:0}:{width:0,height:0,top:0,bottom:0,left:0}}};
   const doc={body:element('body'),createElement:element,visibilityState:'visible',querySelector:()=>null,
     querySelectorAll:s=>s==='[data-e2e="feed-active-video"]'?[feed]:s==='[data-e2e="video-detail"], [data-e2e="note-detail"]'&&preview?[feed]:[],addEventListener(k,fn){callbacks[k]=fn}};
   const mockCrypto={randomUUID(){return `00000000-0000-4000-8000-${String(++sequence).padStart(12,'0')}`;},subtle:{async digest(_,data){
     const result=new Uint8Array(32);for(let i=0;i<data.length;i++)result[i%32]=(result[i%32]*31+data[i])%256;return result.buffer;
   }}};
-  runInNewContext(script,{URL,document:doc,location:page,innerWidth:1200,innerHeight:800,Date:Clock,crypto:mockCrypto,TextEncoder,
+  runInNewContext(script,{URL:CountedURL,document:doc,location:page,innerWidth:1200,innerHeight:800,Date:Clock,crypto:mockCrypto,TextEncoder,
     GM_getValue:(key,fallback)=>structuredClone(storage[key]??fallback),GM_setValue:(key,value)=>{if(failStorage&&key.startsWith('library_browse_event_'))throw Error('storage');storage[key]=structuredClone(value)},
     GM_listValues:()=>{scans++;if(failScan)throw Error('storage');return Object.keys(storage)},GM_deleteValue:key=>{delete storage[key]},GM_registerMenuCommand(){},
     GM_xmlhttpRequest:request=>requests.push(request),ResizeObserver:class{observe(){}disconnect(){}},MutationObserver:class{observe(){}},
@@ -40,7 +41,7 @@ function fixture(storage={library_server:'http://nas.example:8090',library_token
   const posts=()=>requests.filter(request=>request.url.endsWith('/api/browse-history'));
   const reply=(request,value,status=200)=>request.onload({status,responseText:JSON.stringify(value)});
   function visibility(value){doc.visibilityState=value;callbacks.visibilitychange();if(value==='visible')while(frames.length)frames.shift()();}
-  return {storage,requests,posts,pending,detect,advance,reply,doc,feed,elements,visibility,scans:()=>scans,setShown(value){shown=value},setPreview(value){preview=value},setFailStorage(value){failStorage=value},setFailScan(value){failScan=value},page};
+  return {storage,requests,posts,pending,detect,advance,reply,doc,feed,elements,visibility,scans:()=>scans,layoutReads:()=>layoutReads,taskReads:()=>taskReads,setShown(value){shown=value},setPreview(value){preview=value},setFailStorage(value){failStorage=value},setFailScan(value){failScan=value},page};
 }
 
 const b=fixture();await tick();
@@ -49,17 +50,17 @@ const first=b.pending()[0][1].item;
 assert.equal(first.work_id,A);assert.equal(first.title,'第一条');assert.equal(first.author_name,'MS4wLjABAAAA_first');
 assert.equal(first.author_url,'https://www.douyin.com/user/MS4wLjABAAAA_first');
 assert.match(first.event_id,/^[0-9a-f-]{36}$/);assert.equal(first.viewed_at,'2026-10-30T12:00:00.000Z');
-assert.match(b.elements.find(el=>el.className==='history-status').textContent,/待同步/);
+assert.match(b.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/待同步/);
 const scans=b.scans();for(let i=0;i<30;i++)b.detect(A);await tick();assert.equal(b.scans(),scans,'页面频繁变化时不能每帧扫描存储');
 await b.advance(2100);assert.equal(b.posts().length,1);
 const failed=b.posts()[0];assert.equal(failed.headers.Authorization,'Bearer secret-one');failed.onerror();await tick();
 assert.equal(b.pending().length,1,'网络错误不删除本地记录');
-assert.match(b.elements.find(el=>el.className==='history-status').textContent,/同步失败/);
+assert.match(b.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/同步失败/);
 await b.advance(30000);assert.equal(b.posts().length,2);
 const retry=b.posts()[1];assert.equal(JSON.parse(retry.data).items[0].event_id,first.event_id,'重试沿用相同事件 ID');
 b.reply(retry,{accepted:0});await tick();assert.equal(b.pending().length,1,'未确认整个批次不能删除');
 await b.advance(30000);const success=b.posts().at(-1);b.reply(success,{accepted:1});await tick();assert.equal(b.pending().length,0);
-assert.match(b.elements.find(el=>el.className==='history-status').textContent,/已同步/);
+assert.match(b.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/已同步/);
 
 b.detect(B,'MS4wLjABAAAA_second','第二条');await tick();assert.equal(b.pending().length,1);
 let second=b.pending()[0][1].item;assert.equal(second.work_id,B);assert.equal(second.title,'第二条');assert.equal(second.author_name,'MS4wLjABAAAA_second');
@@ -114,10 +115,40 @@ tabA.detect(A,'MS4wLjABAAAA_first','另一个标签发出后才出现的标题')
 assert.equal(tabA.pending().length,1,'另一个标签发送后，本标签迟到的资料仍应重排');
 assert.equal(tabA.pending()[0][1].item.event_id,tabAEvent);
 const broken=fixture();await tick();broken.setFailStorage(true);broken.detect(B);await tick();
-assert.match(broken.elements.find(el=>el.className==='history-status').textContent,/助手存储失败/,'存储失败应明确提示');
-broken.setFailStorage(false);broken.detect(B);await tick();assert.match(broken.elements.find(el=>el.className==='history-status').textContent,/待同步/,'存储恢复后自动重试');
+assert.match(broken.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/助手存储失败/,'存储失败应明确提示');
+broken.setFailStorage(false);broken.detect(B);await tick();assert.match(broken.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/待同步/,'存储恢复后自动重试');
 const scanFailure=fixture();await tick();scanFailure.setFailScan(true);await scanFailure.advance(1100);
-assert.match(scanFailure.elements.find(el=>el.className==='history-status').textContent,/助手存储失败/);
+assert.match(scanFailure.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/助手存储失败/);
 scanFailure.setFailScan(false);await scanFailure.advance(30000);
-assert.doesNotMatch(scanFailure.elements.find(el=>el.className==='history-status').textContent,/助手存储失败/,'读取恢复后可继续同步并消除错误');
-console.log('PASS: 面板关闭识别、真实切换、背景页隔离、断网持久重试、确认后清除和网站/密钥隔离');
+assert.doesNotMatch(scanFailure.elements.find(el=>el.className==='history-status'&&!el.getAttribute('aria-live')).textContent,/助手存储失败/,'读取恢复后可继续同步并消除错误');
+const hidden=fixture();await tick();hidden.visibility('hidden');const beforeLayout=hidden.layoutReads();
+for(let i=0;i<10;i++)hidden.detect(A);await hidden.advance(2100);
+assert.equal(hidden.posts().length,1,'后台仍应发送已经保存的浏览历史');
+assert.equal(hidden.pending().length,1,'网站未确认时历史不能删除');
+hidden.posts()[0].onerror();await tick();await hidden.advance(30000);
+assert.equal(hidden.posts().length,2,'后台断网恢复后仍要重试浏览历史');
+hidden.reply(hidden.posts()[1],{accepted:1});await tick();
+assert.equal(hidden.pending().length,0,'后台重试确认后清除历史');
+const hiddenLayoutReads=hidden.layoutReads()-beforeLayout;
+
+const repeated=fixture();await tick();repeated.elements.find(el=>el.className==='toggle').click();
+const authorsRequest=repeated.requests.find(request=>request.url.endsWith('/api/authors'));
+const tasksRequest=repeated.requests.find(request=>request.url.endsWith('/api/tasks'));
+assert.ok(authorsRequest&&tasksRequest,'打开面板须加载博主和任务');
+const authorURL='https://www.douyin.com/user/MS4wLjABAAAA_first';
+const largeHistory=[{kind:'author',link:authorURL,status:'downloading',updated_at:'2026-10-30T12:00:00Z'},...Array.from({length:500},(_,i)=>({kind:'author',link:`https://www.douyin.com/user/MS4wLjABAAAA_bulk_${i}`,status:'completed',updated_at:'2026-10-30T12:00:00Z'}))];
+repeated.reply(authorsRequest,[{id:'current',url:authorURL,enabled:true}]);repeated.reply(tasksRequest,largeHistory);await tick();
+assert.match(repeated.elements.find(el=>el.className==='state-note').textContent,/正在下载/);
+let taskReads=repeated.taskReads();for(let i=0;i<10;i++)repeated.detect(A);
+const repeatedTaskReads=repeated.taskReads()-taskReads;
+repeated.elements.find(el=>el.className==='toggle').click();taskReads=repeated.taskReads();
+for(let i=0;i<10;i++)repeated.detect(A);
+const closedTaskReads=repeated.taskReads()-taskReads;
+assert.deepEqual([hiddenLayoutReads,repeatedTaskReads,closedTaskReads],[0,0,0],'隐藏页面不测量布局，任务未变化时不反复扫描摘要');
+repeated.elements.find(el=>el.className==='toggle').click();
+repeated.elements.find(el=>el.className==='refresh-state').click();
+const newAuthors=repeated.requests.filter(request=>request.url.endsWith('/api/authors')).at(-1),newTasks=repeated.requests.filter(request=>request.url.endsWith('/api/tasks')).at(-1);
+repeated.reply(newAuthors,[{id:'current',url:authorURL,enabled:true}]);repeated.reply(newTasks,[{kind:'author',link:authorURL,status:'completed',updated_at:'2026-10-30T12:00:00Z'}]);await tick();
+assert.doesNotMatch(repeated.elements.find(el=>el.className==='state-note').textContent,/正在下载/,'任务刷新后摘要必须更新');
+assert.notEqual(repeated.elements.find(el=>el.className==='last-success').textContent,'暂无记录','最新成功时间必须更新');
+console.log('PASS: 面板关闭识别、真实切换、背景页隔离、断网持久重试、确认后清除、网站/密钥隔离与后台开销');

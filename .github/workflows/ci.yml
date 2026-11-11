@@ -31,7 +31,10 @@ jobs:
           for test in tests/test_*.mjs; do node "$test"; done
           node --check app/static/app.js
       - name: Package source
-        run: python tools/package_image.py --source-only
+        run: |
+          version="$(python tools/package_image.py --version)"
+          echo "CLOUDRIFT_VERSION=$version" >> "$GITHUB_ENV"
+          python tools/package_image.py --source-only
       - name: Build clean Linux amd64 image
         run: docker compose build
       - name: Verify fresh container startup
@@ -39,7 +42,7 @@ jobs:
           docker compose up -d --no-build
           for attempt in $(seq 1 45); do
             if curl --fail --silent http://127.0.0.1:8090/health > /tmp/health.json &&
-              python -c 'import json; d=json.load(open("/tmp/health.json")); assert d["status"] == "ok" and d["core_ready"] and d["worker_alive"]'; then
+              python -c 'import json, os; d=json.load(open("/tmp/health.json")); assert d["status"] == "ok" and d["core_ready"] and d["worker_alive"] and d["version"] == os.environ["CLOUDRIFT_VERSION"]'; then
               cat /tmp/health.json
               curl --fail --silent http://127.0.0.1:8090/ > /tmp/index.html
               exit 0
@@ -49,11 +52,13 @@ jobs:
           docker compose logs
           exit 1
       - name: Save installation image
+        shell: bash
         if: github.event_name != 'pull_request'
         run: |
-          docker save cloudrift:1.4.3 | gzip > dist/cloudrift-v1.4.3-linux-amd64.tar.gz
+          release="cloudrift-v${CLOUDRIFT_VERSION}"
+          docker save "cloudrift:$CLOUDRIFT_VERSION" | gzip > "dist/$release-linux-amd64.tar.gz"
           cd dist
-          sha256sum cloudrift-v1.4.3-source.zip cloudrift-v1.4.3-files.sha256 douyin-send.user.js cloudrift-v1.4.3-linux-amd64.tar.gz > SHA256SUMS.txt
+          sha256sum "$release-source.zip" "$release-files.sha256" douyin-send.user.js "$release-linux-amd64.tar.gz" > SHA256SUMS.txt
       - uses: actions/upload-artifact@v4
         if: github.event_name != 'pull_request'
         with:

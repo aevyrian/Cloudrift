@@ -14,7 +14,7 @@ function makeApp({blocked=false}={}){
   const state={token:'private-test-token',cookieSyncGeneration:0},requests=[],popups=[];
   let getResponse=()=>Promise.resolve({status:'success'}),created={id:nonce,status:'waiting'};
   const context=vm.createContext({state,$:id=>nodes[id],Date,URL,
-    setTimeout:fn=>{queueMicrotask(fn);return 1},clearTimeout(){},
+    setTimeout:(fn,delay)=>{if(delay===1200)queueMicrotask(fn);return 1},clearTimeout(){},
     loadSettings:async()=>({}),
     window:{focus(){},open(){if(blocked)return null;const tab={opener:{},location:{href:'about:blank'},closed:false,close(){this.closed=true}};popups.push(tab);return tab},confirm:()=>false},
     api:async(path,method='GET')=>{requests.push({path,method});if(method==='POST'){assert.ok(blocked||popups.length===1,'必须在异步请求前打开窗口');return created}return getResponse()},
@@ -46,6 +46,7 @@ function makeApp({blocked=false}={}){
   assert.equal(b.nodes['cookie-sync-link'].hidden,false,'弹窗受阻时提供可点击入口');
   assert.equal(b.nodes['cookie-sync-link'].href,`https://www.douyin.com/jingxuan#library-cookie-sync=${nonce}`);
   resolve({status:'failed',message:'sessionid=secret-must-not-be-rendered'});await Promise.all([first,second]);
+  assert.equal(b.nodes['cookie-sync-message'].textContent,'更新失败：请检查抖音登录和助手权限后重试。','失败时应显示可操作的安全提示');
   assert.doesNotMatch(b.nodes['cookie-sync-message'].textContent,/secret-must-not-be-rendered/,'错误响应不能回显 Cookie');
   assert.notEqual(b.nodes['cookie-state'].textContent,'配置生效中','验证失败不得显示已保存');
 }
