@@ -33,7 +33,7 @@ from .comment_batch import CommentBatchService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.12"
+VERSION = "1.4.13"
 LARGE_DOWNLOAD_LIMIT = 1000
 BASE = Path(__file__).resolve().parent
 
@@ -233,7 +233,8 @@ class JobService:
                 unknown[uid] = self.store.legacy_unidentified(uid)
             unidentified = unknown.get(uid, False)
         if recorded:
-            raise RuntimeError('旧下载记录已有此作品，但无法可靠定位文件，已停止以免重复下载')
+            # 下载记录只能证明曾下载，文件无法核对时按原作品 ID 补齐。
+            return False
         if unidentified:
             raise RuntimeError('此博主存在无法识别时间的旧文件，已停止以免重复下载，请先核对旧文件')
         return False

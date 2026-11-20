@@ -373,20 +373,26 @@ class LegacyDedupTests(unittest.IsolatedAsyncioTestCase):
         with self.store.connect() as db:
             self.assertEqual([tuple(row) for row in db.execute('SELECT id,work_id FROM work_aliases')],[(WORK_ID,local_id)])
 
-    async def test_unfinished_index_and_unlocatable_old_record_do_not_redownload(self):
-        self.original()
-        job=await self.run_job(); self.assertEqual(job['status'],'failed')
-        self.assertEqual(self.core.download_calls,0)
-        LegacyIndex(self.store,self.media).scan(); self.item['create_time']='2025-12-02 12:30:00'
+    async def test_unlocatable_old_record_downloads_by_id_after_index_is_ready(self):
+        original = self.original()
+        blocked = await self.run_job()
+        self.assertIn('旧库未就绪', blocked['message'])
+        self.assertEqual(self.core.download_calls, 0)
+        await self.service.cancel(blocked['id'])
+        LegacyIndex(self.store, self.media).scan()
+        self.item['create_time'] = '2025-12-02 12:30:00'
         import sqlite3
-        with sqlite3.connect(self.media/'DouK-Downloader.db') as db:
+        with sqlite3.connect(self.media / 'DouK-Downloader.db') as db:
             db.execute('CREATE TABLE download_data(ID TEXT PRIMARY KEY)')
-            db.execute('INSERT INTO download_data VALUES (?)',(WORK_ID,))
+            db.execute('INSERT INTO download_data VALUES (?)', (WORK_ID,))
         db.close()
-        self.service.retry(job['id']); await self.service.process_one()
-        self.assertEqual(self.store.task(job['id'])['status'],'failed')
-        self.assertIn('旧下载记录',self.store.task(job['id'])['message'])
-        self.assertEqual(self.core.download_calls,0)
+        job = await self.run_job()
+        self.assertEqual(job['status'], 'completed')
+        self.assertEqual(self.store.work(WORK_ID)['id'], WORK_ID)
+        self.assertEqual(original.read_bytes(), b'original')
+        self.assertEqual(self.core.download_calls, 1)
+        await self.run_job()
+        self.assertEqual(self.core.download_calls, 1)
 
     async def test_actual_new_work_is_saved_under_volume_root(self):
         self.original(); LegacyIndex(self.store,self.media).scan()
