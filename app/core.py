@@ -264,13 +264,18 @@ class Core:
                 def __getattr__(self, name):
                     return lambda *args, **kwargs: None
 
+            def require_anonymous_response(response):
+                if response.status_code == 429 or any(message in response.text for message in ('请完成验证', '访问过于频繁')):
+                    raise DownloadBlocked('访客资料查询触发验证或限流')
+                if response.status_code != 200 or not response.content:
+                    raise ValueError
+
             allowed = {'accept', 'accept-encoding', 'content-type', 'referer'}
             headers = {key: value for key, value in DATA_HEADERS.items() if key.lower() in allowed}
             registration_headers = {key: value for key, value in PARAMS_HEADERS.items() if key.lower() in allowed}
             async with AsyncSession(timeout=5, impersonate=IMPERSONATE, verify=True, allow_redirects=False) as client:
                 registration = await client.post(TtWid.API, data=TtWid.DATA, headers=registration_headers)
-                if registration.status_code != 200 or not registration.content or any(text in registration.text for text in ('请完成验证', '访问过于频繁')):
-                    raise ValueError
+                require_anonymous_response(registration)
                 cookies = SimpleCookie()
                 cookies.load(registration.headers.get('Set-Cookie', ''))
                 visitor = cookies.get('ttwid')
@@ -278,8 +283,7 @@ class Core:
                     raise ValueError
                 client.cookies.set('ttwid', visitor.value, domain='.douyin.com')
                 home = await client.get('https://www.douyin.com/', headers=headers)
-                if home.status_code != 200 or not home.content or any(text in home.text for text in ('请完成验证', '访问过于频繁')):
-                    raise ValueError
+                require_anonymous_response(home)
                 params = SimpleNamespace(headers=headers, logger=Silent(), console=Silent(), douyin_params=DouYinParams(),
                                          max_retry=0, timeout=5, client=client, impersonate=IMPERSONATE, user_agent=USERAGENT)
                 query = User(params, sec_user_id=sec_uid)
@@ -292,8 +296,7 @@ class Core:
                 # 数量已有缓存和并发限流，不走下载分页的随机等待。
                 signed = query.deal_url_params(query.api, values)
                 response = await client.get(f'{query.api}?{signed}', headers=query.headers)
-                if response.status_code != 200 or not response.content or any(text in response.text for text in ('请完成验证', '访问过于频繁')):
-                    raise ValueError
+                require_anonymous_response(response)
                 payload = response.json()
                 user = payload.get('user') if isinstance(payload, dict) else None
             count = user.get('aweme_count') if isinstance(user, dict) else None
@@ -302,6 +305,8 @@ class Core:
             nickname = user.get('nickname')
             nickname = ''.join(c for c in nickname if ord(c) >= 32 and ord(c) != 127).strip()[:100] if isinstance(nickname, str) else ''
             return {'count': count, 'nickname': nickname}
+        except DownloadBlocked:
+            raise
         except Exception:
             raise RuntimeError('无法获取博主作品数量') from None
 

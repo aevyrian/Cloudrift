@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Literal
 from urllib.parse import urlsplit
 
-from fastapi import Depends, FastAPI, HTTPException, Query, Request
+from fastapi import BackgroundTasks, Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
@@ -354,10 +354,11 @@ class JobService:
                                 message=current['message'] if current['status'] == 'cancelled' else '服务停止，任务已保留，可重试'))
                 raise
             except DownloadBlocked as exc:
-                message = f"{safe_error(exc, self.store)}。任务已暂停，已保存内容保留。处理验证或等待后，可单独继续此任务。"
+                message = safe_error(exc, self.store)
                 if task['retry_at']:
                     await self.database(self.store.schedule_task_retry, task['id'], message, pause_seconds=300)
                 else:
+                    message += "。任务已暂停，已保存内容保留。处理验证或等待后，可单独继续此任务。"
                     await self.database(self.store.update_task, task["id"], pause_seconds=300, status="rate_limited", message=message)
                 if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
                     await self.database(self.store.patch_author, task["author_id"], last_checked=time.time(), last_error=message)
@@ -550,6 +551,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     cookie_account = CookieAccount(store, service)
     cookie_sync = CookieSync(store, service, cookie_account)
     count_cache, count_requests = {}, {}
+    anonymous_blocked_until = 0
     count_limit = asyncio.Semaphore(2)
 
     @asynccontextmanager
@@ -788,11 +790,14 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return task
 
     @app.post("/api/tasks", dependencies=[Depends(authorize)])
-    async def add_task(body: TaskInput):
+    async def add_task(body: TaskInput, background: BackgroundTasks):
         kind, link = normalize_input(body.link, body.kind)
         name = await recognize_author(link, body.name) if kind == 'author' else ''
         preview = [{'nickname': name}] if name else None
-        return public_task(store.create_task(link, kind, body.accept_quality, preview=preview))
+        task = await run_blocking(store.create_task, link, kind, body.accept_quality, preview=preview)
+        if kind == 'author' and not name:
+            background.add_task(fill_author_name, link, task_id=task['id'])
+        return public_task(task)
 
     @app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(authorize)])
     def retry(task_id: str, existing_task_id: str | None = Query(default=None, pattern=r'^[0-9a-f]{16}$')):
@@ -1065,15 +1070,24 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             value = cached[1]
             return value if isinstance(value, dict) else {'count': value, 'nickname': ''}
 
+        if time.monotonic() < anonymous_blocked_until:
+            return None
+
         async def fetch_author():
+            nonlocal anonymous_blocked_until
             try:
                 try:
                     async with asyncio.timeout(8):
                         async with count_limit:
+                            if time.monotonic() < anonymous_blocked_until:
+                                return None
                             if callable(getattr(core, 'author_profile', None)):
                                 value = await core.author_profile(sec_uid)
                             else:
                                 value = {'count': await core.author_count(sec_uid), 'nickname': ''}
+                except DownloadBlocked:
+                    anonymous_blocked_until = time.monotonic() + 300
+                    value = None
                 except Exception:
                     value = None
                 count_cache[sec_uid] = (time.monotonic() + (300 if value is None else 1800), value)
@@ -1105,19 +1119,32 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def recognize_author(url, provided_name=''):
         if provided_name.strip():
             return provided_name.strip()
-        existing = next((item for item in store.authors() if item['url'] == url), None)
-        if existing and existing['name'] not in ('', '待获取作者', '博主信息待获取'):
-            return existing['name']
-        sec_uid = urlsplit(url).path.rstrip('/').rsplit('/', 1)[-1]
+        existing = await run_blocking(store.known_author_name, url)
+        if existing:
+            return existing
         try:
             async with asyncio.timeout(2):
-                profile = await anonymous_author(sec_uid)
+                return await lookup_author_name(url)
+        except TimeoutError:
+            return ''
+
+    async def lookup_author_name(url):
+        path = re.fullmatch(r'/user/([A-Za-z0-9_-]{1,128})/?', urlsplit(url).path)
+        if not path:
+            return ''
+        try:
+            profile = await anonymous_author(path[1])
             return profile.get('nickname', '') if profile else ''
         except Exception:
             return ''
 
+    async def fill_author_name(url, *, task_id=None, author_id=None):
+        name = await lookup_author_name(url)
+        if name:
+            await run_blocking(store.fill_author_name, name, task_id=task_id, author_id=author_id)
+
     @app.post("/api/authors", dependencies=[Depends(authorize)])
-    async def add_author(body: AuthorInput):
+    async def add_author(body: AuthorInput, background: BackgroundTasks):
         kind, url = normalize_input(body.url, "author")
         if "\n" in url:
             raise ValueError("每次添加一个博主")
@@ -1126,6 +1153,10 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         if body.favorite is not None:
             existing = next((a for a in store.authors() if a['url'] == url), None)
             if existing:
+                if not name:
+                    background.add_task(fill_author_name, url, author_id=existing['id'])
+                elif existing['name'] in ('', '待获取作者', '博主信息待获取'):
+                    await run_blocking(store.fill_author_name, name, author_id=existing['id'])
                 return store.patch_author(existing['id'], favorite=body.favorite)
         minutes = FREQUENCIES
         author = store.save_author(author_id, url, name,
@@ -1135,6 +1166,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
             store.mark_author_scheduled(author["id"], reset=True)
         if body.favorite is not None:
             store.patch_author(author['id'], favorite=body.favorite)
+        if not name:
+            background.add_task(fill_author_name, url, author_id=author['id'])
         return store.author(author["id"])
 
     @app.patch("/api/authors/{author_id}", dependencies=[Depends(authorize)])
@@ -1158,7 +1191,9 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         if not author:
             raise HTTPException(404, "博主不存在")
         store.mark_author_scheduled(author_id, reset=True)
-        return public_task(store.create_task(author["url"], "author", author_id=author_id))
+        name = store.known_author_name(author["url"])
+        return public_task(store.create_task(author["url"], "author", author_id=author_id,
+                                             preview=[{'nickname': name}] if name else None))
 
     def media_path(work_id, index):
         item = store.work(work_id)

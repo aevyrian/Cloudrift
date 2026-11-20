@@ -820,6 +820,20 @@ class Store:
                 if task['status']=='failed':entry['last_error']=task['message']
         return sorted(authors.values(),key=lambda a:not a['enabled'])
 
+    def known_author_name(self, url):
+        with self.connect() as db:
+            row = db.execute("SELECT name FROM authors WHERE url=? AND name NOT IN ('','待获取作者','博主信息待获取')", (url,)).fetchone()
+            return row[0] if row else ''
+
+    def fill_author_name(self, name, *, task_id=None, author_id=None):
+        with self.connect() as db:
+            if task_id:
+                db.execute("UPDATE tasks SET preview=?,updated_at=? WHERE id=? AND kind='author' AND preview='[]'",
+                           (json.dumps([{'nickname': name}], ensure_ascii=False), stamp(), task_id))
+            if author_id:
+                db.execute("UPDATE authors SET name=? WHERE id=? AND name IN ('','待获取作者','博主信息待获取')",
+                           (name, author_id))
+
     def save_author(self, author_id, url, name="", enabled=False, interval_minutes=129600):
         with self.connect() as db:
             old = db.execute("SELECT id FROM authors WHERE url=?", (url,)).fetchone()
