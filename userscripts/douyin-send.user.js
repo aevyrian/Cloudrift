@@ -488,7 +488,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
         if(sameView()&&authors)authors=[...authors.filter(a=>a.id!==saved.id),saved];
         task=await call('POST',`/api/authors/${encodeURIComponent(saved.id)}/check`);
       }else if(action==='author'&&authorState()?.author?.id){task=await call('POST',`/api/authors/${encodeURIComponent(authorState().author.id)}/check`);}
-      else task=await call('POST','/api/tasks',{link,kind:action==='detail'?'detail':'author'});
+      else task=await call('POST','/api/tasks',{link,name:action==='detail'?'':name.replace(/^@+/,'').trim().slice(0,100),kind:action==='detail'?'detail':'author'});
       if(task?.id===undefined)throw new Error('网站未返回任务，请先查看归档再重试。');
       if(sameView()){recent.add(key);feedback.set(key,'submitted');history=[{...task,kind:action==='detail'?'detail':'author',link},...(history||[])];message(`已提交 ${action==='detail'?'当前作品':name||'当前博主'}，后台会继续处理。`);}
       if(sameView()&&action!=='detail'&&(action==='plan'||authorState()?.author?.id)){

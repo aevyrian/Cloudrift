@@ -208,7 +208,7 @@ class Store:
         result["large_approved"] = bool(result["large_approved"])
         return result
 
-    def create_task(self, link, kind, accept_quality=False, author_id=None):
+    def create_task(self, link, kind, accept_quality=False, author_id=None, preview=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
             row = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','rate_limited') ORDER BY created_at LIMIT 1",
@@ -219,8 +219,8 @@ class Store:
             now = stamp()
             paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
             paused = bool(json.loads(paused[0])) if paused else False
-            db.execute("INSERT INTO tasks (id,kind,link,status,message,created_at,updated_at,accept_quality,author_id) VALUES (?,?,?,?,?,?,?,?,?)",
-                       (task_id, kind, link, 'paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '', now, now, int(accept_quality), author_id))
+            db.execute("INSERT INTO tasks (id,kind,link,status,message,created_at,updated_at,accept_quality,preview,author_id) VALUES (?,?,?,?,?,?,?,?,?,?)",
+                       (task_id, kind, link, 'paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '', now, now, int(accept_quality), json.dumps(preview or [], ensure_ascii=False), author_id))
         return self.task(task_id)
 
     def task(self, task_id):

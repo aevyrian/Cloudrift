@@ -251,7 +251,7 @@ class Core:
         except Exception:
             return None
 
-    async def author_count(self, sec_uid):
+    async def author_profile(self, sec_uid):
         try:
             if str(self.source) not in sys.path:
                 sys.path.insert(0, str(self.source))
@@ -299,9 +299,14 @@ class Core:
             count = user.get('aweme_count') if isinstance(user, dict) else None
             if not isinstance(user, dict) or user.get('sec_uid') != sec_uid or type(count) is not int or not 0 <= count <= 2**53 - 1:
                 raise ValueError
-            return count
+            nickname = user.get('nickname')
+            nickname = ''.join(c for c in nickname if ord(c) >= 32 and ord(c) != 127).strip()[:100] if isinstance(nickname, str) else ''
+            return {'count': count, 'nickname': nickname}
         except Exception:
             raise RuntimeError('无法获取博主作品数量') from None
+
+    async def author_count(self, sec_uid):
+        return (await self.author_profile(sec_uid))['count']
 
     async def comment_page(self, work_id, cursor=0, root_id=None):
         if not isinstance(work_id, str) or not re.fullmatch(r'\d{19}', work_id):

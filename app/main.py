@@ -11,6 +11,7 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
+from urllib.parse import urlsplit
 
 from fastapi import Depends, FastAPI, HTTPException, Query, Request
 from fastapi.exceptions import RequestValidationError
@@ -436,6 +437,7 @@ class JobService:
 class TaskInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     link: str = Field(min_length=1, max_length=5000)
+    name: str = Field(default="", max_length=100)
     kind: str = "auto"
     accept_quality: bool = False
 
@@ -786,9 +788,11 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return task
 
     @app.post("/api/tasks", dependencies=[Depends(authorize)])
-    def add_task(body: TaskInput):
+    async def add_task(body: TaskInput):
         kind, link = normalize_input(body.link, body.kind)
-        return public_task(store.create_task(link, kind, body.accept_quality))
+        name = await recognize_author(link, body.name) if kind == 'author' else ''
+        preview = [{'nickname': name}] if name else None
+        return public_task(store.create_task(link, kind, body.accept_quality, preview=preview))
 
     @app.post("/api/tasks/{task_id}/retry", dependencies=[Depends(authorize)])
     def retry(task_id: str, existing_task_id: str | None = Query(default=None, pattern=r'^[0-9a-f]{16}$')):
@@ -1055,50 +1059,76 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     def authors():
         return store.authors()
 
+    async def anonymous_author(sec_uid):
+        cached = count_cache.get(sec_uid)
+        if cached and cached[0] > time.monotonic():
+            value = cached[1]
+            return value if isinstance(value, dict) else {'count': value, 'nickname': ''}
+
+        async def fetch_author():
+            try:
+                try:
+                    async with asyncio.timeout(8):
+                        async with count_limit:
+                            if callable(getattr(core, 'author_profile', None)):
+                                value = await core.author_profile(sec_uid)
+                            else:
+                                value = {'count': await core.author_count(sec_uid), 'nickname': ''}
+                except Exception:
+                    value = None
+                count_cache[sec_uid] = (time.monotonic() + (300 if value is None else 1800), value)
+                while len(count_cache) > 128:
+                    count_cache.pop(next(iter(count_cache)))
+                return value
+            finally:
+                count_requests.pop(sec_uid, None)
+
+        if sec_uid not in count_requests:
+            if len(count_requests) >= 8:
+                raise RuntimeError('匿名博主识别暂时繁忙')
+            count_requests[sec_uid] = asyncio.create_task(fetch_author())
+        return await asyncio.shield(count_requests[sec_uid])
+
     @app.get('/api/author-count', dependencies=[Depends(authorize)])
     async def author_count(sec_uid: str = Query(pattern=r'^[A-Za-z0-9_-]{1,128}$')):
-        headers = {'Cache-Control': 'no-store'}
-        key = sec_uid
-        cached = count_cache.get(key)
-        if cached and cached[0] > time.monotonic():
-            count = cached[1]
-        else:
-            async def fetch_count():
-                try:
-                    try:
-                        async with asyncio.timeout(8):
-                            async with count_limit:
-                                value = await core.author_count(sec_uid)
-                    except Exception:
-                        value = None
-                    count_cache[key] = (time.monotonic() + (300 if value is None else 1800), value)
-                    while len(count_cache) > 128:
-                        count_cache.pop(next(iter(count_cache)))
-                    return value
-                finally:
-                    count_requests.pop(key, None)
+        try:
+            profile = await anonymous_author(sec_uid)
+        except RuntimeError:
+            return JSONResponse({'detail': '数量查询繁忙，请稍后重试'}, status_code=429,
+                                headers={'Cache-Control': 'no-store'})
+        if not profile or profile.get('count') is None:
+            return JSONResponse({'detail': '匿名读取暂不可用，可打开博主页读取页面已显示的数量'},
+                                status_code=503, headers={'Cache-Control': 'no-store'})
+        return JSONResponse({'sec_uid': sec_uid, 'count': profile['count']},
+                            headers={'Cache-Control': 'no-store'})
 
-            if key not in count_requests:
-                if len(count_requests) >= 8:
-                    return JSONResponse({'detail': '数量查询繁忙，请稍后重试'}, status_code=429, headers=headers)
-                count_requests[key] = asyncio.create_task(fetch_count())
-            count = await asyncio.shield(count_requests[key])
-        if count is None:
-            return JSONResponse({'detail': '匿名读取暂不可用，可打开博主页读取页面已显示的数量'}, status_code=503, headers=headers)
-        return JSONResponse({'sec_uid': sec_uid, 'count': count}, headers=headers)
+    async def recognize_author(url, provided_name=''):
+        if provided_name.strip():
+            return provided_name.strip()
+        existing = next((item for item in store.authors() if item['url'] == url), None)
+        if existing and existing['name'] not in ('', '待获取作者', '博主信息待获取'):
+            return existing['name']
+        sec_uid = urlsplit(url).path.rstrip('/').rsplit('/', 1)[-1]
+        try:
+            async with asyncio.timeout(2):
+                profile = await anonymous_author(sec_uid)
+            return profile.get('nickname', '') if profile else ''
+        except Exception:
+            return ''
 
     @app.post("/api/authors", dependencies=[Depends(authorize)])
-    def add_author(body: AuthorInput):
+    async def add_author(body: AuthorInput):
         kind, url = normalize_input(body.url, "author")
         if "\n" in url:
             raise ValueError("每次添加一个博主")
         author_id = hashlib.sha256(url.encode()).hexdigest()[:16]
+        name = await recognize_author(url, body.name)
         if body.favorite is not None:
             existing = next((a for a in store.authors() if a['url'] == url), None)
             if existing:
                 return store.patch_author(existing['id'], favorite=body.favorite)
         minutes = FREQUENCIES
-        author = store.save_author(author_id, url, body.name,
+        author = store.save_author(author_id, url, name,
                                    body.frequency != "once" if body.frequency else body.enabled,
                                    minutes[body.frequency] if body.frequency else body.interval_minutes or store.setting("interval_minutes", 129600))
         if body.frequency and author["enabled"]:

@@ -28,7 +28,7 @@ class FakeCore:
         self.max_active = 0
         self.started = Event()
 
-    async def author_count(self, sec_uid):
+    async def _query(self, sec_uid):
         self.calls.append(sec_uid)
         self.started.set()
         self.active += 1
@@ -38,9 +38,15 @@ class FakeCore:
                 await asyncio.sleep(self.delay)
             if self.error:
                 raise self.error
-            return self.value
+            return {'count': self.value, 'nickname': '匿名昵称'}
         finally:
             self.active -= 1
+
+    async def author_profile(self, sec_uid):
+        return await self._query(sec_uid)
+
+    async def author_count(self, sec_uid):
+        return (await self._query(sec_uid))['count']
 
 
 @asynccontextmanager
@@ -72,6 +78,18 @@ class AuthorCountApiTests(unittest.TestCase):
         self.assertEqual(self.core.calls, [])
         self.assertEqual(self.app.state.store.authors(), [])
         self.assertEqual(self.app.state.store.tasks(), [])
+
+    def test_author_is_recognized_anonymously_before_author_and_task_are_returned(self):
+        author = self.client.post('/api/authors', headers=self.headers,
+                                  json={'url': 'https://www.douyin.com/user/valid_author'})
+        self.assertEqual(author.status_code, 200)
+        self.assertEqual(author.json()['name'], '匿名昵称')
+        task = self.client.post('/api/tasks', headers=self.headers,
+                                json={'link': 'https://www.douyin.com/user/another_author', 'kind': 'author',
+                                      'name': '页面昵称'})
+        self.assertEqual(task.status_code, 200)
+        self.assertEqual(task.json()['preview'][0]['nickname'], '页面昵称')
+        self.assertEqual(self.core.calls, ['valid_author'])
 
     def test_zero_success_is_cached_independently_of_login_cookie(self):
         first = self.get()
