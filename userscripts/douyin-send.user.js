@@ -3,7 +3,7 @@
 // @name:zh      抖音收藏库助手
 // @name:zh-CN   抖音收藏库助手
 // @namespace    douyin-local-library
-// @version      1.13.6
+// @version      1.13.7
 // @description  识别当前作品与博主，查看更新状态，按需下载并设置追更周期。
 // @match        https://www.douyin.com/*
 // @match        https://douyin.com/*
@@ -241,7 +241,7 @@
 section{position:fixed;width:304px;padding:17px;background:#24252bf7;border:1px solid #ffffff20;border-radius:15px;box-shadow:0 14px 44px #0005;max-height:calc(100dvh - 24px);overflow:auto;scrollbar-width:thin}
 header,.identity,.status-heading,.status-times,.quick-actions,.footer{display:flex;align-items:center;gap:8px}header{justify-content:space-between;margin-bottom:13px}header strong{font-size:14px}header small{font-size:10px;color:#afb0bb;margin-left:8px}
 button,input,select{font:inherit;color:inherit}button,a,input,select,summary{outline-offset:3px}button:focus-visible,a:focus-visible,summary:focus-visible{outline:2px solid #ff8ba5}button{cursor:pointer;border:1px solid #ffffff1c;border-radius:9px;background:#ffffff06;padding:9px 11px;text-align:center}button:hover{background:#ffffff10}button:disabled{cursor:default;opacity:.48}
-.close{width:28px;height:28px;padding:0;font-size:22px;line-height:1;border:0;background:transparent;color:#b9bac5}.toggle{display:grid;place-items:center;width:44px;height:44px;padding:0;border-radius:11px;color:#fff;background:rgba(0,0,0,.3);border-color:rgba(255,255,255,.12);box-shadow:none}.toggle:hover{background:rgba(0,0,0,.3);border-color:#ffffff38}.toggle[aria-expanded=true]{color:#fff;background:rgba(0,0,0,.3);border-color:#ffffff40}.toggle svg{pointer-events:none;filter:drop-shadow(0 0 2.5px #0000004d)}
+.close{width:28px;height:28px;padding:0;font-size:22px;line-height:1;border:0;background:transparent;color:#b9bac5}.toggle{display:grid;place-items:center;width:44px;height:44px;padding:0;border-radius:11px;color:#fff;background:rgba(0,0,0,.3);border-color:rgba(255,255,255,.12);box-shadow:none}.toggle:hover{background:rgba(0,0,0,.3);border-color:#ffffff38}.toggle[aria-expanded=true]{color:#fff;background:rgba(0,0,0,.3);border-color:#ffffff40}.toggle[data-subscribed=true] svg{color:#ff8ba5}.toggle svg{pointer-events:none;filter:drop-shadow(0 0 2.5px #0000004d)}
 .identity{margin-bottom:12px;min-width:0}.creator{font-size:14px;font-weight:650;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}.context-label,.work-count{flex:none;font-size:10px;color:#aaaab6;white-space:nowrap}.creator-status{padding:12px;border:1px solid #ffffff1d;border-radius:10px;background:#ffffff04;margin-bottom:12px;transition:background .15s,border-color .15s}.creator-status[data-state=submitted]{background:#ff507716;border-color:#ff78976b}.status-heading{justify-content:space-between;margin-bottom:9px}.subscription-state{font-weight:600;font-size:12px}.subscription-state:before{content:"";display:inline-block;width:6px;height:6px;border-radius:50%;margin-right:7px;background:#9699ad}.creator-status[data-enabled=true] .subscription-state:before{background:#ff8ba5}.refresh-state{padding:0;background:transparent;border:0;font-size:10px;color:#c5c6d1}
 .status-times{align-items:start;gap:10px}.status-times>div{flex:1;min-width:0}.status-times small{display:block;font-size:10px;color:#a8a9b5}.last-success,.next-check{display:block;font-size:11px;margin-top:2px;overflow-wrap:anywhere}.state-note{margin:8px 0 0;font-size:10px;color:#c2c3ce;overflow-wrap:anywhere}
 .actions{display:grid;gap:8px}.actions>button{width:100%;min-height:39px}.quick-actions>*{flex:1;min-width:0}.quick-actions button,.quick-actions a{font-size:11px;min-height:37px}.primary{background:#ff507710;border-color:#ff789749;font-weight:600}.primary:hover{background:#ff50771c}a{color:#d4d5df;text-decoration:none}.archive-link{display:flex;align-items:center;justify-content:center;border:1px solid #ffffff1c;border-radius:9px;padding:8px}
@@ -279,7 +279,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   const preference=node('select');for(const [value,text] of [['detail','突出当前作品'],['author','突出博主更新']]){const option=node('option','',text);option.value=value;preference.append(option);}preference.value=defaultKind(GM_getValue('library_default_kind','author'));
   function field(text,control){const label=node('label','',text);label.append(control);form.append(label);}
   field('网站地址',serverInput);field('管理员密钥',tokenInput);field('默认下载操作',preference);const save=node('button','','保存设置');save.type='submit';form.append(save);settings.append(summary,form);
-  const footer=node('div','footer');footer.append(node('small','','助手 1.13.6'),node('span','','下载后在媒体库查看进度'));
+  const footer=node('div','footer');footer.append(node('small','','助手 1.13.7'),node('span','','下载后在媒体库查看进度'));
   panel.append(header,downloads,status,commentStatus,historyStatus,settings,footer);shadow.append(style,panel,toggle);document.body.append(host);
   let targets={detail:null,author:null},anchor=null,hadRail=false,authors=null,history=null,loading=null,generation=0,dataRevision=0,viewRevision=0,busy=false,settingsOverride=false,currentName='',stateAttempted=false;
   const recent=new Set(),feedback=new Map(),counts=new Map();
@@ -364,7 +364,12 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     historyPreparing++;historyMessage('正在保存');
     browseConnection().then(({key:connection})=>{entry.connection=connection;GM_setValue(key,{connection,created:Date.now(),item});historyStorageError='';historyMessage('有待同步记录');setTimeout(flushBrowse,2100);}).catch(()=>{if(lastBrowse===entry)lastBrowse=null;historyStorageError='write';historyMessage('助手存储失败');}).finally(()=>{historyPreparing--;});
   }
-  function authorState(){return authors?subscriptionState(authors,targets.author):null;}
+  let authorStateCache={};
+  function authorState(){
+    if(!authors||!targets.author)return null;
+    if(authorStateCache.authors!==authors||authorStateCache.url!==targets.author)authorStateCache={authors,url:targets.author,state:subscriptionState(authors,targets.author)};
+    return authorStateCache.state;
+  }
   function paintCount(){const item=counts.get(targets.author);workCount.textContent=item?.pending?'· 数量读取中…':Number.isSafeInteger(item?.value)?`· 共 ${item.value.toLocaleString('zh-CN')} 个作品`:'· 数量暂不可用';workCount.title='抖音资料中的作品数，点击刷新可重新核对；实际可下载数量可能不同。';}
   async function loadCount(force=false){
     const link=targets.author;
@@ -384,13 +389,15 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
   function formatTime(value){const date=new Date(typeof value==='number'?value*1000:value);return value&&Number.isFinite(date.getTime())?new Intl.DateTimeFormat('zh-CN',{timeZone:'Asia/Shanghai',year:'numeric',month:'2-digit',day:'2-digit',hour:'2-digit',minute:'2-digit',hour12:false}).format(date):'暂无记录';}
   let taskSummary=null;
   function paint(){
+    const found=authorState();
+    toggle.dataset.subscribed=String(Boolean(found?.enabled));
     if(panel.hidden||document.visibilityState==='hidden'){
       for(const [button,action,link] of [[detailButton,'detail',targets.detail],[authorButton,'author',targets.author],[submit,'plan',targets.author]])button.disabled=busy||!link||feedback.get(actionKey(action,link,action==='plan'?frequency.value:''))==='submitted';
       commentButton.disabled=Boolean(commentSession||batchSession&&!batchSession.stopped)||!targets.detail;commentStop.disabled=!commentSession&&!(batchSession&&!batchSession.stopped);
       return;
     }
     paintCount();
-    const found=authorState(),author=found?.author;
+    const author=found?.author;
     frequency.value=Object.hasOwn(labels,preferredFrequency)?preferredFrequency:author?.enabled?found.frequency:'once';
     subscriptionLabel.textContent=!configured()?'未连接':loading?'核对中…':!authors?'待核对':author?.enabled?`已订阅 · ${labels[found.frequency]}`:'未订阅';
     card.dataset.enabled=String(Boolean(author?.enabled));
@@ -410,14 +417,25 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     const preferred=defaultKind(GM_getValue('library_default_kind','author'));detailButton.classList.toggle('primary',preferred==='detail');authorButton.classList.toggle('primary',preferred==='author');
     try{libraryLink.href=normalizeServer(server())+'/#tasks';}catch{libraryLink.href='#';}
   }
-  function clearState(){generation++;dataRevision++;authors=history=null;loading=null;stateAttempted=false;recent.clear();feedback.clear();}
+  let iconStateAttempted=false,iconLoading=null;
+  function clearState(){iconStateAttempted=false;iconLoading=null;generation++;dataRevision++;authors=history=null;loading=null;stateAttempted=false;recent.clear();feedback.clear();}
   function loadState(force=false){
     if(panel.hidden||settings.open||!targets.author||!configured()){paint();return Promise.resolve();}
     if(!force&&authors&&history){paint();return Promise.resolve();}if(loading&&!force)return loading;
     if(!force&&stateAttempted){paint();return Promise.resolve();}stateAttempted=true;
     const revision=generation,dataVersion=++dataRevision;
-    const job=Promise.all([request('GET','/api/authors'),request('GET','/api/tasks')]).then(([a,t])=>{if(!Array.isArray(a)||!Array.isArray(t))throw new Error('网站状态格式异常');if(revision===generation&&dataVersion===dataRevision){authors=a;history=t;paint();}}).catch(error=>{if(revision===generation&&dataVersion===dataRevision)message(error.message,true);throw error;}).finally(()=>{if(loading===job){loading=null;paint();}});
+    const job=Promise.all([(!force&&iconLoading)||request('GET','/api/authors'),request('GET','/api/tasks')]).then(([a,t])=>{if(!Array.isArray(a)||!Array.isArray(t))throw new Error('网站状态格式异常');if(revision===generation&&dataVersion===dataRevision){authors=a;history=t;paint();}}).catch(error=>{if(revision===generation&&dataVersion===dataRevision)message(error.message,true);throw error;}).finally(()=>{if(loading===job){loading=null;paint();}});
     loading=job;paint();return job;
+  }
+  function loadIconState(){
+    if(iconStateAttempted||authors||loading||!targets.author||!configured())return;
+    iconStateAttempted=true;
+    const revision=generation,dataVersion=dataRevision;
+    const job=request('GET','/api/authors');iconLoading=job;
+    job.then(values=>{
+      if(revision!==generation||dataVersion!==dataRevision||!Array.isArray(values))return;
+      authors=values;paint();
+    }).catch(()=>{}).finally(()=>{if(iconLoading===job)iconLoading=null;});
   }
   function position(){if(document.visibilityState==='hidden')return;const p=senderPosition(anchor,{width:innerWidth,height:innerHeight},panel.hidden?0:panel.offsetHeight);host.style.left=p.left+'px';host.style.top=p.top+'px';panel.style.left=p.panelLeft+'px';panel.style.top=p.panelTop+'px';panel.style.width=p.panelWidth+'px';}
   function visible(element){if(!element)return false;const r=element.getBoundingClientRect();return r.width>0&&r.height>0&&r.bottom>0&&r.top<innerHeight&&r.left+r.width>0&&r.left<innerWidth;}
@@ -466,7 +484,8 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     if(scope!==observedScope){layoutObserver.disconnect();if(scope)layoutObserver.observe(scope);observedScope=scope;}
     recordBrowse(scope);flushBrowse();
     paint();position();if(document.visibilityState!=='hidden'&&!panel.hidden&&!settings.open){loadState().catch(()=>{});loadCount();}
-    else if(document.visibilityState!=='hidden'&&changed&&targets.author){clearTimeout(countTimer);const author=targets.author;countTimer=setTimeout(()=>{if(targets.author===author)loadCount();},500);}
+    if(document.visibilityState!=='hidden'&&panel.hidden)loadIconState();
+    if(document.visibilityState!=='hidden'&&(panel.hidden||settings.open)&&changed&&targets.author){clearTimeout(countTimer);const author=targets.author;countTimer=setTimeout(()=>{if(targets.author===author)loadCount();},500);}
   }
   function configure(){settingsOverride=true;host.hidden=false;if(panel.hidden)togglePanel(panel,toggle);settings.open=true;position();serverInput.focus();}
   async function run(action){
