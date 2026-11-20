@@ -727,7 +727,7 @@ button,input,select{font:inherit;color:inherit}button,a,input,select,summary{out
     }finally{if(commentSession===session){commentTemplates.clear();templateIdentity='';templateCheck=null;commentEpoch=null;commentSession=null;paint();}}
   }
   commentButton.addEventListener('click',()=>{detect();if(batchSession&&!batchSession.stopped)return;saveComments(pendingComment?.id===targets.detail?.split('/').pop()?pendingComment.token:undefined,true);});commentStop.addEventListener('click',()=>stopComments());
-  toggle.addEventListener('click',()=>{settingsOverride=false;settings.open=false;togglePanel(panel,toggle);if(!panel.hidden){clearState();}detect();});
+  toggle.addEventListener('click',()=>{settingsOverride=false;settings.open=false;togglePanel(panel,toggle);if(!panel.hidden){const pendingAuthors=iconLoading;clearState();iconLoading=pendingAuthors;}detect();});
   close.addEventListener('click',()=>{settingsOverride=false;togglePanel(panel,toggle);toggle.focus();detect();});
   detailButton.addEventListener('click',()=>run('detail'));authorButton.addEventListener('click',()=>run('author'));submit.addEventListener('click',()=>run('plan'));
   frequency.addEventListener('change',()=>{preferredFrequency=frequency.value;GM_setValue('library_subscription_frequency',preferredFrequency);paint();});
