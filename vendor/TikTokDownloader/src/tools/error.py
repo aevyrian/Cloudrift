@@ -1,6 +1,10 @@
 from ..translation import _
 
 
+class RequestBlocked(RuntimeError):
+    pass
+
+
 class DownloaderError(Exception):
     def __init__(
         self,

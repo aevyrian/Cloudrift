@@ -1,4 +1,5 @@
 from asyncio import sleep
+from contextvars import ContextVar
 from math import log
 from random import lognormvariate
 from typing import TYPE_CHECKING
@@ -7,6 +8,9 @@ from src.translation import _
 
 if TYPE_CHECKING:
     from src.tools import ColorfulConsole
+
+
+metadata_delay = ContextVar("metadata_delay", default=None)
 
 
 def get_wait_time(
@@ -23,7 +27,7 @@ async def wait(
     """
     设置网络请求间隔时间，仅对获取数据生效，不影响下载文件
     """
-    # 随机延时
+    kwargs.setdefault("avg_delay", metadata_delay.get() or 6.0)
     await sleep(
         get_wait_time(
             **kwargs,

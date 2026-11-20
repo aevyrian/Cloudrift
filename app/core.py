@@ -1,6 +1,7 @@
 import asyncio
 import re
 import sys
+from copy import copy
 from pathlib import Path
 from http.cookies import SimpleCookie
 from types import SimpleNamespace
@@ -9,6 +10,10 @@ from urllib.parse import urlsplit
 
 CORE_COMMIT = "473c90ff70c663cfb69310fff2b8d5192f200661"
 HOSTS = {"www.douyin.com", "douyin.com", "v.douyin.com", "www.iesdouyin.com", "iesdouyin.com"}
+
+
+class DownloadBlocked(RuntimeError):
+    pass
 
 
 class CommentBlocked(RuntimeError):
@@ -156,6 +161,9 @@ class Core:
         self.media_dir = self.media_root
         self.app = None
         self.parser = None
+        self.request_delay = 6.0
+        self.download_slots = asyncio.Semaphore(4)
+        self.media_blocked = asyncio.Event()
         self.ready = False
         self.error = ""
 
@@ -335,6 +343,17 @@ class Core:
     async def parse(self, link, kind, earliest=None):
         if not self.ready:
             raise RuntimeError("下载核心尚未就绪，请检查设置和服务日志")
+        from src.custom.function import metadata_delay
+        from src.tools.error import RequestBlocked
+        token = metadata_delay.set(self.request_delay)
+        try:
+            return await self._parse(link, kind, earliest)
+        except RequestBlocked as exc:
+            raise DownloadBlocked(str(exc)) from None
+        finally:
+            metadata_delay.reset(token)
+
+    async def _parse(self, link, kind, earliest):
         from src.models import Account, Detail
         result = []
         if kind == "author":
@@ -371,11 +390,18 @@ class Core:
             files = verified_files(self.media_dir, item)
         except RuntimeError:
             # 图集中断后作品级记录可能存在，清掉它才能让原下载器补齐缺失图片。
-            await self.parser.downloader.recorder.delete_id(str(item["id"]))
-            self.parser.downloader.last_error = ''
-            success = await self.parser.downloader.run([item.copy()], type_="detail", tiktok=False)
+            from src.tools.error import RequestBlocked
+            downloader = copy(self.parser.downloader)
+            downloader.semaphore = self.download_slots
+            downloader.media_blocked = self.media_blocked
+            await downloader.recorder.delete_id(str(item["id"]))
+            downloader.last_error = ''
+            try:
+                success = await downloader.run([item.copy()], type_="detail", tiktok=False)
+            except RequestBlocked as exc:
+                raise DownloadBlocked(str(exc)) from None
             if success is not True:
-                reason = self.parser.downloader.last_error or '下载器未提供具体原因'
+                reason = downloader.last_error or '下载器未提供具体原因'
                 raise RuntimeError(f"下载未完成：{reason}。已保存作品保留，重试会重新解析地址并跳过已有作品")
             files = verified_files(self.media_dir, item)
         return [(self.media_dir / file).relative_to(self.media_root).as_posix() for file in files]

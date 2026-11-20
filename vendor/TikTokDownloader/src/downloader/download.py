@@ -1,4 +1,4 @@
-from asyncio import Semaphore, gather
+from asyncio import Semaphore, create_task, gather
 from datetime import datetime
 from pathlib import Path
 import re
@@ -32,6 +32,7 @@ from ..tools import (
     beautify_string,
     format_size,
 )
+from ..tools.error import RequestBlocked
 from ..translation import _
 
 if TYPE_CHECKING:
@@ -48,6 +49,7 @@ __all__ = ["Downloader"]
 
 class Downloader:
     semaphore = Semaphore(MAX_WORKERS)
+    media_blocked = None
     CONTENT_TYPE_MAP = {
         "image/png": "png",
         "image/jpeg": "jpeg",
@@ -372,16 +374,22 @@ class Downloader:
     ):
         with progress:
             tasks = [
-                self.request_file(
+                create_task(self.request_file(
                     *task,
                     count=count,
                     **kwargs,
                     progress=progress,
                     semaphore=semaphore,
-                )
+                ))
                 for task in tasks
             ]
-            results = await gather(*tasks)
+            try:
+                results = await gather(*tasks)
+            finally:
+                for task in tasks:
+                    if not task.done():
+                        task.cancel()
+                await gather(*tasks, return_exceptions=True)
             return all(result is True for result in results)
 
     def deal_folder_path(
@@ -621,6 +629,8 @@ class Downloader:
         semaphore: Semaphore = None,
     ) -> bool | None:
         async with semaphore or self.semaphore:
+            if self.media_blocked is not None and self.media_blocked.is_set():
+                raise RequestBlocked("媒体服务器触发限流（HTTP 429）")
             actual.parent.mkdir(parents=True, exist_ok=True)
             temp = actual.with_name("." + actual.name + ".part")
             client = self.client_tiktok if tiktok else self.client
@@ -698,6 +708,9 @@ class Downloader:
                         raise DownloaderError
             except HTTPError as e:
                 code = response.status_code if response is not None else '未知'
+                if code == 429 and self.media_blocked is not None:
+                    self.media_blocked.set()
+                    raise RequestBlocked("媒体服务器触发限流（HTTP 429）") from None
                 self.last_error = f'媒体服务器返回 HTTP {code}'
                 if code in (403, 429):
                     self.last_error += '，可能是地址过期、访问限制或请求过多，请稍后重试并检查Cookie'

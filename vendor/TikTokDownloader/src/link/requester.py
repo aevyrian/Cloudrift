@@ -2,7 +2,9 @@ from re import compile
 from typing import TYPE_CHECKING
 
 from ..custom import IMPERSONATE, wait
+from ..custom.function import metadata_delay
 from ..tools import DownloaderError, Retry, capture_error_request
+from ..tools.error import RequestBlocked
 
 if TYPE_CHECKING:
     from curl_cffi.requests import AsyncSession, get, head
@@ -80,6 +82,8 @@ class Requester:
         # 记录请求体数据会导致日志文件体积过大，仅在必要时记录
         # self.log.info(f"Response Content: {response.content}", False)
         self.log.info(f"Response Headers: {dict(response.headers)}", False)
+        if metadata_delay.get() is not None and response.status_code == 429:
+            raise RequestBlocked("分享链接请求触发限流（HTTP 429）")
         match content:
             case "text":
                 return response.text

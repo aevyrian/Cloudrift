@@ -82,7 +82,7 @@ class Store:
                     status TEXT NOT NULL, message TEXT NOT NULL DEFAULT '',
                     completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
-                    accept_quality INTEGER NOT NULL DEFAULT 0,
+                    accept_quality INTEGER NOT NULL DEFAULT 0, large_approved INTEGER NOT NULL DEFAULT 0,
                     preview TEXT NOT NULL DEFAULT '[]', author_id TEXT);
                 CREATE INDEX IF NOT EXISTS task_state ON tasks(status,created_at);
                 CREATE TABLE IF NOT EXISTS works (
@@ -123,6 +123,8 @@ class Store:
                     enabled INTEGER NOT NULL DEFAULT 0, interval_minutes INTEGER NOT NULL DEFAULT 60,
                     last_checked REAL, next_check REAL NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');
             """)
+            if 'large_approved' not in {row[1] for row in db.execute('PRAGMA table_info(tasks)')}:
+                db.execute('ALTER TABLE tasks ADD COLUMN large_approved INTEGER NOT NULL DEFAULT 0')
             columns = {row[1] for row in db.execute('PRAGMA table_info(authors)')}
             for name, kind in (("starred", "INTEGER NOT NULL DEFAULT 0"), ("favorite", "INTEGER NOT NULL DEFAULT 0"), ("schedule_until", "REAL NOT NULL DEFAULT 0")):
                 if name not in columns:
@@ -189,12 +191,13 @@ class Store:
         if "preview_nicknames" in result:
             result["preview_nicknames"] = json.loads(result["preview_nicknames"])
         result["accept_quality"] = bool(result["accept_quality"])
+        result["large_approved"] = bool(result["large_approved"])
         return result
 
     def create_task(self, link, kind, accept_quality=False, author_id=None):
         with self.connect() as db:
             db.execute("BEGIN IMMEDIATE")
-            row = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') ORDER BY created_at LIMIT 1",
+            row = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','rate_limited') ORDER BY created_at LIMIT 1",
                              (link, kind)).fetchone()
             if row:
                 return self.task_dict(row)
@@ -214,7 +217,7 @@ class Store:
         with self.connect() as db:
             fields = "*"
             if summary:
-                fields = """id,kind,link,status,message,completed,total,created_at,updated_at,accept_quality,author_id,
+                fields = """id,kind,link,status,message,completed,total,created_at,updated_at,accept_quality,large_approved,author_id,
                     (SELECT json_group_array(json(value)) FROM (SELECT value FROM json_each(tasks.preview) LIMIT 5)) AS preview,
                     (SELECT json_group_array(COALESCE(json_extract(value,'$.nickname'),'')) FROM json_each(tasks.preview)) AS preview_nicknames"""
             return [self.task_dict(row) for row in db.execute(f"""
@@ -224,7 +227,7 @@ class Store:
             """)]
 
     def update_task(self, task_id, pause_seconds=0, **values):
-        allowed = {"status", "message", "completed", "total", "accept_quality", "preview"}
+        allowed = {"status", "message", "completed", "total", "accept_quality", "large_approved", "preview"}
         if not values or not set(values) <= allowed:
             raise ValueError("任务更新字段无效")
         if "preview" in values:
@@ -274,9 +277,9 @@ class Store:
         with self.connect() as db:
             db.execute('BEGIN IMMEDIATE')
             row = db.execute('SELECT * FROM tasks WHERE id=?', (task_id,)).fetchone()
-            if not row or row['status'] != 'paused':
+            if not row or row['status'] not in ('paused', 'rate_limited'):
                 raise ValueError('只有暂停的任务可以继续')
-            duplicate = db.execute("SELECT 1 FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') LIMIT 1", (row['link'], row['kind'], task_id)).fetchone()
+            duplicate = db.execute("SELECT 1 FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','rate_limited') LIMIT 1", (row['link'], row['kind'], task_id)).fetchone()
             if duplicate:
                 raise ValueError('同一链接已有进行中的任务，请等待它完成')
             db.execute("INSERT INTO settings VALUES ('queue_paused','false') ON CONFLICT(key) DO UPDATE SET value='false'")
@@ -317,11 +320,11 @@ class Store:
                     raise ValueError('接续任务已不存在，请重新提交链接')
                 return self.task_dict(linked)
             if existing_task_id is not None:
-                duplicate = db.execute("SELECT * FROM tasks WHERE id=? AND link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','completed')", (existing_task_id, task['link'], task['kind'], task_id)).fetchone()
+                duplicate = db.execute("SELECT * FROM tasks WHERE id=? AND link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','rate_limited','completed')", (existing_task_id, task['link'], task['kind'], task_id)).fetchone()
                 if not duplicate:
                     raise ValueError('指定的接续任务不存在、不匹配或未完成')
             else:
-                duplicate = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation') ORDER BY created_at,rowid LIMIT 1", (task['link'], task['kind'], task_id)).fetchone()
+                duplicate = db.execute("SELECT * FROM tasks WHERE link=? AND kind=? AND id!=? AND status IN ('queued','parsing','downloading','paused','awaiting_confirmation','rate_limited') ORDER BY created_at,rowid LIMIT 1", (task['link'], task['kind'], task_id)).fetchone()
             if duplicate:
                 message = f"已由同链接任务 #{duplicate['id']} 接续，已保存内容保留。原结果：{task['message']}"
                 db.execute("UPDATE tasks SET status='cancelled',message=?,updated_at=? WHERE id=?", (message, stamp(), task_id))

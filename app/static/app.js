@@ -266,7 +266,7 @@
   const state = { token: localStorage.getItem('library_access_key') || '', muted:false, favoriteKind:'works', auth: null, view: 'library', items: [], total: 0, generation: 0, authorsGeneration: 0, navigation: 0, busy: false, cookieSyncGeneration:0 };
   const frequencies={once:'不订阅',three_days:'每3天更新',weekly:'每7天更新',monthly:'每月更新',quarterly:'每季度更新',yearly:'每年更新'};
   const frequencyValues={1440:'three_days',4320:'three_days',10080:'weekly',43200:'monthly',129600:'quarterly',525600:'yearly'};
-  const statusNames = { queued: '已排队', paused:'已暂停', parsing: '正在解析', awaiting_confirmation: '等待画质确认', downloading: '正在下载', completed: '完整保存', failed: '失败', interrupted: '已中断', cancelled: '已取消' };
+  const statusNames = { queued: '已排队', paused:'已暂停', parsing: '正在解析', awaiting_confirmation: '等待确认', rate_limited: '因限流或验证暂停', downloading: '正在下载', completed: '完整保存', failed: '失败', interrupted: '已中断', cancelled: '已取消' };
   const titles = { library: ['作品库', 'FOR YOU'], favorites:['收藏','SAVED WORKS'], tasks: ['下载', 'DOWNLOADS'], authors: ['订阅', 'CREATORS'], history: ['历史', 'HISTORY'], settings: ['设置', 'LIBRARY SETTINGS'] };
   function element(tag, className, text) { const node = document.createElement(tag); if (className) node.className = className; if (text !== undefined) node.textContent = String(text); return node; }
   function notice(message, error = false) { $('notice').textContent = message; $('notice').className = `notice${error ? ' error' : ''}`; $('notice').hidden = !message; }
@@ -608,17 +608,18 @@
     content.append(element('p', 'hint', `${task.kind==='author'?'博主全部作品':'单个作品'} · 更新于 ${formatDate(task.updated_at || task.created_at)} · 任务 ${task.id}`));
     const actions = element('div', 'record-actions');
     if (['queued','parsing','downloading'].includes(task.status)) actions.append(action('暂停', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/pause`, 'POST'); await loadTasks(); }));
-    if (task.status === 'paused') actions.append(action('继续', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, 'POST'); await loadTasks(); }));
+    if (['paused','rate_limited'].includes(task.status)) actions.append(action('继续', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, 'POST'); await loadTasks(); }));
     if (['failed', 'interrupted', 'cancelled'].includes(task.status)) actions.append(action('重试', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/retry`, 'POST'); await loadTasks(); }));
     if (task.status === 'awaiting_confirmation') {
-      content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
-      if (Array.isArray(task.preview)) {
+      const large = task.kind === 'author' && task.total > 1000 && !task.large_approved;
+      if (!large) content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
+      if (!large && Array.isArray(task.preview)) {
         for (const item of task.preview.slice(0, 5)) {
           const dimensions = item.width > 0 && item.height > 0 ? `${item.width} × ${item.height}` : '分辨率未确认';
           content.append(element('p', 'muted', `${item.nickname || '未知作者'} · ${item.desc || item.id} · ${dimensions}`));
         }
       }
-      actions.append(action('接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
+      actions.append(action(large ? '确认下载这些作品' : '接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
     }
     if (!['completed','cancelled'].includes(task.status)) actions.append(action('取消', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, 'POST'); await loadTasks(); }));
     actions.append(action('删除',async()=>{await api(`/api/tasks/${encodeURIComponent(task.id)}`,'DELETE');await loadTasks();notice('任务记录已删除，媒体文件保留。');}));
@@ -721,7 +722,9 @@
         if (navigation !== state.navigation || state.view !== 'settings'||serial!==state.cookieStatusSerial) return;
         paintCookieStatus(settings);pollCookieAccount(settings,serial,navigation);
         $('cookie').value = ''; $('quality-policy').value = settings.quality_policy || 'upstream';
-        $('download-dir').value = settings.download_dir; $('download-dir-hint').textContent = `可用范围：${settings.media_root} 及其子目录。修改不搬迁已有文件；更换 NAS 磁盘请修改 Compose 挂载。`;
+        $('request-delay-seconds').value = settings.request_delay_seconds ?? 6;
+        $('download-concurrency').value = settings.download_concurrency ?? 4;
+        state.downloadDir = $('download-dir').value = settings.download_dir; $('download-dir-hint').textContent = `可用范围：${settings.media_root} 及其子目录。修改不搬迁已有文件；更换 NAS 磁盘请修改 Compose 挂载。`;
         $('script-server').value = location.origin; $('script-token').value = settings.script_token || state.token; $('script-token').type = 'password'; $('reveal-token').textContent = '显示';
       }),
       api('/api/status').then(status => { if (navigation === state.navigation && state.view === 'settings') showStatus(status); }),
@@ -833,7 +836,11 @@
   });
   $('settings-form').addEventListener('submit', async event => {
     event.preventDefault(); const button = event.target.querySelector('[type="submit"]'); button.disabled = true;
-    const body = { quality_policy: $('quality-policy').value, download_dir: $('download-dir').value.trim() }; if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
+    const body = { quality_policy: $('quality-policy').value,
+      request_delay_seconds: Number($('request-delay-seconds').value), download_concurrency: Number($('download-concurrency').value) };
+    const directory = $('download-dir').value.trim();
+    if (directory !== state.downloadDir) body.download_dir = directory;
+    if ($('cookie').value.trim()) body.cookie = $('cookie').value.trim();
     try { await api('/api/settings', 'PUT', body); $('cookie').value = ''; await loadSettings(); showCookieSync('保存成功。',false,true); }
     catch (error) { showCookieSync('保存失败：'+error.message,true); } finally { button.disabled = false; }
   });

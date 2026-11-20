@@ -18,7 +18,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, model_validator
 
-from .core import Core, download_directory, normalize_input
+from .core import Core, DownloadBlocked, download_directory, normalize_input
 from .blocking import run_blocking
 from .store import Store, FREQUENCIES, BEIJING, AmbiguousAliasError
 from .legacy import LegacyIndex, recorded_download, recorded_downloads, identical_legacy_copies
@@ -32,7 +32,8 @@ from .comment_batch import CommentBatchService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.10"
+VERSION = "1.4.11"
+LARGE_DOWNLOAD_LIMIT = 1000
 BASE = Path(__file__).resolve().parent
 
 
@@ -170,9 +171,11 @@ class JobService:
     def confirm(self, task_id):
         task = self.store.task(task_id)
         if not task or task["status"] != "awaiting_confirmation":
-            raise ValueError("该任务没有等待画质确认")
+            raise ValueError("该任务没有等待确认")
+        large = task["kind"] == "author" and task["total"] > LARGE_DOWNLOAD_LIMIT and not task["large_approved"]
+        approval = {"large_approved": True} if large else {"accept_quality": True}
         self.store.update_task(task_id, status='paused' if self.store.setting('queue_paused', False) else 'queued',
-                               accept_quality=True, message="已接受当前任务的原项目优选质量")
+                               message="已确认，等待队列处理", **approval)
         return self.store.task(task_id)
 
     def complete(self, work):
@@ -269,6 +272,7 @@ class JobService:
                 if not self.core.ready:
                     raise RuntimeError(self.core.error or "下载核心未就绪，请检查设置")
                 # 每次重试重新解析，避免使用已过期的媒体地址。
+                self.core.request_delay = await self.database(self.store.setting, "request_delay_seconds", 6)
                 items = await self.core.parse(task["link"], task["kind"])
                 await self.database(self.store.update_task, task["id"], preview=items)
                 pending, failures = [], []
@@ -281,26 +285,55 @@ class JobService:
                             is_update = True
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
-                await self.database(self.store.update_task, task["id"], total=len(pending) + len(failures))
+                await self.database(self.store.update_task, task["id"], total=len(pending), completed=0)
+                if task["kind"] == "author" and len(pending) > LARGE_DOWNLOAD_LIMIT and not task["large_approved"]:
+                    await self.database(self.store.update_task, task["id"], status="awaiting_confirmation",
+                                        message=f"将下载 {len(pending)} 个新作品，请确认是否继续。")
+                    return True
                 if pending and not task["accept_quality"] and (await self.database(self.store.setting, "quality_policy", "upstream")) == "confirm":
                     await self.database(self.store.update_task, task["id"], status="awaiting_confirmation", message="已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本")
                     return True
+                await self.database(self.store.update_task, task["id"], total=len(pending) + len(failures))
                 completed = 0
-                for item in pending:
-                    (await self.database(self.store.update_task, task["id"], status="downloading", completed=completed,
-                                           message=f"正在下载第 {completed + 1}/{len(pending)} 个作品：{item.get('desc') or item['id']}"[:160]))
+                if pending:
+                    limit = await self.database(self.store.setting, "download_concurrency", 4)
+                    if task["kind"] == "author" and len(pending) > 300:
+                        limit = min(limit, 2)
+                    self.core.download_slots = asyncio.Semaphore(limit)
+                    self.core.media_blocked = asyncio.Event()
+                    await self.database(self.store.update_task, task["id"], status="downloading",
+                                        message=f"正在下载 {len(pending)} 个作品，最多同时传输 {limit} 个文件")
+                    remaining = iter(pending)
+
+                    async def download_next():
+                        nonlocal completed
+                        for item in remaining:
+                            if self.core.media_blocked.is_set():
+                                raise DownloadBlocked("媒体服务器触发限流（HTTP 429）")
+                            try:
+                                files = await self.core.download(item)
+                                if not files or any(not (self.media_root / file).resolve().is_relative_to(self.media_root)
+                                                    or not (self.media_root / file).is_file()
+                                                    or (self.media_root / file).stat().st_size <= 0 for file in files):
+                                    raise RuntimeError("文件未完整保存，任务不会标记完成，可重试")
+                            except DownloadBlocked:
+                                self.core.media_blocked.set()
+                                raise
+                            except RuntimeError as exc:
+                                failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
+                                continue
+                            await self.database(self.store.save_work, item, files)
+                            completed += 1
+                            await self.database(self.store.update_task, task["id"], completed=completed)
+
+                    workers = [asyncio.create_task(download_next()) for _ in range(min(limit, len(pending)))]
                     try:
-                        files = await self.core.download(item)
-                        if not files or any(not (self.media_root / file).resolve().is_relative_to(self.media_root)
-                                            or not (self.media_root / file).is_file()
-                                            or (self.media_root / file).stat().st_size <= 0 for file in files):
-                            raise RuntimeError("文件未完整保存，任务不会标记完成，可重试")
-                    except RuntimeError as exc:
-                        failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
-                        continue
-                    await self.database(self.store.save_work, item, files)
-                    completed += 1
-                    await self.database(self.store.update_task, task["id"], completed=completed)
+                        await asyncio.gather(*workers)
+                    finally:
+                        for worker in workers:
+                            if not worker.done():
+                                worker.cancel()
+                        await asyncio.gather(*workers, return_exceptions=True)
                 summary = f"已完整保存 {completed} 个作品，跳过本库已有 {len(items) - completed - len(failures)} 个"
                 if failures:
                     summary += f"；{len(failures)} 个未完成，可重试：" + '；'.join(failures[:3])
@@ -317,6 +350,11 @@ class JobService:
                     (await self.database(self.finish, task, is_update, status='cancelled' if current['status'] == 'cancelled' else 'interrupted',
                                 message=current['message'] if current['status'] == 'cancelled' else '服务停止，任务已保留，可重试'))
                 raise
+            except DownloadBlocked as exc:
+                message = f"{safe_error(exc, self.store)}。任务已暂停，已保存内容保留。处理验证或等待后，可单独继续此任务。"
+                await self.database(self.store.update_task, task["id"], pause_seconds=300, status="rate_limited", message=message)
+                if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
+                    await self.database(self.store.patch_author, task["author_id"], last_checked=time.time(), last_error=message)
             except Exception as exc:
                 message = safe_error(exc, self.store)
                 await self.database(self.finish, task, is_update, status="failed", message=message)
@@ -401,6 +439,8 @@ class SettingsInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
     cookie: str | None = Field(default=None, max_length=30000)
     quality_policy: str | None = None
+    request_delay_seconds: float | None = Field(default=None, ge=1.5, le=33.3)
+    download_concurrency: int | None = Field(default=None, strict=True, ge=1, le=4)
     interval_minutes: int | None = Field(default=None, ge=5, le=525600)
     download_dir: str | None = Field(default=None, max_length=1000)
 
@@ -620,6 +660,8 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
         return {"cookie_configured": configured, "cookie_effective": bool(configured and core.ready),
                 **cookie_account.current(schedule=probe),
                 "quality_policy": store.setting("quality_policy", "upstream"),
+                "request_delay_seconds": store.setting("request_delay_seconds", 6),
+                "download_concurrency": store.setting("download_concurrency", 4),
                 "interval_minutes": store.setting("interval_minutes", 60), "script_token": current_key,
                 "download_dir": str(download_directory(store.setting("download_dir", ""), media_dir)),
                 "media_root": str(media_dir)}
@@ -664,7 +706,7 @@ def make_app(data_dir=None, media_dir=None, token=None, core=None, legacy_dir=No
     async def save_settings(body: SettingsInput, current=Depends(authorize)):
         if body.quality_policy is not None and body.quality_policy not in {"confirm", "upstream"}:
             raise ValueError("请选择每次确认或明确接受原项目优选质量")
-        async with (service.configuration() if body.cookie is not None or body.download_dir is not None else service.lock):
+        async with (service.configuration() if body.cookie is not None or body.download_dir is not None else service.configuration_lock):
             def still_authorized():
                 if not hmac.compare_digest(current.encode(), store.setting('access_token', '').encode()):
                     raise HTTPException(401, '管理员密钥已更改，请重新登录')

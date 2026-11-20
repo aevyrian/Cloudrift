@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 from fastapi.testclient import TestClient
 
+from app.core import DownloadBlocked
 from app.main import JobService, make_app, recorded_downloads
 from app.store import Store
 from test_backend import FakeCore, WORK_ID
@@ -98,6 +99,81 @@ class QueuePacingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.setting('queue_resume_at'), 1300)
         self.assertEqual((self.root / 'media' / 'keep.part').read_bytes(), b'partial')
         self.assertEqual(self.store.task(task['id'])['status'], 'queued')
+
+    async def test_download_concurrency_is_bounded_and_all_results_are_saved(self):
+        get_items, download = self.core.parse, self.core.download
+        active, peak = 0, 0
+
+        async def parse(link, kind):
+            item = (await get_items(link, kind))[0]
+            return [dict(item, id=str(int(WORK_ID) + index)) for index in range(5)]
+
+        async def transfer(item):
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            try:
+                await asyncio.sleep(0.01)
+                return await download(item)
+            finally:
+                active -= 1
+
+        self.core.parse, self.core.download = parse, transfer
+        self.store.set_setting('download_concurrency', 2)
+        task = self.store.create_task(self.url, 'author')
+        await self.service.process_one()
+        self.assertEqual(peak, 2)
+        self.assertEqual(self.store.task(task['id'])['completed'], 5)
+
+    async def test_rate_limit_stops_siblings_and_requires_individual_resume(self):
+        get_items = self.core.parse
+        started, stopped = asyncio.Event(), asyncio.Event()
+
+        async def parse(link, kind):
+            item = (await get_items(link, kind))[0]
+            return [item, dict(item, id=str(int(WORK_ID) + 1))]
+
+        async def transfer(item):
+            if item['id'] == WORK_ID:
+                await started.wait()
+                raise DownloadBlocked('HTTP 429')
+            started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                stopped.set()
+
+        self.core.parse, self.core.download = parse, transfer
+        task = self.store.create_task(self.url, 'author')
+        await asyncio.wait_for(self.service.process_one(), 3)
+        self.assertTrue(stopped.is_set())
+        self.assertEqual(self.store.task(task['id'])['status'], 'rate_limited')
+        self.assertEqual(self.store.create_task(self.url, 'author')['id'], task['id'])
+        self.assertEqual(self.store.resume_queue(), [])
+        self.assertEqual(self.store.resume_task(task['id'])['status'], 'queued')
+        self.assertFalse(await self.service.process_one())
+
+    async def test_large_batch_confirmation_does_not_accept_quality(self):
+        get_items = self.core.parse
+
+        async def parse(link, kind):
+            item = (await get_items(link, kind))[0]
+            return [dict(item, id=str(int(WORK_ID) + index)) for index in range(1001)]
+
+        self.core.parse = parse
+        self.store.set_setting('quality_policy', 'confirm')
+        task = self.store.create_task(self.url, 'author')
+        await self.service.process_one()
+        first = self.store.task(task['id'])
+        self.assertEqual(first['status'], 'awaiting_confirmation')
+        self.assertEqual(first['total'], 1001)
+        self.assertEqual(self.core.download_calls, 0)
+        self.service.confirm(task['id'])
+        await self.service.process_one()
+        second = self.store.task(task['id'])
+        self.assertEqual(second['status'], 'awaiting_confirmation')
+        self.assertTrue(second['large_approved'])
+        self.assertFalse(second['accept_quality'])
 
     async def test_legacy_record_and_unknown_names_are_checked_once_per_batch(self):
         legacy_root = self.root / 'legacy'

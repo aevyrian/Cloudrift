@@ -1,7 +1,7 @@
 (function () {
   'use strict';
   const ACTIVE = ['queued', 'parsing', 'downloading'];
-  const ATTENTION = ['failed', 'interrupted', 'awaiting_confirmation'];
+  const ATTENTION = ['failed', 'interrupted', 'awaiting_confirmation', 'rate_limited'];
   const FILTERS = [['all', '全部任务'], ['active', '进行中'], ['paused', '已暂停'], ['attention', '需处理'], ['completed', '已完成'], ['cancelled', '已取消']];
   function groupMatches(task, filter) {
     return filter === 'all' || (filter === 'active' ? ACTIVE.includes(task.status) : filter === 'attention' ? ATTENTION.includes(task.status) : task.status === filter);
@@ -42,7 +42,7 @@
       button.append(node('span', '', label), node('span', 'task-filter-count', '0'));
       button.addEventListener('click', () => { filter = value; render(); }); filters.append(button); filterButtons.set(value, button);
     }
-    for (const [value, label, help] of [['active', '进行中', '下载与排队'], ['attention', '需要处理', '重试或确认画质'], ['completed', '完整保存', '已进入作品库']]) {
+    for (const [value, label, help] of [['active', '进行中', '下载与排队'], ['attention', '需要处理', '重试、确认或处理限流'], ['completed', '完整保存', '已进入作品库']]) {
       const button = node('button', 'task-summary-item'); button.type = 'button';
       button.append(node('span', '', label), node('strong', '', '0'), node('small', '', help));
       button.addEventListener('click', () => { filter = value; render(); }); summary.append(button); summaryButtons.set(value, button);

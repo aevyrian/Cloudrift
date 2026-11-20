@@ -17,6 +17,8 @@ from ..tools import (
     capture_error_request,
     cookie_str_to_dict,
 )
+from ..custom.function import metadata_delay
+from ..tools.error import RequestBlocked
 from ..translation import _
 
 if TYPE_CHECKING:
@@ -422,12 +424,20 @@ class API:
         self.log.info(f"Response Headers: {dict(response.headers)}", False)
         # 记录请求体数据会导致日志文件体积过大，仅在必要时记录
         # self.log.info(f"Response Content: {response.content}", False)
+        checking_download = metadata_delay.get() is not None
+        if checking_download and response.status_code == 429:
+            raise RequestBlocked("作品信息请求触发限流（HTTP 429）")
         response.raise_for_status()
         await wait()
-        # if response.status_code != 200:
-        #     self.log.error(f"请求 {url} 失败，响应码 {response.status_code}")
-        #     return
-        return response.json()
+        data = response.json()
+        if checking_download and isinstance(data, dict):
+            messages = (data.get(key) for key in ("status_msg", "status_message", "message", "error_msg"))
+            if (data.get("verify_type") or data.get("captcha")
+                    or any(isinstance(value, str) and any(
+                        word in value.lower() for word in ("验证", "频繁", "限流", "captcha", "verify", "rate limit", "too many requests")
+                    ) for value in messages)):
+                raise RequestBlocked("作品信息接口要求验证或限制了请求")
+        return data
 
     def __record_request_messages(
         self,

@@ -100,8 +100,8 @@ class Database:
         return await self.cursor.fetchone()
 
     async def has_download_data(self, id_: str) -> bool:
-        await self.cursor.execute("SELECT ID FROM download_data WHERE ID=?", (id_,))
-        return bool(await self.cursor.fetchone())
+        async with self.database.execute("SELECT ID FROM download_data WHERE ID=?", (id_,)) as cursor:
+            return bool(await cursor.fetchone())
 
     async def write_download_data(self, id_: str):
         await self.database.execute(
