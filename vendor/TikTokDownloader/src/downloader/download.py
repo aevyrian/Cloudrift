@@ -32,7 +32,7 @@ from ..tools import (
     beautify_string,
     format_size,
 )
-from ..tools.error import RequestBlocked
+from ..tools.error import MediaHTTPError, RequestBlocked
 from ..translation import _
 
 if TYPE_CHECKING:
@@ -711,6 +711,8 @@ class Downloader:
                 if code == 429 and self.media_blocked is not None:
                     self.media_blocked.set()
                     raise RequestBlocked("媒体服务器触发限流（HTTP 429）") from None
+                if self.media_blocked is not None and code in (403, 404):
+                    raise MediaHTTPError(code) from None
                 self.last_error = f'媒体服务器返回 HTTP {code}'
                 if code in (403, 429):
                     self.last_error += '，可能是地址过期、访问限制或请求过多，请稍后重试并检查Cookie'

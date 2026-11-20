@@ -184,10 +184,10 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
         self.core.download = broken
         job = self.store.create_task(WORK_ID, "detail", accept_quality=True)
         await self.service.process_one()
-        self.assertEqual(self.store.task(job["id"])["status"], "failed")
+        scheduled = self.store.task(job["id"])
+        self.assertEqual(scheduled["status"], "queued")
+        self.assertGreater(scheduled["retry_at"], 0)
         self.assertEqual(self.store.stats()["works"], 0)
-        self.service.retry(job["id"])
-        self.assertEqual(self.store.task(job["id"])["status"], "queued")
 
     @patch('app.main.time.time', new=lambda: 1767229200)
     async def test_scheduled_update_adds_new_work_skips_existing_and_pause_survives_reload(self):
@@ -255,10 +255,12 @@ class JobTests(unittest.IsolatedAsyncioTestCase):
             for i in (1, 2):
                 (folder / f"{WORK_ID}_{i}.jpg").write_bytes(b"image")
             return True
+        import sys
         core = Core(self.root, self.root / "data", self.root / "media")
         core.ready = True
         core.parser = SimpleNamespace(downloader=SimpleNamespace(recorder=SimpleNamespace(delete_id=delete_id), run=download))
-        files = await core.download({"id": WORK_ID, "type": "图集", "downloads": ["one", "two"]})
+        with patch.object(sys, 'path', [str(Path('vendor/TikTokDownloader').resolve()), *sys.path]):
+            files = await core.download({"id": WORK_ID, "type": "图集", "downloads": ["one", "two"]})
         self.assertEqual(deleted, [WORK_ID])
         self.assertEqual(len(files), 2)
 

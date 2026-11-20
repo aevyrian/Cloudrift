@@ -32,7 +32,7 @@ from .comment_batch import CommentBatchService
 from .comment_assets import asset_path, export_snapshot
 
 
-VERSION = "1.4.11"
+VERSION = "1.4.12"
 LARGE_DOWNLOAD_LIMIT = 1000
 BASE = Path(__file__).resolve().parent
 
@@ -172,10 +172,8 @@ class JobService:
         task = self.store.task(task_id)
         if not task or task["status"] != "awaiting_confirmation":
             raise ValueError("该任务没有等待确认")
-        large = task["kind"] == "author" and task["total"] > LARGE_DOWNLOAD_LIMIT and not task["large_approved"]
-        approval = {"large_approved": True} if large else {"accept_quality": True}
         self.store.update_task(task_id, status='paused' if self.store.setting('queue_paused', False) else 'queued',
-                               message="已确认，等待队列处理", **approval)
+                               message="已确认，等待队列处理", accept_quality=True)
         return self.store.task(task_id)
 
     def complete(self, work):
@@ -241,7 +239,10 @@ class JobService:
 
     def finish(self, task, is_update, **values):
         pause = (120 if is_update else 300) + secrets.randbelow(181) if task['kind'] == 'author' else 0
-        self.store.update_task(task['id'], pause_seconds=pause, **values)
+        if values['status'] in {'failed', 'interrupted'}:
+            self.store.schedule_task_retry(task['id'], values['message'], values.get('completed'), pause_seconds=pause)
+        else:
+            self.store.update_task(task['id'], pause_seconds=pause, **values)
 
     async def process_one(self):
         if self.configuration_pending:
@@ -275,7 +276,9 @@ class JobService:
                 self.core.request_delay = await self.database(self.store.setting, "request_delay_seconds", 6)
                 items = await self.core.parse(task["link"], task["kind"])
                 await self.database(self.store.update_task, task["id"], preview=items)
-                pending, failures = [], []
+                pending = []
+                failures = list(getattr(self.core, 'parse_issues', ())) if task['kind'] == 'author' else []
+                item_count = len(items) + len(failures)
                 legacy_cache = {'ids': [str(item['id']) for item in items]}
                 for item in items:
                     try:
@@ -286,11 +289,10 @@ class JobService:
                     except RuntimeError as exc:
                         failures.append(f"{item['id']}：{safe_error(exc, self.store)}")
                 await self.database(self.store.update_task, task["id"], total=len(pending), completed=0)
-                if task["kind"] == "author" and len(pending) > LARGE_DOWNLOAD_LIMIT and not task["large_approved"]:
-                    await self.database(self.store.update_task, task["id"], status="awaiting_confirmation",
-                                        message=f"将下载 {len(pending)} 个新作品，请确认是否继续。")
+                large = task["kind"] == "author" and len(pending) > LARGE_DOWNLOAD_LIMIT
+                if large and await self.database(self.store.defer_large_task, task["id"], len(pending)):
                     return True
-                if pending and not task["accept_quality"] and (await self.database(self.store.setting, "quality_policy", "upstream")) == "confirm":
+                if pending and not large and not task["accept_quality"] and (await self.database(self.store.setting, "quality_policy", "upstream")) == "confirm":
                     await self.database(self.store.update_task, task["id"], status="awaiting_confirmation", message="已解析。原项目已优选画质，但未自动判定水印；请确认采用当前版本")
                     return True
                 await self.database(self.store.update_task, task["id"], total=len(pending) + len(failures))
@@ -334,9 +336,9 @@ class JobService:
                             if not worker.done():
                                 worker.cancel()
                         await asyncio.gather(*workers, return_exceptions=True)
-                summary = f"已完整保存 {completed} 个作品，跳过本库已有 {len(items) - completed - len(failures)} 个"
+                summary = f"已完整保存 {completed} 个作品，跳过本库已有 {item_count - completed - len(failures)} 个"
                 if failures:
-                    summary += f"；{len(failures)} 个未完成，可重试：" + '；'.join(failures[:3])
+                    summary += f"；{len(failures)} 个未完成：" + '；'.join(failures[:3])
                 await self.database(self.finish, task, is_update, status="failed" if failures else "completed", completed=completed, message=summary[:1500])
                 if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
                     name = items[0].get("nickname", "") if items else ""
@@ -352,7 +354,10 @@ class JobService:
                 raise
             except DownloadBlocked as exc:
                 message = f"{safe_error(exc, self.store)}。任务已暂停，已保存内容保留。处理验证或等待后，可单独继续此任务。"
-                await self.database(self.store.update_task, task["id"], pause_seconds=300, status="rate_limited", message=message)
+                if task['retry_at']:
+                    await self.database(self.store.schedule_task_retry, task['id'], message, pause_seconds=300)
+                else:
+                    await self.database(self.store.update_task, task["id"], pause_seconds=300, status="rate_limited", message=message)
                 if task["author_id"] and (await self.database(self.store.author, task["author_id"])):
                     await self.database(self.store.patch_author, task["author_id"], last_checked=time.time(), last_error=message)
             except Exception as exc:
@@ -391,7 +396,7 @@ class JobService:
             try:
                 if needs_recovery:
                     self.comment_batches.ready = False
-                    await self.database(self.store.recover)
+                    await self.database(self.store.recover, automatic=True)
                     await self.database(self.comment_batches.recover)
                     needs_recovery = False
                 await self.database(self.browser_comments.expire)

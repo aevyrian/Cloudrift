@@ -599,7 +599,13 @@
     const summary = needsAttention && Number(task.total) > 0
       ? `已保存 ${task.completed} 个，${Math.max(0, Number(task.total) - Number(task.completed))} 个需要处理`
       : needsAttention ? '任务未完成，请展开查看原因' : task.message || '等待处理';
+    if (task.status === 'cancelled' && task.retry_at && task.message?.startsWith('自动补跑仍失败')) {
+      heading.append(element('span', 'badge bad', '自动补跑失败'));
+    }
     content.append(heading,source,element('p', '', summary));
+    if (task.retry_at > Date.now() / 1000 && ['queued','paused'].includes(task.status)) {
+      content.append(element('p', 'hint', `自动补跑时间：${formatDate(new Date(task.retry_at * 1000).toISOString())}`));
+    }
     if (needsAttention && task.message) { const reason=element('details');reason.append(element('summary','','查看原因'),element('p','',task.message));content.append(reason); }
     if (Number(task.total) > 0) {
       const bar = element('div', 'progress'); const fill = element('span'); fill.style.width = `${Math.min(100, Math.max(0, Number(task.completed) / Number(task.total) * 100))}%`; bar.append(fill);
@@ -611,15 +617,14 @@
     if (['paused','rate_limited'].includes(task.status)) actions.append(action('继续', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/resume`, 'POST'); await loadTasks(); }));
     if (['failed', 'interrupted', 'cancelled'].includes(task.status)) actions.append(action('重试', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/retry`, 'POST'); await loadTasks(); }));
     if (task.status === 'awaiting_confirmation') {
-      const large = task.kind === 'author' && task.total > 1000 && !task.large_approved;
-      if (!large) content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
-      if (!large && Array.isArray(task.preview)) {
+      content.append(element('p', 'hint', '目标画质或无水印尚不能确认。接受仅适用于此任务，也可取消。'));
+      if (Array.isArray(task.preview)) {
         for (const item of task.preview.slice(0, 5)) {
           const dimensions = item.width > 0 && item.height > 0 ? `${item.width} × ${item.height}` : '分辨率未确认';
           content.append(element('p', 'muted', `${item.nickname || '未知作者'} · ${item.desc || item.id} · ${dimensions}`));
         }
       }
-      actions.append(action(large ? '确认下载这些作品' : '接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
+      actions.append(action('接受此任务原项目优选', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/confirm`, 'POST'); await loadTasks(); }, true));
     }
     if (!['completed','cancelled'].includes(task.status)) actions.append(action('取消', async () => { await api(`/api/tasks/${encodeURIComponent(task.id)}/cancel`, 'POST'); await loadTasks(); }));
     actions.append(action('删除',async()=>{await api(`/api/tasks/${encodeURIComponent(task.id)}`,'DELETE');await loadTasks();notice('任务记录已删除，媒体文件保留。');}));

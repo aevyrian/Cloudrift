@@ -5,6 +5,12 @@ class RequestBlocked(RuntimeError):
     pass
 
 
+class MediaHTTPError(RuntimeError):
+    def __init__(self, status_code):
+        self.status_code = status_code
+        super().__init__(f"媒体服务器返回 HTTP {status_code}")
+
+
 class DownloaderError(Exception):
     def __init__(
         self,

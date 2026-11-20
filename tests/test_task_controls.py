@@ -66,12 +66,19 @@ class TaskControlTests(unittest.IsolatedAsyncioTestCase):
         from app.core import Core
         with tempfile.TemporaryDirectory() as tmp:
             root=Path(tmp);core=Core(root,root/'data',root/'media');core.ready=True
-            downloader=SimpleNamespace(recorder=SimpleNamespace(delete_id=AsyncMock()))
-            async def fail(*args,**kwargs):
-                downloader.last_error='媒体服务器返回 HTTP 429';return False
-            downloader.run=fail;core.parser=SimpleNamespace(downloader=downloader)
-            with self.assertRaisesRegex(RuntimeError,'HTTP 429'):
-                await core.download({'id':WORK_ID,'type':'视频','downloads':['one']})
+            import sys
+            from unittest.mock import patch
+            class Downloader:
+                recorder = SimpleNamespace(delete_id=AsyncMock())
+
+                async def run(self, *args, **kwargs):
+                    self.last_error = '媒体服务器返回 HTTP 429'
+                    return False
+
+            core.parser = SimpleNamespace(downloader=Downloader())
+            with patch.object(sys, 'path', [str(Path('vendor/TikTokDownloader').resolve()), *sys.path]):
+                with self.assertRaisesRegex(RuntimeError, 'HTTP 429'):
+                    await core.download({'id': WORK_ID, 'type': '视频', 'downloads': ['one']})
 
     async def test_cancel_running_keeps_partial_and_queue_can_continue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -102,7 +109,7 @@ class TaskControlTests(unittest.IsolatedAsyncioTestCase):
             core.parse=many;core.download=partial
             task=store.create_task('https://www.douyin.com/user/a','author',accept_quality=True)
             await service.process_one();result=store.task(task['id'])
-            self.assertEqual(result['status'],'failed');self.assertEqual(result['completed'],1)
+            self.assertEqual(result['status'],'queued');self.assertEqual(result['completed'],1)
             self.assertIn('HTTP 403',result['message']);self.assertEqual(store.stats()['works'],1)
 
 
@@ -131,6 +138,7 @@ class ControlApiTests(unittest.TestCase):
             root=Path(tmp);app=make_app(root/'data',root/'media',token='test-token',core=FakeCore(root/'media'));store=app.state.store
             headers={'Authorization':'Bearer test-token'}
             root.joinpath('media').mkdir(exist_ok=True);original=root/'media'/'keep.mp4';original.write_bytes(b'keep')
+            store.set_setting('queue_paused',True)
             with TestClient(app) as client:
                 first=store.create_task(WORK_ID,'detail');store.update_task(first['id'],status='failed')
                 duplicate=store.create_task(WORK_ID,'detail');store.update_task(duplicate['id'],status='failed')

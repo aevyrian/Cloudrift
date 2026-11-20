@@ -2,6 +2,7 @@ import hmac
 import hashlib
 import math
 import json
+import logging
 import re
 import secrets
 import sqlite3
@@ -48,6 +49,11 @@ def random_daytime(start, end):
     return lower + secrets.randbelow(max(1, upper - lower))
 
 
+def next_day_retry(now):
+    start = datetime.fromtimestamp(now, BEIJING).replace(hour=0, minute=0, second=0, microsecond=0) + timedelta(days=1)
+    return int(random_daytime(start.timestamp(), (start + timedelta(days=1)).timestamp()))
+
+
 def _legacy_created(file):
     match = FILENAME.fullmatch(Path(file).stem) if file else None
     if match:
@@ -83,6 +89,7 @@ class Store:
                     completed INTEGER NOT NULL DEFAULT 0, total INTEGER NOT NULL DEFAULT 0,
                     created_at TEXT NOT NULL, updated_at TEXT NOT NULL,
                     accept_quality INTEGER NOT NULL DEFAULT 0, large_approved INTEGER NOT NULL DEFAULT 0,
+                    deferred_size INTEGER NOT NULL DEFAULT 0, retry_at INTEGER NOT NULL DEFAULT 0,
                     preview TEXT NOT NULL DEFAULT '[]', author_id TEXT);
                 CREATE INDEX IF NOT EXISTS task_state ON tasks(status,created_at);
                 CREATE TABLE IF NOT EXISTS works (
@@ -123,8 +130,15 @@ class Store:
                     enabled INTEGER NOT NULL DEFAULT 0, interval_minutes INTEGER NOT NULL DEFAULT 60,
                     last_checked REAL, next_check REAL NOT NULL DEFAULT 0, last_error TEXT NOT NULL DEFAULT '');
             """)
-            if 'large_approved' not in {row[1] for row in db.execute('PRAGMA table_info(tasks)')}:
-                db.execute('ALTER TABLE tasks ADD COLUMN large_approved INTEGER NOT NULL DEFAULT 0')
+            task_columns = {row[1] for row in db.execute('PRAGMA table_info(tasks)')}
+            for column in ('large_approved', 'deferred_size', 'retry_at'):
+                if column not in task_columns:
+                    db.execute(f'ALTER TABLE tasks ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0')
+            db.execute("""UPDATE tasks SET deferred_size=total,
+                status=CASE WHEN (SELECT value FROM settings WHERE key='queue_paused')='true' THEN 'paused' ELSE 'queued' END,
+                message='大任务已排到普通任务之后'
+                WHERE kind='author' AND status='awaiting_confirmation' AND total>1000
+                  AND large_approved=0 AND message LIKE '将下载%请确认是否继续。'""")
             columns = {row[1] for row in db.execute('PRAGMA table_info(authors)')}
             for name, kind in (("starred", "INTEGER NOT NULL DEFAULT 0"), ("favorite", "INTEGER NOT NULL DEFAULT 0"), ("schedule_until", "REAL NOT NULL DEFAULT 0")):
                 if name not in columns:
@@ -217,7 +231,7 @@ class Store:
         with self.connect() as db:
             fields = "*"
             if summary:
-                fields = """id,kind,link,status,message,completed,total,created_at,updated_at,accept_quality,large_approved,author_id,
+                fields = """id,kind,link,status,message,completed,total,created_at,updated_at,accept_quality,large_approved,deferred_size,retry_at,author_id,
                     (SELECT json_group_array(json(value)) FROM (SELECT value FROM json_each(tasks.preview) LIMIT 5)) AS preview,
                     (SELECT json_group_array(COALESCE(json_extract(value,'$.nickname'),'')) FROM json_each(tasks.preview)) AS preview_nicknames"""
             return [self.task_dict(row) for row in db.execute(f"""
@@ -246,7 +260,50 @@ class Store:
 
     def author_queue_busy(self):
         with self.connect() as db:
-            return db.execute("SELECT 1 FROM tasks WHERE kind='author' AND status IN ('queued','parsing','downloading','paused') LIMIT 1").fetchone() is not None
+            return db.execute("""SELECT 1 FROM tasks WHERE kind='author'
+                AND (status IN ('parsing','downloading','paused') OR (status='queued' AND retry_at<=?))
+                LIMIT 1""", (time.time(),)).fetchone() is not None
+
+    def defer_large_task(self, task_id, count):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            current = db.execute("SELECT rowid,created_at FROM tasks WHERE id=? AND status='parsing'", (task_id,)).fetchone()
+            if current is None:
+                return True
+            earlier = db.execute("""SELECT 1 FROM tasks WHERE status='queued' AND id!=? AND retry_at<=?
+                AND (deferred_size=0 OR deferred_size<? OR
+                     (deferred_size=? AND (created_at,rowid)<(?,?))) LIMIT 1""",
+                (task_id, time.time(), count, count, current['created_at'], current['rowid'])).fetchone()
+            if earlier:
+                db.execute("UPDATE tasks SET status='queued',deferred_size=?,message=?,updated_at=? WHERE id=?",
+                           (count, f'大任务（{count} 个待下载），等待普通任务和较小的大任务完成', stamp(), task_id))
+                return True
+            db.execute("UPDATE tasks SET deferred_size=? WHERE id=?", (count, task_id))
+            return False
+
+    def schedule_task_retry(self, task_id, reason, completed=None, pause_seconds=0):
+        with self.connect() as db:
+            db.execute("BEGIN IMMEDIATE")
+            row = db.execute("SELECT status,retry_at,completed FROM tasks WHERE id=?", (task_id,)).fetchone()
+            if not row or row['status'] not in ('parsing', 'downloading', 'failed', 'interrupted'):
+                return
+            now = time.time()
+            if row['retry_at']:
+                status, retry_at = 'cancelled', row['retry_at']
+                message = f'自动补跑仍失败，已取消。错误：{reason}'
+            else:
+                paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
+                status = 'paused' if paused and json.loads(paused[0]) else 'queued'
+                retry_at = next_day_retry(now)
+                when = datetime.fromtimestamp(retry_at, BEIJING).strftime('%m-%d %H:%M')
+                message = f'计划 {when} 自动补跑一次。原错误：{reason}'
+            db.execute("UPDATE tasks SET status=?,retry_at=?,completed=?,message=?,updated_at=? WHERE id=?",
+                       (status,retry_at,row['completed'] if completed is None else completed,message[:1600],stamp(),task_id))
+            if pause_seconds:
+                db.execute("""INSERT INTO settings VALUES ('queue_resume_at',?)
+                    ON CONFLICT(key) DO UPDATE SET value=excluded.value""", (json.dumps(now + pause_seconds),))
+        if status == 'cancelled':
+            logging.getLogger(__name__).warning("任务 %s 自动补跑失败：%s", task_id, reason)
 
     def claim_task(self):
         with self.connect() as db:
@@ -254,7 +311,8 @@ class Store:
             values = {row['key']: json.loads(row['value']) for row in db.execute("SELECT key,value FROM settings WHERE key IN ('queue_paused','queue_resume_at')")}
             if values.get('queue_paused', False) or time.time() < values.get('queue_resume_at', 0):
                 return None
-            row = db.execute("SELECT * FROM tasks WHERE status='queued' ORDER BY created_at,rowid LIMIT 1").fetchone()
+            row = db.execute("""SELECT * FROM tasks WHERE status='queued' AND retry_at<=?
+                ORDER BY (deferred_size>0),deferred_size,created_at,rowid LIMIT 1""", (time.time(),)).fetchone()
             if not row:
                 return None
             db.execute("UPDATE tasks SET status='parsing',message='正在解析作品',updated_at=? WHERE id=?", (stamp(), row["id"]))
@@ -331,13 +389,18 @@ class Store:
                 return self.task_dict(duplicate)
             paused = db.execute("SELECT value FROM settings WHERE key='queue_paused'").fetchone()
             paused = bool(json.loads(paused[0])) if paused else False
-            db.execute("UPDATE tasks SET status=?,message=?,completed=0,updated_at=? WHERE id=?",
+            db.execute("UPDATE tasks SET status=?,message=?,completed=0,retry_at=0,updated_at=? WHERE id=?",
                        ('paused' if paused else 'queued', '已暂停，已保存内容保留' if paused else '已加入重试队列', stamp(), task_id))
         return self.task(task_id)
 
-    def recover(self):
+    def recover(self, automatic=False):
         with self.connect() as db:
-            db.execute("UPDATE tasks SET status='interrupted',message='上次运行中断，可点击重试',updated_at=? WHERE status IN ('parsing','downloading')", (stamp(),))
+            if not automatic:
+                db.execute("UPDATE tasks SET status='interrupted',message='上次运行中断，可点击重试',updated_at=? WHERE status IN ('parsing','downloading')", (stamp(),))
+                return
+            active = [row[0] for row in db.execute("SELECT id FROM tasks WHERE status IN ('parsing','downloading')")]
+        for task_id in active:
+            self.schedule_task_retry(task_id, '上次运行中断，已保存内容保留')
 
     def save_work(self, item, files):
         self.save_works([(item, files)])

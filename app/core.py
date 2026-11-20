@@ -164,6 +164,8 @@ class Core:
         self.request_delay = 6.0
         self.download_slots = asyncio.Semaphore(4)
         self.media_blocked = asyncio.Event()
+        self.refresh_lock = asyncio.Lock()
+        self.parse_issues = []
         self.ready = False
         self.error = ""
 
@@ -345,6 +347,8 @@ class Core:
             raise RuntimeError("下载核心尚未就绪，请检查设置和服务日志")
         from src.custom.function import metadata_delay
         from src.tools.error import RequestBlocked
+        if kind == "author":
+            self.parse_issues = []
         token = metadata_delay.set(self.request_delay)
         try:
             return await self._parse(link, kind, earliest)
@@ -376,16 +380,47 @@ class Core:
                 result.append(response.data)
         unique = {}
         for item in result:
-            if item.get("type") not in {"视频", "图集", "实况"}:
-                raise RuntimeError("该作品类型暂不支持，任务已保留，可重试")
-            if not re.fullmatch(r"\d{19}", str(item.get("id", ""))) or not item.get("downloads"):
-                raise RuntimeError("解析结果缺少作品标识或可下载地址")
-            unique[str(item["id"])] = item
+            work_id = str(item.get("id", "")) if isinstance(item, dict) else ""
+            if not re.fullmatch(r"\d{19}", work_id) or item.get("type") not in {"视频", "图集", "实况"}:
+                if kind != "author":
+                    raise RuntimeError("解析结果缺少有效作品标识，或作品类型暂不支持")
+                self.parse_issues.append("有作品缺少有效标识，或类型暂不支持")
+                continue
+            if not item.get("downloads"):
+                if kind != "author":
+                    raise RuntimeError("解析结果缺少可下载地址")
+                item = {**item, "downloads": []}
+            unique[work_id] = item
         return list(unique.values())
 
     async def download(self, item):
         if not self.ready:
             raise RuntimeError("下载核心尚未就绪")
+        from src.tools.error import MediaHTTPError
+        if not item.get("downloads"):
+            return await self._download(await self._refresh_download_item(item))
+        try:
+            return await self._download(item)
+        except MediaHTTPError as exc:
+            if exc.status_code != 404:
+                raise
+            return await self._download(await self._refresh_download_item(item))
+
+    async def _refresh_download_item(self, item):
+        async with self.refresh_lock:
+            if self.media_blocked.is_set():
+                raise DownloadBlocked("媒体服务器触发限流（HTTP 429）")
+            fresh, = await self.parse(str(item["id"]), "detail")
+        old_urls = item.get("downloads")
+        new_urls = fresh["downloads"]
+        if (str(fresh["id"]) != str(item["id"]) or fresh["type"] != item["type"]
+                or old_urls == new_urls
+                or (isinstance(old_urls, list) and old_urls and
+                    (not isinstance(new_urls, list) or len(old_urls) != len(new_urls)))):
+            raise RuntimeError("重新获取后没有可用的新媒体地址，或作品内容已变更")
+        return fresh
+
+    async def _download(self, item):
         try:
             files = verified_files(self.media_dir, item)
         except RuntimeError:

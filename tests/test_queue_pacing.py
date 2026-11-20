@@ -78,7 +78,7 @@ class QueuePacingTests(unittest.IsolatedAsyncioTestCase):
         task = self.store.create_task(self.url, 'author')
         with patch('app.main.time.time', return_value=1000), patch('app.main.secrets.randbelow', return_value=0):
             await self.service.process_one()
-        self.assertEqual(self.store.task(task['id'])['status'], 'failed')
+        self.assertEqual(self.store.task(task['id'])['status'], 'queued')
         self.assertEqual(self.store.setting('queue_resume_at'), 1300)
 
     async def test_cancelled_author_keeps_partial_files_and_rest_before_retry(self):
@@ -153,27 +153,51 @@ class QueuePacingTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(self.store.resume_task(task['id'])['status'], 'queued')
         self.assertFalse(await self.service.process_one())
 
-    async def test_large_batch_confirmation_does_not_accept_quality(self):
-        get_items = self.core.parse
+    async def test_large_batches_yield_to_regular_tasks_and_sort_by_size(self):
+        large = self.store.create_task(self.url, 'author')
+        smaller = self.store.create_task(self.url + 'small', 'author')
+        regular = self.store.create_task(WORK_ID, 'detail')
+        sample = (await self.core.parse(WORK_ID, 'detail'))[0]
 
         async def parse(link, kind):
-            item = (await get_items(link, kind))[0]
-            return [dict(item, id=str(int(WORK_ID) + index)) for index in range(1001)]
+            if kind == 'detail':
+                return [sample]
+            count = 1001 if link.endswith('small') else 1100
+            return [dict(sample, id=str(int(WORK_ID) + 1 + i)) for i in range(count)]
 
         self.core.parse = parse
         self.store.set_setting('quality_policy', 'confirm')
-        task = self.store.create_task(self.url, 'author')
         await self.service.process_one()
-        first = self.store.task(task['id'])
-        self.assertEqual(first['status'], 'awaiting_confirmation')
-        self.assertEqual(first['total'], 1001)
+        await self.service.process_one()
+        self.assertEqual(self.store.task(large['id'])['deferred_size'], 1100)
+        self.assertEqual(self.store.task(smaller['id'])['deferred_size'], 1001)
         self.assertEqual(self.core.download_calls, 0)
-        self.service.confirm(task['id'])
-        await self.service.process_one()
-        second = self.store.task(task['id'])
-        self.assertEqual(second['status'], 'awaiting_confirmation')
-        self.assertTrue(second['large_approved'])
-        self.assertFalse(second['accept_quality'])
+        self.assertEqual(self.store.claim_task()['id'], regular['id'])
+        self.assertEqual(self.store.claim_task()['id'], smaller['id'])
+        self.assertEqual(self.store.claim_task()['id'], large['id'])
+
+    async def test_download_retries_next_day_once_without_blocking_other_tasks(self):
+        async def fail(item):
+            raise RuntimeError('媒体网络连接失败')
+
+        self.core.download = fail
+        task = self.store.create_task(WORK_ID, 'detail')
+        other = self.store.create_task(self.url, 'author')
+        with patch('app.main.time.time', return_value=1000):
+            await self.service.process_one()
+            self.assertEqual(self.store.task(task['id'])['status'], 'queued')
+            self.assertEqual(self.store.claim_task()['id'], other['id'])
+            self.assertFalse(await self.service.process_one())
+        retry_at = self.store.task(task['id'])['retry_at']
+        self.assertGreaterEqual(retry_at, 86400)
+        self.assertLess(retry_at, 86400 * 2)
+        with patch('app.main.time.time', return_value=retry_at):
+            with self.assertLogs('app.store', level='WARNING') as errors:
+                await self.service.process_one()
+        final = self.store.task(task['id'])
+        self.assertEqual(final['status'], 'cancelled')
+        self.assertIn('媒体网络连接失败', final['message'])
+        self.assertIn(task['id'], errors.output[0])
 
     async def test_legacy_record_and_unknown_names_are_checked_once_per_batch(self):
         legacy_root = self.root / 'legacy'
